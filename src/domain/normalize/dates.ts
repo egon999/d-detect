@@ -13,7 +13,7 @@ import { normalizeText } from './text';
  *   conflict rule must not report a disagreement between a day and the month that
  *   contains it.
  * - `ambiguous` marks the `03/04/2024` problem, where day-first and month-first
- *   readings are both valid. CaseGraph refuses to silently pick one: ambiguous
+ *   readings are both valid. Detact refuses to silently pick one: ambiguous
  *   dates are parsed under the configured locale order but flagged so the UI can
  *   ask, and so conflict rules can downgrade their severity.
  */
@@ -181,15 +181,45 @@ export function daysBetween(a: NormalizedDate, b: NormalizedDate): number | null
   return Math.round((second - first) / 86_400_000);
 }
 
+/**
+ * Month names for display, indexed by month number minus one.
+ *
+ * Held separately from `MONTHS` rather than derived from it. `MONTHS` is a parsing table:
+ * it maps every spelling a document might use onto a number, and several months have more
+ * than one entry. Searching it backwards for "the long spelling of month 5" cannot work —
+ * May has no long spelling, so the search found nothing and the date rendered as the digit
+ * `05`, and September matched the abbreviation `sept` before its full name. Those strings
+ * are not only shown on screen: they are written into finding explanations and into the
+ * `Compared because` line stored on a finding, so a May transaction was permanently
+ * recorded as "15 05 2024".
+ *
+ * A separate list has one entry per month and no choice to get wrong.
+ */
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+] as const;
+
 /** Renders a normalized date for display, preserving stated uncertainty. */
 export function formatDate(value: NormalizedDate): string {
   if (!value.iso) return value.original || 'Undated';
   if (value.precision === 'YEAR') return value.iso;
+
   const [year, month, day] = value.iso.split('-');
-  const monthName = Object.entries(MONTHS).find(
-    ([name, index]) => index === Number(month) && name.length > 3,
-  )?.[0];
-  const label = monthName ? monthName[0]!.toUpperCase() + monthName.slice(1) : month;
+  // A stored ISO string always carries a real month, but this reads a persisted record
+  // and must not produce `undefined` in a report if one is ever malformed.
+  const label = MONTH_NAMES[Number(month) - 1] ?? month;
+
   if (value.precision === 'MONTH') return `${label} ${year}`;
   return `${Number(day)} ${label} ${year}`;
 }

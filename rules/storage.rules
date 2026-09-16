@@ -1,0 +1,96 @@
+rules_version = '2';
+
+/**
+ * Ddetect — Cloud Storage Security Rules.
+ *
+ * Evidence files are the most sensitive thing this product handles: invoices, receipts,
+ * screenshots of private conversations. The rule is therefore the strictest one available —
+ * **a file is readable and writable only by the user whose uid is in its path.**
+ *
+ * ## Authorisation by path, not by metadata
+ *
+ * Firestore rules authorise by reading a field on the document. Storage has no equivalent
+ * that is free to check, so ownership is encoded in the object path instead:
+ *
+ *     users/{uid}/cases/{caseId}/{fileName}
+ *
+ * The uid segment is compared against `request.auth.uid`. This is checked before the upload
+ * is accepted, so a file can never come to rest at a path its uploader does not own.
+ *
+ * ## Limits are part of the security model
+ *
+ * An unbounded upload path on a free-tier project is a way to run up a bill or fill the
+ * bucket, so size and content type are constrained here rather than only in the client —
+ * the client is not a boundary.
+ */
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * 100 MB.
+     *
+     * Comfortably above a phone photo, a scanned multi-page PDF or a video, and the same cap
+     * the client enforces before upload. Still bounded, so a single upload cannot be used to
+     * fill the bucket or run up a bill.
+     */
+    function withinSizeLimit() {
+      return request.resource.size > 0
+        && request.resource.size <= 100 * 1024 * 1024;
+    }
+
+    /**
+     * The evidence types the app can actually parse.
+     *
+     * Anything else is refused: a file the pipeline cannot read is not evidence, it is just
+     * a liability sitting in the bucket. Audio is included because the app requests the
+     * microphone permission for voice notes.
+     */
+    function isSupportedType() {
+      return request.resource.contentType.matches('image/.*')
+        || request.resource.contentType.matches('audio/.*')
+        || request.resource.contentType.matches('video/.*')
+        || request.resource.contentType.matches('text/.*')
+        || request.resource.contentType == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        || request.resource.contentType == 'application/pdf'
+        || request.resource.contentType == 'text/plain';
+    }
+
+    /**
+     * Per-user evidence storage.
+     *
+     * `{fileName=**}` matches nested paths so a case folder can hold a directory structure
+     * without needing a rule per level.
+     */
+    match /users/{userId}/cases/{caseId}/{fileName=**} {
+      allow read: if signedIn() && request.auth.uid == userId;
+
+      allow create: if signedIn()
+                   && request.auth.uid == userId
+                   && withinSizeLimit()
+                   && isSupportedType();
+      allow update: if false;
+
+      // A user may remove their own evidence. The Firestore record and its audit entry are
+      // unaffected — deleting the file does not erase the record that it existed.
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Everything else is refused.
+     *
+     * Including the legacy `demo/` prefix that the seeded demonstration case uses for its
+     * `storagePath` values. Those paths are labels on locally generated documents, not real
+     * uploaded objects, so nothing needs to read them from Storage — and if that ever
+     * changes, the demo data must move under a real owner path rather than have a hole
+     * opened for it here.
+     */
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

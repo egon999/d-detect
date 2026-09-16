@@ -1,4 +1,4 @@
-import { normalizeText } from './text';
+import { foldDigits, normalizeText } from './text';
 
 /**
  * Monetary normalization.
@@ -91,6 +91,18 @@ function parseDecimalString(raw: string): { negative: boolean; whole: string; fr
     : text.replace(/[.,]/g, '');
   const fraction = decimalSeparator ? text.slice(text.lastIndexOf(decimalSeparator) + 1) : '';
 
+  // Whatever separators remain in the whole part must delimit well-formed groups: a
+  // leading group of one to three digits, then groups of three (or two, for Indian
+  // lakh/crore notation). Without this check "1.2.3" parses as 123 — a version number
+  // silently becoming an amount, which is exactly the class of error this module exists
+  // to prevent.
+  const wholeSource = decimalSeparator ? text.slice(0, text.lastIndexOf(decimalSeparator)) : text;
+  const groups = wholeSource.split(/[.,]/);
+  if (groups.length > 1) {
+    if (!/^\d{1,3}$/.test(groups[0]!)) return null;
+    if (groups.slice(1).some((group) => !/^\d{2,3}$/.test(group))) return null;
+  }
+
   if (!/^\d*$/.test(whole) || !/^\d*$/.test(fraction) || (!whole && !fraction)) return null;
   return { negative, whole: whole || '0', fraction };
 }
@@ -104,11 +116,19 @@ export function normalizeAmount(input: string, currency: string): NormalizedAmou
   const code = currency.toUpperCase();
   const exponent = currencyExponent(code);
 
-  // Strip a leading or trailing currency code / symbol before parsing digits.
-  const stripped = normalizeText(input)
-    .replace(/\b(INR|USD|EUR|GBP|AUD|CAD|SGD|AED|CHF|CNY|NZD|ZAR|JPY|KRW|BHD|KWD|OMR|Rs\.?)\b/gi, '')
+  // Strip a leading or trailing currency code / symbol before parsing digits. "Rs." is
+  // matched without a trailing word boundary so its full stop is removed with it —
+  // otherwise a stray separator is left in front of the number.
+  //
+  // `foldDigits` rewrites Devanagari and other non-ASCII digits as 0-9 so `₹१००` parses.
+  // It only ever affects the value computed from the text; `original` below is the caller's
+  // string untouched, so the UI still shows what the document actually printed.
+  const stripped = foldDigits(normalizeText(input))
+    .replace(/\b(INR|USD|EUR|GBP|AUD|CAD|SGD|AED|CHF|CNY|NZD|ZAR|JPY|KRW|BHD|KWD|OMR)\b/gi, '')
+    .replace(/\bRs\.?/gi, '')
     .replace(/[₹$€£¥₩₽]/g, '')
     .replace(/\b(only|\/-)\b/gi, '')
+    .replace(/^[.,\s]+|[.,\s]+$/g, '')
     .trim();
 
   const parsed = parseDecimalString(stripped);
@@ -151,7 +171,7 @@ export function formatAmount(amount: NormalizedAmount): string {
 
 /**
  * Relative difference between two amounts of the same currency, as a fraction of the
- * larger one. Returns `null` for mismatched currencies: CaseGraph does not hold
+ * larger one. Returns `null` for mismatched currencies: Detact does not hold
  * exchange rates and will not invent a comparison across them.
  */
 export function relativeDifference(a: NormalizedAmount, b: NormalizedAmount): number | null {
@@ -159,4 +179,34 @@ export function relativeDifference(a: NormalizedAmount, b: NormalizedAmount): nu
   const largest = Math.max(Math.abs(a.minorUnits), Math.abs(b.minorUnits));
   if (largest === 0) return a.minorUnits === b.minorUnits ? 0 : 1;
   return Math.abs(a.minorUnits - b.minorUnits) / largest;
+}
+
+/**
+ * Below these thresholds a difference is rounding, a fee or a tip — not a discrepancy.
+ * Either one being satisfied is enough: the relative bound keeps large invoices from
+ * tripping on paise, the absolute bound keeps small ones from tripping on a percentage
+ * of almost nothing.
+ */
+export const AMOUNT_RELATIVE_TOLERANCE = 0.01;
+export const AMOUNT_ABSOLUTE_TOLERANCE_MINOR_UNITS = 100;
+
+/**
+ * Whether two amounts disagree by enough to be worth a person's attention.
+ *
+ * Lives here, exported, because two separate consumers ask this question — the
+ * `amount-mismatch` rule that raises the finding, and the comparison table that shows the
+ * figures side by side. If they applied different thresholds the app would contradict
+ * itself: a table marking two figures as differing while the analysis reports no
+ * discrepancy between them, or the reverse. The user cannot tell which one is lying, so
+ * the threshold is defined once.
+ *
+ * Different currencies return `false` — not "they differ". Nothing here can compare INR
+ * to USD, and reporting a discrepancy between them would be an arithmetic claim the app
+ * has no basis for.
+ */
+export function amountsMateriallyDiffer(a: NormalizedAmount, b: NormalizedAmount): boolean {
+  const difference = relativeDifference(a, b);
+  if (difference === null) return false;
+  const absolute = Math.abs(a.minorUnits - b.minorUnits);
+  return difference > AMOUNT_RELATIVE_TOLERANCE && absolute >= AMOUNT_ABSOLUTE_TOLERANCE_MINOR_UNITS;
 }

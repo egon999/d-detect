@@ -1,22 +1,37 @@
-# CaseGraph — project specification
+# Product specification
 
-## Purpose
-CaseGraph reconstructs a case from scattered sources. The hierarchy is **Case → Claims → Events → Evidence → Relationships**. It is an evidence organisation and analysis tool, not legal advice, legal verification, or proof of truth. Findings describe the current linked evidence, not what definitively happened.
+Ddetect helps people assess whether claims are supported, contradicted or unresolved by supplied evidence. It organizes a dispute into explicit claims, sources and source-cited assessments. It is not an automated judge, generic AI dashboard or an authenticity certificate.
 
-## Submission scope
-An Android-first Expo Router / React Native TypeScript application with email/password Firebase authentication; owner-scoped cases; claims and events; private evidence uploads and manual notes; deterministic extraction and normalization; explainable rules; reviewable Gemini suggestions; timeline; a tappable derived graph; and append-oriented audit history. A freelancer payment dispute is available through a clearly labelled, device-local demo using the same domain commands and screens. Cloud mode never bypasses authentication or Security Rules.
+## Primary workflow
 
-## Acceptance workflow
-1. Sign in (or explicitly enter local demonstration).
-2. Create a case and claim; add a dated event.
-3. Upload a PDF, text export or image, or enter a note. Inspect processing and recover from failure.
-4. Inspect normalized fields and provenance. Confirm only after reviewing.
-5. Link evidence to claims/events with an explicit relationship type.
-6. Run analysis; inspect inputs, rule identifiers and explanations; mark reviewed/dismissed.
-7. Open timeline, graph and audit history.
+1. Create a case describing the question to investigate. Category and participants are flexible metadata.
+2. Add one or more explicit claims.
+3. Add originals or typed notes, including source information when known.
+4. Wait for persisted extraction status; review failures, unreadable text and truncation.
+5. Run case analysis over processed sources. Read each claim's status, citations, missing information and limitations.
+6. Inspect underlying evidence and graph relationships rather than relying on a headline.
+7. Return later through saved case history and search, or export a readable assessment with citations and limitations.
 
-## Boundaries
-No VPS, relational database, graph database or custom document parser. Gemini is optional and never authoritative. Image OCR is a replaceable provider boundary; manual transcription remains available if native OCR is unavailable. Exact duplicates require SHA-256 byte equality. Similar identifiers imply related sources, not independent corroboration. Review state does not change evidence content.
+Every populated record must come from the owner's workspace. Examples belong in explanatory copy or isolated tests, never in a new user's case list or search history.
 
-## Initial environment (2026-09-11)
-Workspace E:\\Project Evid was empty and not a Git repository. Scaffold created in `casegraph/` because the parent folder is not a URL-safe package name. Windows 11 build 26100; Git Bash; Node 22.15.0; npm 11.12.1. Expo SDK 55 is pinned rather than adopting latest SDK 57 without compatibility validation. Android SDK contains adb/emulator; Java was absent from PATH, no AVD or attached device. No project Firebase configuration or environment files supplied. Existing global Firebase login credentials were not read. See DEVELOPMENT.md and VERIFICATION.md for current setup and actual checks.
+## User experience contract
+
+Case creation persists before navigation. Errors preserve entered values. Upload, extraction and analysis are separate actions/states; progress is not simulated. An empty workspace explains the next meaningful step. A failed read is not an empty workspace.
+
+Profiles show actual authenticated identity, provider photo or initials, applicable password controls, saved case history, appearance and real search-privacy preferences. Provider keys and developer health checks are excluded. Google-only users manage their password through Google rather than being offered a misleading app-password form.
+
+Search includes real case metadata, claims, evidence text/entities and manual events. Model-extracted entity results require valid current source citations and link to the cited passage. Recent queries belong only to that account on that device. Graph nodes/edges must expose a meaningful relationship and route to their sources. Activity reflects actual saved jobs and audit events.
+
+Previous cloud cases remain reviewable from Profile under the owning account. Recovery only copies missing cases after review; it cannot overwrite current data. Historical text is explicitly unverified and original files require re-upload.
+
+## Evidence conclusions
+
+Supported means the supplied sources support the specific claim under the stated limitations. It does not mean every fact is verified. Contradicted means relevant conflicting evidence was identified, not that a person intentionally lied. Insufficient evidence and unresolved are legitimate outcomes.
+
+Reports preserve source coverage and citations. Missing context, uncertain transcription, duplicated sources, unknown participants and incomplete coverage must remain visible. No decorative confidence percentage may stand in for evidence quality.
+
+## Current scope boundary
+
+The implemented platform uses a local authenticated backend, private originals, durable jobs and backend-managed Groq access. It supports text/document extraction, local English/Hindi image OCR, bounded scanned/mixed-PDF OCR and speech transcription. PDF processing examines up to 80 pages and OCRs up to 10 sparse pages, with partial coverage visible. Video-frame reasoning, verified speaker identification, multi-account collaboration and public production operations remain incomplete.
+
+The detailed acceptance matrix and evidence status are in docs/rebuild-acceptance.md. Architecture and data contracts are in ARCHITECTURE.md and DATA_MODEL.md.

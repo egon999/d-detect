@@ -1,8 +1,14 @@
-import type { Evidence, Extraction, TextField } from '../models';
+import type { Evidence, Extraction, TextField, TextFieldKey } from '../models';
 import { TEXT_FIELD_KEYS } from '../models';
 import { normalizeDate } from '../normalize/dates';
 import { normalizeAmount } from '../normalize/money';
-import { normalizeIdentifier, normalizeText } from '../normalize/text';
+import {
+  normalizeEmail,
+  normalizeIdentifier,
+  normalizeName,
+  normalizePhone,
+  normalizeText,
+} from '../normalize/text';
 
 /**
  * Precedence between human and machine values.
@@ -21,21 +27,78 @@ export function fieldPath(key: string, index?: number): string {
   return index === undefined ? key : `${key}.${index}`;
 }
 
-function overrideTextField(field: TextField, value: string): TextField {
+/** Reads the index back out of a `<listKey>.<index>` path; `null` when the path is not one. */
+function parseFieldIndex(path: string): number | null {
+  const match = /\.(\d+)$/.exec(path);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * The normalizer each kind of text field is measured with.
+ *
+ * One normalizer for all of them is wrong, and this is the bug it caused: a corrected
+ * name was normalized with `normalizeIdentifier`, which uppercases and strips spaces —
+ * so a user fixing "Ravi Shrma" to "Ravi Sharma" stored the normalized value
+ * `RAVISHARMA`. Any later comparison of that person against the same name read from
+ * another document found nothing, and the entity silently stopped linking. The point of
+ * a correction is to make the two records agree, so the corrected value has to be folded
+ * the same way the extracted one was. This mirrors, key for key, what the extractor does.
+ *
+ * `keywords` is the exception: the extractor stores keywords already lowercased as
+ * `original`, so there is no folding step to reproduce beyond lowercasing.
+ */
+const NORMALIZER_FOR: Record<TextFieldKey, (value: string) => string> = {
+  people: normalizeName,
+  organizations: normalizeName,
+  emails: normalizeEmail,
+  phones: normalizePhone,
+  invoiceNumbers: normalizeIdentifier,
+  orderNumbers: normalizeIdentifier,
+  transactionIds: normalizeIdentifier,
+  addresses: normalizeText,
+  keywords: (value) => normalizeText(value).toLowerCase(),
+};
+
+function overrideTextField(
+  field: TextField,
+  value: string,
+  key: TextFieldKey,
+): TextField {
   return {
     ...field,
     original: value,
-    normalized: normalizeIdentifier(value) || normalizeText(value),
+    normalized: NORMALIZER_FOR[key](value),
     method: 'MANUAL',
     sourceQuote: field.sourceQuote,
   };
 }
 
 /**
+ * A kind of text field the extractor has a `sourceQuote` convention for. Every key in
+ * `TEXT_FIELD_KEYS` is read out of a passage of the document, so a value the user typed
+ * has no quote to point at, and the fields that carry one are left empty rather than
+ * pointed at text that never said this.
+ */
+function emptyField(key: TextFieldKey, value: string, evidenceId: string): TextField {
+  return {
+    evidenceId,
+    method: 'MANUAL',
+    original: value,
+    normalized: NORMALIZER_FOR[key](value),
+  };
+}
+
+/**
  * Applies confirmed overrides to a raw extraction.
  * Returns `null` when the evidence has never been processed and has no manual values.
+ *
+ * Takes the evidence `id` because a field the user added that the extractor never found
+ * has no extracted field to inherit one from, and a `TextField` whose `evidenceId` is
+ * wrong would attribute a manual value to a different document.
  */
-export function effectiveExtraction(evidence: Pick<Evidence, 'extraction' | 'confirmedFields'>): Extraction | null {
+export function effectiveExtraction(
+  evidence: Pick<Evidence, 'id' | 'extraction' | 'confirmedFields'>,
+): Extraction | null {
   const base = evidence.extraction;
   if (!base) return null;
 
@@ -50,11 +113,28 @@ export function effectiveExtraction(evidence: Pick<Evidence, 'extraction' | 'con
 
   for (const key of TEXT_FIELD_KEYS) {
     const list = base[key];
-    if (!list.length) continue;
-    result[key] = list.map((field, index) => {
+    const additions: TextField[] = [];
+
+    // Walked over the overrides rather than the extracted list, and over both indices in
+    // them. A confirmed value whose index is at or past the end of the extracted list —
+    // a person adding a second phone number the extractor never found — has no field to
+    // attach to. Iterating the list alone discarded it: the user's input was accepted by
+    // the form, written to `confirmedFields`, and then never shown again.
+    const updated = list.map((field, index) => {
       const override = overrides[fieldPath(key, index)];
-      return override === undefined ? field : overrideTextField(field, override);
+      return override === undefined ? field : overrideTextField(field, override, key);
     });
+
+    for (const path of Object.keys(overrides)) {
+      if (!path.startsWith(`${key}.`)) continue;
+      const index = parseFieldIndex(path);
+      if (index === null || index < list.length) continue;
+      const value = overrides[path];
+      if (value === undefined) continue;
+      additions[index - list.length] = emptyField(key, value, evidence.id);
+    }
+
+    result[key] = additions.length ? [...updated, ...additions] : updated;
   }
 
   result.dates = base.dates.map((field, index) => {

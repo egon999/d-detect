@@ -1,23 +1,32 @@
-# Roadmap
+# Remaining engineering work
 
-## Implementation sequence
-1. Inspect environment and establish documented domain/security contracts.
-2. Scaffold pinned Expo Router application; implement pure normalization, extraction, rule registry and tests.
-3. Add owner-checked Firebase commands, private Storage pipeline, validated AI suggestions and rules tests.
-4. Build authentic case/claim/event/evidence workflows and explainable analysis.
-5. Derive timeline/graph, audit view and synthetic seeded case; test and polish.
+This roadmap distinguishes implemented foundations from work needed for broader use. It is not a list of features that are already available.
 
-## Deliberately deferred
-- Native ML Kit OCR until a maintained Expo 55/new-architecture module is Android-build validated. Manual transcription and server text/PDF extraction are honest fallbacks.
-- Play Integrity/App Check enforcement pending tested native integration.
-- Multi-user authorization/collaboration; owner-only is enforced initially.
-- Advanced full-text search, semantic pairwise duplication, custom rule builder, extensive theme switching.
-- Physical erasure/account deletion, encrypted offline evidence vault and deployment-specific retention policy.
-- OCR for scanned PDFs, large/malicious document sandboxing beyond bounded MVP ingestion, high-volume case pagination, production quotas and monitoring.
-- Native APK/device verification when local Java/SDK/device prerequisites or an EAS account are unavailable.
+## Before public deployment
 
-## Demonstration story
-A freelance designer invoiced a client for a website. An invoice, delivery email and payment receipt provide linked but not conclusive sources. Two dates disagree, delivery has corroborating sources, and a second promised reimbursement lacks evidence. The examiner opens the case, follows a finding to its sources, adds/links a note, reruns rules, then explores the timeline, graph and audit trail. No synthetic AI responses are labelled real model output.
+- Replace single-process JSON persistence with a versioned database strategy appropriate for expected load, plus object storage and tested backup/restore.
+- Extend implemented account/file/connection limits with concurrency fairness, whole-server resource monitoring and operational alerts.
+- Strengthen existing document subprocess isolation with OS sandboxing and malware scanning where required; verify native network/storage permissions.
+- Deploy HTTPS, process supervision and a clear identity/revocation policy.
+- Complete retention, original-file package export, deletion and provider-data handling policy; the current readable assessment PDF is not a complete evidence archive.
+- Validate all workflows on signed Android builds and real devices, including interruptions and accessibility.
 
-## Release gate
-Refer to VERIFICATION.md rather than treating this roadmap as evidence of completion. A production release requires authenticated cloud smoke testing in the chosen project, rules emulator execution, tested Android APK, security review, cost limits and retention decisions.
+## Evidence processing
+
+- Extend current bounded scanned/mixed-PDF OCR beyond 10 sparse pages using resumable jobs; evaluate text-rich pages with embedded images and suspicious hidden text layers.
+- Add video-frame extraction and event descriptions with exact time anchors, keeping speech separate.
+- Add document structure/tables and spreadsheet extraction without executing active content.
+- Add retrieval/chunk selection for large evidence sets with explicit coverage and per-source limits.
+- Evaluate extraction and claim reasoning against independently labelled mixed-source datasets, including manipulated screenshots and adversarial instructions.
+- Add grounded entity/event normalization without merging people or events solely because labels resemble each other.
+- Implement calibrated evidence-quality dimensions when a validated method exists; do not add arbitrary percentages.
+
+## Collaborative and operational features
+
+- Design explicit case membership, invitations, roles and contributor/source attribution before enabling multiple accounts to edit a shared dispute.
+- Move search to an owner-authorized server index with pagination and source snippets.
+- Add actionable notifications only when real job-event delivery and user preferences exist.
+- Add schema migrations, data reconciliation, queue metrics and recovery tooling.
+- Maintain human review and source provenance when adding providers, deterministic validators or specialist analyzers.
+
+The current source-oriented report and repository boundaries allow these changes without exposing provider credentials in user profiles.

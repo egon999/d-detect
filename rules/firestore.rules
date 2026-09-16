@@ -1,0 +1,437 @@
+rules_version = '2';
+
+/**
+ * Ddetect — Firestore Security Rules.
+ *
+ * The authorisation model is deliberately simple, because a complicated rule set is one
+ * nobody can audit: **every document belongs to exactly one user, named in its own
+ * `ownerId` field, and only that user may read or write it.** There is no sharing, no role
+ * table and no admin escape hatch. Adding any of those later means adding a rule here, not
+ * loosening one.
+ *
+ * ## Why `ownerId` lives on the document
+ *
+ * The data layout is one top-level collection per entity type (`cases`, `claims`, …)
+ * rather than subcollections under each case. That is what lets a rule authorise a
+ * document by reading a field on the document itself. The subcollection alternative would
+ * force a `get()` on the parent case for every single read — which Firestore bills as a
+ * document read, and which would turn one case-open into hundreds of extra reads on the
+ * free plan.
+ *
+ * ## What these rules actually defend against
+ *
+ * A signed-in user reaching another user's evidence. The Firebase API key in the app is a
+ * public project identifier, not a secret — anyone can point their own client at this
+ * project and authenticate. These rules, not the client code, are the boundary. The
+ * `assertOwnership` check in `src/data/repository.ts` exists only to turn a foreign write
+ * into a clear developer error before it leaves the device; it is not a security control.
+ *
+ * ## Immutable ownership
+ *
+ * `ownerId` is fixed at creation. Allowing it to change on update would let a user hand a
+ * document to someone else — or take one — with a single field edit, which is the one way
+ * an owner-scoped model can be subverted from inside.
+ *
+ * ## Append-only means "cannot be rewritten", not "cannot be removed"
+ *
+ * Several collections here are a record of what happened: the audit log, job records,
+ * saved reports, seals. Those refuse `update` outright, and must, because an audit trail
+ * its own subject can edit is not an audit trail.
+ *
+ * They used to refuse `delete` as well, and that was a mistake with real consequences.
+ * "Erase everything" walks every collection deleting the caller's documents; `cases` was
+ * the only one that permitted it. So the button destroyed the user's cases and was then
+ * refused on the very next collection — leaving their evidence, extracted text, audit
+ * history, display name and email in Firestore permanently, orphaned and (because
+ * `hasCaseId` then pointed at a deleted case) beyond any future write. A user asking to
+ * be forgotten got the precise inverse: data lost, personal information retained.
+ *
+ * The distinction that actually matters for an audit trail is between *altering* an entry
+ * and *removing* it. An altered entry lies while looking intact. A removed one breaks the
+ * hash chain, and `verifySealedHistory` in `@domain/crucible/seal` reports exactly that —
+ * which is what sealing is for, and it works whether or not these rules permit the delete.
+ * Refusing deletes never protected against the account owner anyway; it only stopped them
+ * leaving.
+ *
+ * So: **update stays refused where history matters; delete is granted to the owner
+ * everywhere.** Tampering remains detectable, and erasure remains possible.
+ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    /** The document already stored — the owner check for read, update and delete. */
+    function ownsExisting() {
+      return signedIn()
+        && resource.data.ownerId is string
+        && resource.data.ownerId == uid();
+    }
+
+    /** The document being written — the owner check for create and update payloads. */
+    function ownsIncoming() {
+      return signedIn()
+        && request.resource.data.ownerId is string
+        && request.resource.data.ownerId == uid();
+    }
+
+    /**
+     * Ownership cannot be reassigned.
+     *
+     * Checked on update only; on create there is no prior document to compare against.
+     */
+    function ownerUnchanged() {
+      return request.resource.data.ownerId == resource.data.ownerId;
+    }
+
+    /**
+     * Every case-scoped record must name the case it belongs to.
+     *
+     * This deliberately does *not* verify the named case exists or who owns it, and the
+     * absence is the point. An earlier version ended this function with
+     *
+     *     getAfter(/databases/$(database)/documents/cases/$(...caseId)).data.ownerId == uid()
+     *
+     * which contradicted the comment sitting directly above it and cost the product far
+     * more than it bought:
+     *
+     * - **It could fail every analysis run.** Firestore permits 20 document-access calls
+     *   per batched write, and `commit()` batches up to 400 changes. One `getAfter` per
+     *   case-scoped write puts any real run — which writes findings, jobs, audit entries
+     *   and a report together — over that ceiling, and the batch is refused *in full*.
+     *   Whether identical paths are de-duplicated inside one evaluation is undocumented,
+     *   so the rule set's correctness rested on an implementation detail nobody can cite.
+     * - **It made orphans immortal.** A record whose case has been deleted can no longer
+     *   satisfy the lookup, so it can never again be updated *or* removed — see the delete
+     *   rules below, which exist to let a user erase their account.
+     * - **It secured nothing.** `ownsIncoming()` already pins `ownerId` to the caller. The
+     *   worst a client gains without the lookup is a record *it owns* naming a case id it
+     *   does not. Every query in the app is owner-scoped, so that document is invisible to
+     *   the other user and unreadable by them. It is a dangling pointer inside the
+     *   attacker's own data — a correctness bug, exactly as this comment always said, and
+     *   not a way to reach anyone else's evidence.
+     *
+     * So what is enforced is the shape: present, a string, non-empty. That is enough to
+     * keep a document out of a form the case-scoped queries can never match.
+     */
+    function hasCaseId() {
+      return request.resource.data.caseId is string
+        && request.resource.data.caseId.size() > 0;
+    }
+
+    /**
+     * The shared rule for creating and updating a case-scoped document.
+     *
+     * Note what this cannot be used for: **delete**. On a delete there is no
+     * `request.resource`, so `ownsIncoming()` and `hasCaseId()` both read fields off null.
+     * A collection that grants `allow write` with this function therefore silently refuses
+     * every delete — which is how account erasure came to destroy cases and then strand
+     * everything else. Delete is granted separately, and explicitly, per collection.
+     */
+    function caseScopedWriteAllowed() {
+      return ownsIncoming()
+        && hasCaseId()
+        && (resource == null || (ownsExisting() && ownerUnchanged()
+          && request.resource.data.caseId == resource.data.caseId));
+    }
+
+    // -----------------------------------------------------------------------
+    // User profiles
+    // -----------------------------------------------------------------------
+
+    /**
+     * A profile is keyed by the user's own uid, so the document id *is* the authorisation
+     * check. `ownerId` is still required to match, because the app writes it and a profile
+     * whose body disagrees with its own key would be a silent inconsistency.
+     */
+    match /users/{userId} {
+      allow read: if signedIn() && uid() == userId;
+      allow create: if signedIn()
+                    && uid() == userId
+                    && request.resource.data.id == userId;
+      allow update: if signedIn()
+                    && uid() == userId
+                    && request.resource.data.id == userId;
+
+      // Deleting the profile is the last step of erasing an account, after every
+      // owner-scoped document above it is already gone — so there is nothing left to
+      // orphan. Refusing it meant "erase everything" left the user's display name and
+      // email behind, which is the one piece of directly identifying data in the project.
+      allow delete: if signedIn() && uid() == userId;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cases
+    // -----------------------------------------------------------------------
+
+    /**
+     * The root entity. Unlike everything below it, a case has no `caseId` of its own, so it
+     * gets its own block rather than using `caseScopedWriteAllowed()`.
+     *
+     * Delete is allowed but the app does not use it: cases are soft-deleted by setting
+     * `deletedAt`, which keeps the audit trail intact. A hard delete stays permitted so a
+     * user can genuinely remove their own data.
+     */
+    match /cases/{caseId} {
+      allow read: if ownsExisting();
+      allow create: if ownsIncoming();
+      allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged();
+      allow delete: if ownsExisting();
+    }
+
+    // -----------------------------------------------------------------------
+    // Case-scoped entities
+    // -----------------------------------------------------------------------
+
+    match /claims/{docId} {
+      allow read: if ownsExisting();
+      allow create, update: if caseScopedWriteAllowed();
+      allow delete: if ownsExisting();
+    }
+
+    match /events/{docId} {
+      allow read: if ownsExisting();
+      allow create, update: if caseScopedWriteAllowed();
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * Evidence, and the pipeline that runs on it.
+     *
+     * The client is the processor: the extraction, the state machine, the stored-file
+     * fields and the processing jobs are all written by the app itself, on the device
+     * that holds the file. The earlier rules encoded the opposite model — creates were
+     * metadata-only (`extraction == null`, `sha256 == null`) and updates were limited to
+     * user-editable fields, because a server worker was supposed to write the results.
+     * No server exists (Spark plan, no Cloud Functions) and none is coming, so those
+     * rules did not protect the documents; they denied every legitimate write and left
+     * `extraction` permanently null for file evidence.
+     *
+     * What is still enforced, because it is what these rules are for:
+     *
+     * - Ownership: only the owner reads or writes, and ownership never changes hands.
+     * - Shape: updates may touch only the fields the application actually changes.
+     * - Permanence of identity: once a record names its stored original (`storagePath`)
+     *   and its digest (`sha256`), neither may be replaced. The digest is the entire
+     *   basis of duplicate detection and the audit chain; a record whose file silently
+     *   became a different file would be evidence tampering by bug.
+     */
+    match /evidence/{docId} {
+      allow read: if ownsExisting();
+      // Two legitimate create shapes: the metadata-first intake record for a file (no
+      // path, no digest yet — its bytes are still being written), and a complete record —
+      // a typed statement born extracted, or a file arriving through the device handover
+      // with its extraction and digest already on it. The one invariant worth keeping:
+      // a NOTE is its own content and never carries a stored original's fields.
+      allow create: if ownsIncoming() && hasCaseId()
+        && request.resource.data.id == docId
+        && (request.resource.data.kind != 'NOTE'
+            || (request.resource.data.sha256 == null && request.resource.data.storagePath == null));
+      allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged() && hasCaseId()
+        && request.resource.data.caseId == resource.data.caseId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['title', 'note', 'sourceLabel', 'capturedAt', 'fileName', 'mimeType',
+                    'sizeBytes', 'storagePath', 'sha256', 'extraction', 'state',
+                    'failureReason', 'confirmedFields', 'confirmedAt', 'deletedAt', 'updatedAt'])
+        && (resource.data.sha256 == null || request.resource.data.sha256 == resource.data.sha256)
+        && (resource.data.storagePath == null || request.resource.data.storagePath == resource.data.storagePath);
+      // The record may be removed, but never rewritten to point at different bytes — the
+      // two rules above are what make the digest permanent, and they still hold. Deleting
+      // an evidence record is how a user takes their own document back out of the product.
+      allow delete: if ownsExisting();
+    }
+
+    match /relationships/{docId} {
+      allow read: if ownsExisting();
+      allow create, update: if caseScopedWriteAllowed() && request.resource.data.origin == 'USER';
+      // Machine-derived links used to be undeletable, which meant account erasure stalled
+      // on them. Removing one is not a way to falsify anything: the analysis that inferred
+      // it re-derives it on the next run.
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * Findings from the rule engine. Created and refreshed on-device by a case analysis
+     * run; the review fields are a human's layer over the machine's output
+     * (`reviewFinding`), which is why update is not limited to the review fields — a
+     * re-run rewrites the finding itself and must be able to. Deletion stays refused:
+     * a finding that no longer holds is marked RESOLVED, never removed, so the history
+     * of what was found and when survives.
+     */
+    match /analysisResults/{docId} {
+      allow read: if ownsExisting();
+      allow create, update: if caseScopedWriteAllowed();
+      // A finding that no longer holds is still marked RESOLVED rather than removed — that
+      // is the client's behaviour and the reason the history stays readable. Delete exists
+      // for erasure, not for editing: the app has no code path that calls it on one finding.
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * Job records, written by the client at the *end* of a run and always in a terminal
+     * state — nothing in this app is a background worker, so a persisted QUEUED or
+     * PROCESSING would claim work that is not running anywhere and lock the analysis
+     * button forever. Append-only for the same reason a log is: a job is a fact about a
+     * run that finished, not a document to edit.
+     */
+    match /processingJobs/{docId} {
+      allow read: if ownsExisting();
+      allow create: if caseScopedWriteAllowed();
+      // Still never edited — a job is a fact about a run that finished.
+      allow update: if false;
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * AI suggestions: model output a person reviews, and only ever that.
+     *
+     * Created by the client's optional AI pass once the deterministic result it
+     * annotates is already saved, so a create can never imply that a model produced
+     * anything authoritative. Two shapes of write are legitimate and both are pinned:
+     *
+     * - **Create** is normally a fresh, un-reviewed proposal, and `status == 'SUGGESTED'`
+     *   is enforced here as well as in `aiSuggestionRecord` in
+     *   `src/services/ai/provenance`, so no code path — present or future — can write a
+     *   model output into the case as already accepted *without a review behind it*.
+     *
+     *   There is one other legitimate create, and refusing it was destroying data. Signing
+     *   in hands the local workspace over to the account by re-writing every record under
+     *   the new owner id (`buildMigrationPlan` in `src/services/migration-plan.ts`), and a
+     *   suggestion the user already accepted or rejected arrives carrying that verdict. A
+     *   create-time `status == 'SUGGESTED'` refused it, and because the handover is one
+     *   batch, the refusal discarded *the entire sign-in migration* — every case, every
+     *   piece of evidence — for any user who had ever reviewed a suggestion. So a reviewed
+     *   status is accepted on create when it comes with the `reviewedAt` that a real review
+     *   leaves behind. The property being protected is "nothing is accepted that nobody
+     *   reviewed", and that is what is now checked, rather than a proxy for it.
+     *
+     * - **Update** may touch only the review fields: `status`, `reviewedAt`,
+     *   `updatedAt`. The proposal itself (payload, model, promptVersion, summary,
+     *   confidence, sourceEvidenceIds) is immutable once written, which is what makes a
+     *   suggestion attributable after the model that produced it is decommissioned.
+     *
+     * Delete is the owner's, for erasure. The review history it carries is a fact about
+     * the review process, and the client never removes one on its own.
+     */
+    match /aiSuggestions/{docId} {
+      allow read: if ownsExisting();
+      allow create: if caseScopedWriteAllowed()
+        && (request.resource.data.status == 'SUGGESTED'
+            || (request.resource.data.status in ['ACCEPTED', 'REJECTED']
+                && request.resource.data.reviewedAt != null));
+      allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged() && hasCaseId()
+        && request.resource.data.caseId == resource.data.caseId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'reviewedAt', 'updatedAt'])
+        && request.resource.data.status in ['ACCEPTED', 'REJECTED'];
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * Case assessment reports. Each analysis run writes a new report document; a saved
+     * report is never edited afterwards, so the history of what was concluded — and the
+     * citations behind it — is preserved verbatim.
+     */
+    match /caseAnalyses/{docId} {
+      allow read: if ownsExisting();
+      allow create: if caseScopedWriteAllowed();
+      allow update: if false;
+      allow delete: if ownsExisting();
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit log, and the seal over it
+    // -----------------------------------------------------------------------
+
+    /**
+     * Append-only.
+     *
+     * An audit trail that the subject of the audit can edit is not an audit trail. Update
+     * and delete are refused outright — not merely owner-checked — so a user cannot rewrite
+     * the record of what they did to their own case. The client never attempts either.
+     *
+     * This is the one place where the app's own code is deliberately constrained by the
+     * rules rather than trusted by them.
+     */
+    match /auditLogs/{docId} {
+      allow read: if ownsExisting();
+      // `ANALYSIS_RUN` and `EVIDENCE_PROCESSED` used to be excluded here on the
+      // assumption that only the server worker would write them. There is no server
+      // worker; the client runs the analysis and the extraction, so those entries are
+      // its own legitimate records. The append-only rule below is what makes the trail
+      // trustworthy — not which actions a client may claim.
+      allow create: if ownsIncoming() && hasCaseId()
+        && request.resource.data.actorId == uid()
+        // …with one exception, added when sealing arrived. `SEAL_CREATED` is the only
+        // action that reports something the device did not do, so a client-written one
+        // would be a record of a signature that may not exist. The seal itself is
+        // unforgeable (see `/seals` below) and a reader checking a bundle looks there, not
+        // here — but a user reading their own history would be shown "Record sealed" for
+        // an attestation nobody made, and the audit screen is not a place to be lied to.
+        && request.resource.data.action != 'SEAL_CREATED';
+      // Never rewritten: an entry that changed while keeping its id would lie about what
+      // happened and look untouched doing it. Removal is a different act — it breaks the
+      // hash chain, and `verifySealedHistory` reports the gap — so delete is the owner's,
+      // which is what lets them erase the account. The client never calls it on one entry.
+      allow update: if false;
+      allow delete: if ownsExisting();
+    }
+
+    /**
+     * Server attestations over the audit chain. **The only collection in this file a
+     * client may not write at all.**
+     *
+     * Every other rule above grants the owner some write, because the device is where the
+     * work happens. A seal is the exception, and the reason is the whole point of it: a
+     * seal is a signature made with a key the device does not hold. Its value to a hostile
+     * reader rests entirely on the claim *this could not have been produced on the phone
+     * that produced the record*. A rule permitting the owner to create one would make that
+     * claim false — not weaker, false — because anyone could then write a document
+     * asserting any chain head at any time, and a reader would have no way to tell the
+     * asserted seals from the signed ones without checking every signature.
+     *
+     * Seals are therefore written only by `sealCase`, which runs with the Admin SDK and so
+     * bypasses these rules entirely. That is not a loophole being relied on: it is the
+     * distinction the design needs, expressed in the one place a client cannot argue with.
+     *
+     * Read stays owner-scoped like everything else. Publishing a seal to a counterparty is
+     * an export, not a Firestore read — a stranger holding a bundle verifies it against the
+     * published public key and never touches this database. See `@domain/crucible/seal`.
+     */
+    match /seals/{docId} {
+      allow read: if ownsExisting();
+      // Create and update stay refused — that refusal is the entire value of a seal.
+      allow create, update: if false;
+      // Delete is the owner's, so erasing an account is not blocked by the one collection
+      // the account cannot write. Removing a seal destroys the attestation; it cannot
+      // manufacture one, which is the only direction that would matter.
+      allow delete: if ownsExisting();
+    }
+
+    // -----------------------------------------------------------------------
+    // Default deny
+    // -----------------------------------------------------------------------
+
+    /**
+     * Anything not matched above is refused.
+     *
+     * Firestore already denies unmatched paths, so this is redundant to the engine — it is
+     * written out because a reader should not have to know that to audit this file, and
+     * because a future `match` added above this line inherits nothing from it.
+     */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

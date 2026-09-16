@@ -1,48 +1,76 @@
 {
   "expo": {
-    "name": "CaseGraph",
-    "slug": "casegraph",
-    "scheme": "casegraph",
+    "name": "Ddetect",
+    "slug": "ddetect",
+    "scheme": "ddetect",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
-    "newArchEnabled": true,
-    "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0B1220"
-    },
-    "assetBundlePatterns": ["**/*"],
+    "icon": "./assets/dd.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#030712",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.casegraph.app"
+      "bundleIdentifier": "com.ddetect.casegraph"
     },
     "android": {
-      "package": "com.casegraph.app",
+      "package": "com.ddetect.casegraph",
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
-        "backgroundColor": "#0B1220",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#030712",
+        "foregroundImage": "./assets/dd.png"
       },
       "predictiveBackGestureEnabled": false,
-      "edgeToEdgeEnabled": true
+      "allowBackup": false
     },
     "web": {
       "bundler": "metro",
       "output": "single",
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/dd.png"
     },
     "plugins": [
       "expo-router",
       "expo-image",
+      "expo-font",
+      "expo-sharing",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/dd.png",
+          "imageWidth": 180,
+          "resizeMode": "contain",
+          "backgroundColor": "#030712",
+          "dark": {
+            "image": "./assets/dd.png",
+            "backgroundColor": "#030712"
+          }
+        }
+      ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "CaseGraph needs photo access so you can attach screenshots and scanned documents as case evidence."
+          "photosPermission": "Ddetect needs photo access so you can attach screenshots and scanned documents as case evidence.",
+          "cameraPermission": "Ddetect needs camera access so you can photograph a document and add it as evidence."
         }
-      ]
+      ],
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Production"
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": false
+        }
+      ],
+      "@react-native-google-signin/google-signin",
+      "./plugins/with-release-signing.js",
+      "./plugins/with-android-security.js",
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true
@@ -50,7 +78,16 @@
     "extra": {
       "eas": {
         "projectId": null
-      }
+      },
+      "firebase": {
+        "apiKey": "AIzaSyC0Umg35kUiH1XOqb139TttQCTSF3Ut1hE",
+        "authDomain": "d-dectect.firebaseapp.com",
+        "projectId": "d-dectect",
+        "storageBucket": "d-dectect.firebasestorage.app",
+        "messagingSenderId": "398432738032",
+        "appId": "1:398432738032:android:a2dd4c9a938c5b8b63c035"
+      },
+      "googleWebClientId": "398432738032-als9m6j3mfgdqup9ue4e77guva3cl2v9.apps.googleusercontent.com"
     }
   }
 }

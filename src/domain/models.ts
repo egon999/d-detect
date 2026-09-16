@@ -83,19 +83,53 @@ export const amountFieldSchema = provenanceSchema.extend({
   minorUnits: z.number().int(),
   currency: z.string().length(3),
   role: z.string().max(40).optional(),
+  normalized: z.number().optional(),
 });
 export type AmountField = z.infer<typeof amountFieldSchema>;
+
+export const chatMessageSchema = z.object({
+  sender: z.string().max(120),
+  recipient: z.string().max(120).optional(),
+  timestamp: z.string().max(80).optional(),
+  content: z.string().max(3000),
+  tone: z.string().max(60).optional(),
+  suspicious: z.boolean().default(false),
+});
+export type ChatMessage = z.infer<typeof chatMessageSchema>;
+
+/**
+ * One span of a time-based recording, with the clock positions it occupies.
+ */
+export interface TimedSegment {
+  index: number;
+  text: string;
+  startMs: number;
+  endMs?: number;
+  source: 'speech' | 'frame-text';
+}
 
 /**
  * The normalized shape every evidence item is reduced to, whatever its source format.
  * Adding a new entity type here is the single place that changes.
  */
 export const extractionSchema = z.object({
+  limitations: z.array(z.string().max(2000)).default([]),
+  segments: z.array(z.object({
+    id: z.string().min(1).max(160),
+    text: z.string().max(30000),
+    startOffset: z.number().int().nonnegative(),
+    endOffset: z.number().int().nonnegative(),
+    page: z.number().int().positive().optional(),
+    startMs: z.number().nonnegative().optional(),
+    endMs: z.number().nonnegative().optional(),
+    method: z.string().min(1).max(60),
+  })).default([]),
   documentType: z.string().max(80),
   title: z.string().max(200),
   summary: z.string().max(1200).default(''),
   dates: z.array(dateFieldSchema).default([]),
   amounts: z.array(amountFieldSchema).default([]),
+  parties: z.array(textFieldSchema).default([]),
   people: z.array(textFieldSchema).default([]),
   organizations: z.array(textFieldSchema).default([]),
   emails: z.array(textFieldSchema).default([]),
@@ -105,6 +139,9 @@ export const extractionSchema = z.object({
   transactionIds: z.array(textFieldSchema).default([]),
   addresses: z.array(textFieldSchema).default([]),
   keywords: z.array(textFieldSchema).default([]),
+  chatMessages: z.array(chatMessageSchema).default([]),
+  transactionStatus: z.enum(['SUCCESS', 'FAILED', 'PENDING', 'CANCELLED', 'UNKNOWN']).default('UNKNOWN'),
+  disputedPoints: z.array(z.string().max(400)).default([]),
   /** Raw text the extraction was derived from. Bounded, and never written to logs. */
   sourceText: z.string().max(40_000).default(''),
   sourceTextTruncated: z.boolean().default(false),
@@ -133,10 +170,19 @@ export type TextFieldKey = (typeof TEXT_FIELD_KEYS)[number];
 
 export const userProfileSchema = z.object({
   ...baseEntity,
-  email: z.email(),
+  email: z.string().max(255),
   displayName: z.string().max(120).default(''),
+  photoURL: z.string().max(1000).nullable().default(null),
 });
 export type UserProfile = z.infer<typeof userProfileSchema>;
+
+export const caseParticipantSchema = z.object({
+  id: idSchema,
+  name: z.string().max(120),
+  role: z.string().max(80),
+  contact: z.string().max(160).optional(),
+});
+export type CaseParticipant = z.infer<typeof caseParticipantSchema>;
 
 export const caseSchema = z.object({
   ...baseEntity,
@@ -145,6 +191,10 @@ export const caseSchema = z.object({
   status: CaseStatusEnum,
   /** Free-form categorisation, e.g. "Payment dispute". Not an enum: users define their own. */
   category: z.string().max(80).default(''),
+  priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'URGENT']).default('NORMAL'),
+  participants: z.array(caseParticipantSchema).default([]),
+  tags: z.array(z.string().max(60)).default([]),
+  incidentDate: z.string().max(60).nullable().default(null),
   /** Timestamp of the last successful rule-engine run, used to show staleness. */
   lastAnalyzedAt: timestampSchema.nullable().default(null),
   deletedAt: timestampSchema.nullable().default(null),
@@ -184,6 +234,8 @@ export const evidenceSchema = z.object({
   kind: EvidenceKindEnum,
   state: ProcessingStateEnum,
   note: z.string().max(4000).default(''),
+  sourceLabel: z.string().max(240).optional(),
+  capturedAt: z.string().max(120).optional(),
 
   /** File metadata. Null for NOTE evidence, which has no underlying file. */
   fileName: z.string().max(260).nullable().default(null),
@@ -231,6 +283,24 @@ export const relationshipSchema = z.object({
 });
 export type EvidenceRelationship = z.infer<typeof relationshipSchema>;
 
+/**
+ * One value a finding rests on that was read from pixels and that no person has confirmed.
+ *
+ * Carries everything the prompt needs to be actionable without a second lookup: which
+ * evidence item, which field inside its extraction, what to call it, and what it currently
+ * reads as. `path` is the same key `confirmEvidenceFields` writes (`amounts.0`,
+ * `dates.2`), so confirming from a finding and confirming from the evidence screen are
+ * the same operation and cannot drift apart.
+ */
+export const unconfirmedReadSchema = z.object({
+  evidenceId: idSchema,
+  path: z.string().max(60),
+  label: z.string().max(60),
+  /** The value as currently read, so the prompt can show what is being confirmed. */
+  reading: z.string().max(200),
+});
+export type UnconfirmedRead = z.infer<typeof unconfirmedReadSchema>;
+
 export const analysisResultSchema = z.object({
   ...caseScopedEntity,
   resultType: AnalysisTypeEnum,
@@ -248,6 +318,26 @@ export const analysisResultSchema = z.object({
   inputs: z.record(z.string(), z.string()).default({}),
   confidence: MatchConfidenceEnum,
   status: FindingStatusEnum,
+  /**
+   * True when this finding accuses two documents of disagreeing, but at least one of the
+   * values it compared was read from an image and never confirmed by a person.
+   *
+   * A misread digit turning ₹1,500 into ₹7,500 would manufacture a contradiction that
+   * does not exist — the worst failure this product can have. Such a finding is still
+   * shown (hiding it would be its own kind of lie), but it is shown as a question rather
+   * than an accusation, and `unconfirmedReads` lists exactly what must be checked to turn
+   * it into one or make it disappear.
+   *
+   * Only conflict-shaped findings are ever provisional. An unconfirmed read that merely
+   * groups or corroborates is left alone: a misread there fails towards silence.
+   */
+  provisional: z.boolean().default(false),
+  /**
+   * The unconfirmed image-read values this finding rests on, each one a one-tap confirm
+   * target. Can be empty on a provisional finding — an AI reading of a whole document has
+   * no single field to confirm — in which case the cited evidence is what must be read.
+   */
+  unconfirmedReads: z.array(unconfirmedReadSchema).default([]),
   /** Set when a human reviews or dismisses the finding. */
   reviewedAt: timestampSchema.nullable().default(null),
   reviewNote: z.string().max(1000).default(''),
@@ -268,7 +358,9 @@ export type AuditLog = z.infer<typeof auditLogSchema>;
 
 export const processingJobSchema = z.object({
   ...caseScopedEntity,
-  evidenceId: idSchema,
+  type: z.enum(['EVIDENCE', 'CASE']).default('EVIDENCE'),
+  evidenceId: idSchema.nullable().default(null),
+  resultPath: z.string().max(600).nullable().default(null),
   state: ProcessingStateEnum,
   attempts: z.number().int().nonnegative().default(0),
   /**
@@ -284,13 +376,149 @@ export const processingJobSchema = z.object({
 });
 export type ProcessingJob = z.infer<typeof processingJobSchema>;
 
+export const caseCitationSchema = z.object({
+  evidenceId: idSchema,
+  segmentId: z.string().min(1).max(160),
+  quote: z.string().min(1).max(4000),
+  startOffset: z.number().int().nonnegative(),
+  endOffset: z.number().int().nonnegative(),
+  stance: z.enum(['SUPPORTS', 'CONTRADICTS', 'CONTEXT']),
+}).refine((value) => value.endOffset > value.startOffset, 'Citation offsets must identify source text');
+export type CaseCitation = z.infer<typeof caseCitationSchema>;
+
+export const claimAssessmentSchema = z.object({
+  claimId: idSchema,
+  statement: z.string().min(1).max(2000),
+  status: z.enum(['SUPPORTED', 'PARTIALLY_SUPPORTED', 'CONTRADICTED', 'DISPUTED', 'INSUFFICIENT_EVIDENCE', 'UNRESOLVED']),
+  explanation: z.string().max(8000),
+  citations: z.array(caseCitationSchema).max(100),
+  missingInformation: z.array(z.string().max(2000)).max(40),
+  limitations: z.array(z.string().max(2000)).max(40),
+});
+export type ClaimAssessment = z.infer<typeof claimAssessmentSchema>;
+
+const citedStatementSchema = z.object({
+  statement: z.string().min(1).max(4000),
+  citations: z.array(caseCitationSchema).min(1).max(100),
+});
+
+/** Saved by the backend after citations are checked against the source segments. */
+export const caseAnalysisSchema = z.object({
+  ...caseScopedEntity,
+  jobId: idSchema,
+  schemaVersion: z.literal('1'),
+  summary: z.string().max(10000),
+  claims: z.array(claimAssessmentSchema).max(200),
+  agreements: z.array(citedStatementSchema).max(100),
+  entities: z.array(z.object({
+    name: z.string().min(1).max(240),
+    type: z.enum(['PERSON', 'ORG', 'TRANSACTION', 'DOCUMENT', 'LOCATION']),
+    citations: z.array(caseCitationSchema).min(1).max(100),
+  })).default([]),
+  contradictions: z.array(citedStatementSchema).max(100),
+  timeline: z.array(z.object({
+    description: z.string().max(4000),
+    occurredAt: z.string().max(120).nullable(),
+    citations: z.array(caseCitationSchema).min(1).max(100),
+  })).max(200),
+  limitations: z.array(z.string().max(2000)).max(100),
+  coverage: z.object({
+    totalEvidence: z.number().int().nonnegative(),
+    processedEvidence: z.number().int().nonnegative(),
+    excludedEvidenceIds: z.array(idSchema),
+    truncated: z.boolean(),
+  }),
+  model: z.string().min(1).max(160),
+  promptVersion: z.string().min(1).max(80),
+});
+export type CaseAnalysis = z.infer<typeof caseAnalysisSchema>;
+
+/**
+ * A server's signature over a case's audit chain at a moment in time.
+ *
+ * The one record in this model a client cannot write. It is produced by a Cloud Function
+ * holding an Ed25519 key the device does not have, and stored so that anyone — with no
+ * account — can re-derive the chain and check the signature. `@domain/crucible/seal` holds
+ * the signing recipe, the verification, and the precise statement of what a seal does and
+ * does not prove; this schema is only its shape at rest.
+ *
+ * The fields are exactly what `sealPayload` signs, plus the base-entity stamps. A
+ * compile-time assertion in `@domain/crucible/seal` pins `Seal` to the `SealedAttestation`
+ * shape that module verifies, so the record written here and the bytes checked there cannot
+ * drift apart.
+ */
+export const sealSchema = z.object({
+  ...caseScopedEntity,
+  /** The audit chain head that was signed: 64 lowercase hex characters. */
+  chainHead: z.string().regex(/^[a-f0-9]{64}$/),
+  /** How many entries that head covers. The seal attests to a prefix of this length. */
+  entryCount: z.number().int().positive(),
+  /** The signing server's clock at signing time, epoch ms. Never the client's. */
+  sealedAt: timestampSchema,
+  /** The signature of the previous seal for this case, chaining the seals into a ladder. */
+  previousSealSignature: z.string().regex(/^[a-f0-9]{128}$/).nullable().default(null),
+  /** The Ed25519 signature over the seal payload: 128 lowercase hex characters. */
+  signature: z.string().regex(/^[a-f0-9]{128}$/),
+  /** Which published key signed this. An id no verifier holds is a failure, never a pass. */
+  keyId: z.string().min(1).max(60),
+  algorithm: z.literal('ed25519'),
+});
+export type Seal = z.infer<typeof sealSchema>;
+
 export const aiSuggestionSchema = z.object({
   ...caseScopedEntity,
   evidenceId: idSchema.nullable().default(null),
-  kind: z.enum(['FIELD_EXTRACTION', 'RELATIONSHIP', 'DOCUMENT_TYPE', 'EVENT_MATCH']),
+  /**
+   * What shape of proposal the payload carries.
+   *
+   * `DISPUTE_SYNTHESIS` was added when the case-level AI pass was wired: a narrative
+   * summary of the whole case is none of the four original kinds, and filing it under
+   * one of them (a `RELATIONSHIP` with no endpoints, a `DOCUMENT_TYPE` about no
+   * document) would put a false label on a record whose entire value is that its label
+   * is true. Additive only - existing kinds keep their meaning.
+   *
+   * The last four were added when the case pass was re-pointed at the work this product
+   * exists to do. The model had been asked for a narrative summary of the dispute —
+   * readable, plausible, and a restatement of what the user already knew. It was not
+   * asked to reconcile the documents against each other, to say which claims the
+   * evidence actually supports, to name what is missing, or to check whether the dates
+   * can all be true at once. Those four functions were written, tested, and never called
+   * from anywhere. They are the kinds below.
+   *
+   * `DISPUTE_SYNTHESIS` stays in this enum although nothing writes it any more. This
+   * enum is a record contract, not a list of current features: a user who ran the old
+   * pass has synthesis documents in their case, and removing the value would fail
+   * validation on load and make those records unreadable.
+   */
+  kind: z.enum([
+    'FIELD_EXTRACTION',
+    'RELATIONSHIP',
+    'DOCUMENT_TYPE',
+    'EVENT_MATCH',
+    'DISPUTE_SYNTHESIS',
+    /** Values that disagree across documents, each side quoted from its own source. */
+    'CROSS_DOCUMENT_RECONCILIATION',
+    /** What a claim would need and the case does not have. */
+    'MISSING_INFORMATION',
+    /** Whether the documents actually support each claim, graded and cited. */
+    'SUPPORT_STRENGTH',
+    /** Whether the dates across the documents can all be true together. */
+    'TIMELINE_COHERENCE',
+  ]),
   status: SuggestionStatusEnum,
-  /** Model-reported or application-derived, kept separate from deterministic confidence. */
-  confidence: z.number().min(0).max(1),
+  /**
+   * The model's own reported confidence, or `null` when it reported none.
+   *
+   * Nullable on purpose. An earlier version substituted 0.5 for a missing value, which
+   * put a number on screen that no model had ever produced — a fabricated measurement in
+   * a product whose entire claim is that it does not fabricate. "Not reported" is a real
+   * state and is stored as one.
+   *
+   * Note this is the model's self-assessment, not a measurement of accuracy. The UI shows
+   * it as an interpretable band rather than a percentage; see `confidenceBand` in
+   * `@services/ai/provenance`.
+   */
+  confidence: z.number().min(0).max(1).nullable().default(null),
   model: z.string().max(120),
   promptVersion: z.string().max(60),
   summary: z.string().max(600),
@@ -322,6 +550,8 @@ export interface Workspace {
   auditLogs: AuditLog[];
   processingJobs: ProcessingJob[];
   aiSuggestions: AIExtractionSuggestion[];
+  caseAnalyses: CaseAnalysis[];
+  seals: Seal[];
 }
 
 export function emptyWorkspace(): Workspace {
@@ -335,6 +565,8 @@ export function emptyWorkspace(): Workspace {
     auditLogs: [],
     processingJobs: [],
     aiSuggestions: [],
+    caseAnalyses: [],
+    seals: [],
   };
 }
 
@@ -348,6 +580,10 @@ export const workspaceSchema = z.object({
   auditLogs: z.array(auditLogSchema),
   processingJobs: z.array(processingJobSchema),
   aiSuggestions: z.array(aiSuggestionSchema),
+  // Defaulted, like `caseAnalyses` above it: a workspace stored before seals existed has no
+  // such key, and a required field would make every previously saved local case unreadable.
+  caseAnalyses: z.array(caseAnalysisSchema).default([]),
+  seals: z.array(sealSchema).default([]),
 });
 
 /** Collection names, shared by the Firestore adapter, Security Rules and the local adapter. */
@@ -362,5 +598,7 @@ export const COLLECTIONS = {
   auditLogs: 'auditLogs',
   processingJobs: 'processingJobs',
   aiSuggestions: 'aiSuggestions',
+  caseAnalyses: 'caseAnalyses',
+  seals: 'seals',
 } as const;
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

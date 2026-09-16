@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "398432738032",
+    "project_id": "d-dectect",
+    "storage_bucket": "d-dectect.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:398432738032:android:9de8227e0e088ff263c035",
+        "android_client_info": {
+          "package_name": "com.diya.Ddetect"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "398432738032-als9m6j3mfgdqup9ue4e77guva3cl2v9.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC0Umg35kUiH1XOqb139TttQCTSF3Ut1hE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "398432738032-als9m6j3mfgdqup9ue4e77guva3cl2v9.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

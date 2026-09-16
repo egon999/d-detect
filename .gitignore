@@ -31,7 +31,15 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
+!.env.example
+
+# Firebase native config. Not a secret (the values ship inside every APK anyway), but it is
+# per-project and does not belong to the source tree.
+google-services.json
+GoogleService-Info.plist
+.firebase/
 
 # typescript
 *.tsbuildinfo
@@ -39,3 +47,21 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+probe-output.txt
+
+# Release signing material.
+#
+# /android is already ignored, but the keystore is also copied here so that a prebuild —
+# which deletes the whole android directory — cannot destroy the only copy of the signing
+# key. That backup holds the private key and its password, so it is ignored explicitly
+# rather than relying on the rule above.
+.keystore-backup/
+*.jks
+*.keystore
+keystore.properties
+
+# Preserved and generated release APKs.
+/artifacts/android/
+# Diagnostics export bundles. Generated on demand from the developer screen and purged
+# afterwards; whatever lands here is machine-state dumps, never source.
+.diag-export/
