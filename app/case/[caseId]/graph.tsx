@@ -77,6 +77,7 @@ import {
   readableError,
   readableToken,
   RELATIONSHIP_TONE,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonList,
@@ -217,6 +218,21 @@ const REPORT_ENTITY_LABEL: Record<Lowercase<CaseAnalysis['entities'][number]['ty
 // call site. The maps stay exhaustive over their unions; only the lookup is loosened.
 const REPORT_ENTITY_LOOKUP: Record<string, string | undefined> = REPORT_ENTITY_LABEL;
 const EVIDENCE_KIND_LOOKUP: Record<string, string | undefined> = EVIDENCE_KIND_LABELS;
+
+// The same widening for the two tone maps, which needed it more and had it least.
+//
+// A label that comes back `undefined` renders as nothing; a tone that comes back `undefined`
+// is handed to `theme.tone(...)` and then read for `.fg`. `edge.type` is the one that can
+// genuinely miss: a relationship's type is stored on its document and read back, so a case
+// written by a build that declared a type this one has retired arrives here with a key the
+// map has no entry for. `node.kind` is decided while the graph is built rather than read off
+// a record, so it is closed in practice — it is widened alongside for the same reason the
+// two maps above were: the call site cannot tell which of the two it is holding.
+//
+// `neutral` is the fallback because it is the one tone that claims nothing. A link this
+// build cannot name is still drawn, in the colour that says only "this is here".
+const RELATIONSHIP_TONE_LOOKUP: Record<string, Tone | undefined> = RELATIONSHIP_TONE;
+const NODE_TONE_LOOKUP: Record<string, Tone | undefined> = NODE_TONE;
 
 const nodeKindLabel = (node: GraphNode) =>
   node.reportKind ? REPORT_KIND_LABEL[node.reportKind] : NODE_KIND_LABEL[node.kind];
@@ -374,7 +390,7 @@ function layoutMap(nodes: readonly GraphNode[], width: number): MapLayout {
 }
 
 export default function EvidenceGraphScreen() {
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const router = useRouter();
   const theme = useTheme();
   const { user } = useSession();
@@ -402,9 +418,13 @@ export default function EvidenceGraphScreen() {
 
   const graph = useMemo(
     () =>
-      buildGraph(workspace, caseId, {
-        kinds: ['claim', 'event', 'evidence', 'entity', 'conflict'],
-      }),
+      // `buildGraph` returns this same empty graph for a case it cannot find, so an absent
+      // id lands on the state the screen already draws for one that has not loaded.
+      caseId
+        ? buildGraph(workspace, caseId, {
+            kinds: ['claim', 'event', 'evidence', 'entity', 'conflict'],
+          })
+        : { nodes: [], edges: [], width: 600, height: 600 },
     [workspace, caseId],
   );
 
@@ -525,9 +545,9 @@ export default function EvidenceGraphScreen() {
    * `semantics.ts` already assigns all ten types, and is what the rest of the app draws
    * relationships with.
    */
-  const edgeTone = (edge: GraphEdge): Tone => RELATIONSHIP_TONE[edge.type];
+  const edgeTone = (edge: GraphEdge): Tone => RELATIONSHIP_TONE_LOOKUP[edge.type] ?? 'neutral';
   const edgeColor = (edge: GraphEdge) => theme.tone(edgeTone(edge)).fg;
-  const nodeColor = (node: GraphNode) => theme.tone(NODE_TONE[node.kind]).fg;
+  const nodeColor = (node: GraphNode) => theme.tone(NODE_TONE_LOOKUP[node.kind] ?? 'neutral').fg;
 
   const selectNode = useCallback((nodeId: string) => {
     setSelectedNodeId((current) => (current === nodeId ? null : nodeId));
@@ -542,6 +562,7 @@ export default function EvidenceGraphScreen() {
   }, []);
 
   const openRecord = (node: GraphNode) => {
+    if (!caseId) return;
     if (node.reportKind || node.kind === 'entity' || node.kind === 'conflict') return;
     if (node.kind === 'evidence') {
       router.push({
@@ -556,7 +577,7 @@ export default function EvidenceGraphScreen() {
   };
 
   async function triggerAnalysis() {
-    if (!user || analyzing) return;
+    if (!user || !caseId || analyzing) return;
     setAnalyzing(true);
     setAnalysisError(null);
     try {
@@ -847,7 +868,7 @@ export default function EvidenceGraphScreen() {
                             >
                               <IconTile
                                 icon={NODE_ICON[node.kind]}
-                                tone={NODE_TONE[node.kind]}
+                                tone={NODE_TONE_LOOKUP[node.kind] ?? 'neutral'}
                                 size="md"
                               />
                             </View>
@@ -875,7 +896,7 @@ export default function EvidenceGraphScreen() {
                       key={kind}
                       dot
                       size="sm"
-                      tone={NODE_TONE[kind]}
+                      tone={NODE_TONE_LOOKUP[kind] ?? 'neutral'}
                       label={NODE_KIND_LABEL[kind]}
                     />
                   ))}
@@ -891,7 +912,7 @@ export default function EvidenceGraphScreen() {
                         key={type}
                         dot
                         size="sm"
-                        tone={RELATIONSHIP_TONE[type]}
+                        tone={RELATIONSHIP_TONE_LOOKUP[type] ?? 'neutral'}
                         label={linkLabel(type)}
                       />
                     ))}
@@ -914,7 +935,7 @@ export default function EvidenceGraphScreen() {
                   <Row gap="sm" align="center" style={styles.flex}>
                     <IconTile
                       icon={NODE_ICON[selectedNode.kind]}
-                      tone={NODE_TONE[selectedNode.kind]}
+                      tone={NODE_TONE_LOOKUP[selectedNode.kind] ?? 'neutral'}
                       size="md"
                     />
                     <Stack gap="xxs" style={styles.flex}>
@@ -1001,7 +1022,7 @@ export default function EvidenceGraphScreen() {
                     <CitationList
                       citations={selectedNode.citations}
                       workspace={workspace}
-                      caseId={caseId}
+                      caseId={record.id}
                     />
                   </Stack>
                 ) : null}
@@ -1064,7 +1085,7 @@ export default function EvidenceGraphScreen() {
                   <CitationList
                     citations={selectedEdge.citations}
                     workspace={workspace}
-                    caseId={caseId}
+                    caseId={record.id}
                   />
                 ) : null}
               </Surface>
@@ -1110,7 +1131,7 @@ export default function EvidenceGraphScreen() {
                           <View style={[styles.listRowInner, { gap: theme.spacing.md }]}>
                             <IconTile
                               icon={NODE_ICON[node.kind]}
-                              tone={NODE_TONE[node.kind]}
+                              tone={NODE_TONE_LOOKUP[node.kind] ?? 'neutral'}
                               size="sm"
                             />
                             <Stack gap="xxs" style={styles.flex}>

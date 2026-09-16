@@ -11,7 +11,7 @@ import { CitationList } from '@features/analysis/case-analysis-panel';
 import { confidenceBand, readStoredEvidenceFile, requestEvidenceProcessing, useRepository, useSession, type PrivateEvidenceFile } from '@services';
 import { eraseOriginals } from '@services/erase';
 import { mutationContext, useCaseRecord, useWorkspace } from '@services/use-case-store';
-import { Button, Chip, CONFIDENCE_LABELS, IconButton, Notice, PaperSheet, ProvenanceValue, Row, ScreenScroll, SlideUpIn, Surface, Text, TextField, formatBytes, readableError, useTheme } from '@ui';
+import { Button, Chip, CONFIDENCE_LABELS, IconButton, Notice, PaperSheet, ProvenanceValue, Row, routeParam, ScreenScroll, SlideUpIn, Surface, Text, TextField, formatBytes, readableError, useTheme } from '@ui';
 
 const LINK_TYPES: RelationshipType[] = ['RELEVANT_TO_CLAIM', 'SUPPORTS', 'CONTRADICTS', 'ATTACHED_TO_EVENT'];
 const timestamp = (milliseconds: number) => `${Math.floor(milliseconds / 60000)}:${Math.floor(milliseconds / 1000 % 60).toString().padStart(2, '0')}`;
@@ -65,7 +65,10 @@ function contestRiskLine(payload: Record<string, unknown>): string | null {
 }
 
 export default function EvidenceDetailScreen() {
-  const { caseId, evidenceId, segmentId } = useLocalSearchParams<{ caseId: string; evidenceId: string; segmentId?: string }>();
+  const params = useLocalSearchParams<{ caseId?: string | string[]; evidenceId?: string | string[]; segmentId?: string | string[] }>();
+  const caseId = routeParam(params.caseId);
+  const evidenceId = routeParam(params.evidenceId);
+  const segmentId = routeParam(params.segmentId);
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const theme = useTheme();
@@ -75,7 +78,7 @@ export default function EvidenceDetailScreen() {
   const { user } = useSession();
   const { repository } = useRepository();
   const { workspace, loading, refreshing, error, reload } = useWorkspace(user?.id ?? null, caseId ?? null);
-  const caseRecord = useCaseRecord(workspace, caseId ?? null);
+  const caseRecord = useCaseRecord(workspace, caseId);
   const evidence = workspace.evidence.find(item => item.id === evidenceId && item.caseId === caseId && !item.deletedAt);
   const extraction = evidence?.extraction;
   const selectedSegment = extraction?.segments.find(segment => segment.id === segmentId);
@@ -267,7 +270,7 @@ export default function EvidenceDetailScreen() {
                 was the whole offer: a dead row, a disabled button, and a sentence telling the
                 user to go somewhere they could not get to from here. */}
             {missingOriginal
-              ? <Button label="Add the original file" onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId } })} />
+              ? <Button label="Add the original file" onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId: evidence.caseId } })} />
               : <Button label={processing ? 'Processing...' : extraction ? 'Reprocess original' : 'Process evidence'} disabled={busy || processing} onPress={() => void retry()} />}
             <Button label="Link to a claim or event" variant="ghost" onPress={() => setShowLink(true)} />
           </Row>
@@ -312,7 +315,7 @@ export default function EvidenceDetailScreen() {
             {extraction.segments.length > visibleSegments ? <Button variant="secondary" label="Show more passages" onPress={() => setVisibleSegments(value => value + 40)} /> : null}
           </>}
         </View>
-        {citations.length ? <View style={panel}><Text variant="heading">Used in the saved assessment</Text><CitationList citations={citations} workspace={workspace} caseId={caseId} /></View> : null}
+        {citations.length ? <View style={panel}><Text variant="heading">Used in the saved assessment</Text><CitationList citations={citations} workspace={workspace} caseId={evidence.caseId} /></View> : null}
         {correctionFields.length ? <Surface padding="lg" style={panel}>
           <Text variant="heading">Review extracted details</Text>
           <Text colorToken="textSecondary">Each value shows how it was read. Correcting one records your reading alongside it — the original file and the extracted passage are never changed.</Text>

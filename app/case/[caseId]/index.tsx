@@ -81,6 +81,7 @@ import {
   Pressable,
   PulseDot,
   readableError,
+  routeParam,
   Row,
   ScreenScroll,
   Section,
@@ -174,7 +175,7 @@ const DESTINATIONS: readonly Destination[] = [
 // ---------------------------------------------------------------------------
 
 export default function CaseScreen() {
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const router = useRouter();
   const theme = useTheme();
   const { user } = useSession();

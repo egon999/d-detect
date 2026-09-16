@@ -59,6 +59,7 @@ import {
   FadeIn,
   HIT_TARGET,
   Icon,
+  routeParam,
   type IconName,
   Notice,
   Pressable,
@@ -101,7 +102,7 @@ const FIELD_ICON: Record<ComparisonRow['field'], IconName> = {
 export default function CompareScreen() {
   const theme = useTheme();
   const router = useRouter();
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const { user } = useSession();
 
   // `error` is taken alongside `reload` because the empty state below is a positive claim:

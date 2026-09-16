@@ -31,6 +31,7 @@ import {
   Notice,
   Pressable,
   readableError,
+  routeParam,
   Row,
   ScreenScroll,
   Section,
@@ -91,7 +92,7 @@ export default function FilingLetterScreen() {
   const theme = useTheme();
   const router = useRouter();
   const toast = useToast();
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const { user } = useSession();
   const { workspace, loading, refreshing, error: loadError, reload } = useWorkspace(user?.id ?? null, caseId);
 

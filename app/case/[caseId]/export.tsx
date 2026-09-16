@@ -14,6 +14,7 @@ import {
   LAYOUT,
   Notice,
   RADIUS,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonCard,
@@ -66,12 +67,12 @@ export default function ExportReportScreen() {
   const theme = useTheme();
   const router = useRouter();
   const toast = useToast();
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const { user } = useSession();
   const { workspace, loading, refreshing, error: loadError, reload } = useWorkspace(user?.id ?? null, caseId);
 
   const record = useCaseRecord(workspace, caseId);
-  const report = latestCaseAnalysis(workspace, caseId);
+  const report = caseId ? latestCaseAnalysis(workspace, caseId) : null;
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +102,9 @@ export default function ExportReportScreen() {
   }, []);
 
   const exportReport = useCallback(async () => {
+    // Without an id there is no case to report on, and building one anyway would produce a
+    // document about nothing. The screen already shows "Back to cases" in that state.
+    if (!caseId) return;
     setBusy(true);
     setError(null);
     try {

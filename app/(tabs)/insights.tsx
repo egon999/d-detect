@@ -14,6 +14,7 @@ import {
   HIT_TARGET,
   LAYOUT,
   Pressable,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonCard,
@@ -54,7 +55,8 @@ export default function InsightsScreen() {
   const tabBarInset = useTabBarInset();
   const router = useRouter();
   const { user } = useSession();
-  const params = useLocalSearchParams<{ caseId?: string }>();
+  const params = useLocalSearchParams<{ caseId?: string | string[] }>();
+  const linkedCaseId = routeParam(params.caseId);
 
   const { cases, loading, refreshing, error, reload } = useCaseList(user?.id ?? null);
 
@@ -63,11 +65,11 @@ export default function InsightsScreen() {
   const [picked, setPicked] = useState<string | null>(null);
 
   const activeCase = useMemo(() => {
-    const wanted = picked ?? params.caseId ?? null;
+    const wanted = picked ?? linkedCaseId;
     // A stale id — a case opened from a link and since deleted — falls back rather than
     // leaving the screen blank with no explanation.
     return cases.find((item) => item.id === wanted) ?? cases[0] ?? null;
-  }, [cases, picked, params.caseId]);
+  }, [cases, picked, linkedCaseId]);
 
   const state = useWorkspace(user?.id ?? null, activeCase?.id ?? null);
 

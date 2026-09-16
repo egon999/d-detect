@@ -39,9 +39,11 @@ import { readFileSync } from 'node:fs';
  *
  * ## Running it
  *
- * Needs the Firestore emulator, which needs a JDK:
+ * Needs the Firestore emulator, which needs a **JDK 21 or newer** — firebase-tools 15
+ * refuses to start on anything older, and the JDK 17 that Gradle downloads for the Android
+ * build does not qualify, so a machine that builds the APK can still be unable to run this:
  *
- *     npx firebase emulators:start --only firestore
+ *     npx firebase emulators:start --only firestore --project ddetect-rules-test
  *     npx vitest run tests/firestore-rules.test.ts
  *
  * Without it every case here is skipped and the reason is printed once. That is deliberate
@@ -91,8 +93,15 @@ const available = await emulatorReachable();
 if (!available) {
   console.warn(
     `\n  [firestore-rules] Firestore emulator not reachable on ${HOST}:${PORT} — security rule ` +
-      `tests skipped.\n  Start it with: npx firebase emulators:start --only firestore  ` +
-      `(requires a JDK on PATH)\n`,
+      `tests skipped.
+  Start it with: npx firebase emulators:start --only firestore
+  ` +
+      `Needs a JDK 21+ on PATH. firebase-tools 15 refuses anything older, and the JDK 17 ` +
+      `Gradle
+  downloads for the Android build does not qualify — so a machine that ` +
+      `builds the APK
+  can still be unable to run these.
+`,
   );
 }
 
@@ -100,10 +109,20 @@ if (!available) {
  * A document body carrying only the fields the rules actually read. The rules do not
  * validate the record schema — `src/domain/models.ts` does, on the way in — so a fuller
  * fixture would test nothing extra and would rot against every schema change.
+ *
+ * `docId` is a parameter rather than a constant because `/evidence` requires
+ * `data.id == docId`, and this helper used to answer `id: 'doc_1'` for every evidence
+ * body it built. Two consequences, and the second is the worse one. `carries the whole
+ * workspace across in one batch` wrote that body to `migrated_evidence` and asserted the
+ * batch *succeeded*, which it cannot — so the handover test could never have passed. And
+ * `refuses a %s with a missing or empty caseId` did pass for evidence, but on the id
+ * mismatch rather than on the missing `caseId` it names: a green result for a rule it was
+ * not exercising. Threading the key through means a fixture states the document it is,
+ * and a test that expects a refusal gets it from the rule it is about.
  */
-function body(collection: string, ownerId: string, extra: Record<string, unknown> = {}) {
-  const base: Record<string, unknown> = { ownerId, caseId: CASE_ID, ...extra };
-  if (collection === 'evidence') return { id: 'doc_1', kind: 'TEXT', sha256: null, storagePath: null, ...base };
+function body(collection: string, ownerId: string, docId: string, extra: Record<string, unknown> = {}) {
+  const base: Record<string, unknown> = { id: docId, ownerId, caseId: CASE_ID, ...extra };
+  if (collection === 'evidence') return { kind: 'TEXT', sha256: null, storagePath: null, ...base };
   if (collection === 'relationships') return { origin: 'USER', ...base };
   if (collection === 'aiSuggestions') return { status: 'SUGGESTED', reviewedAt: null, ...base };
   if (collection === 'auditLogs') return { actorId: ownerId, action: 'CASE_CREATED', ...base };
@@ -131,7 +150,7 @@ describe.skipIf(!available)('firestore security rules', () => {
       await setDoc(doc(db, 'cases', CASE_ID), { id: CASE_ID, ownerId: ALICE, title: 'Alpha' });
       await setDoc(doc(db, 'users', ALICE), { id: ALICE, ownerId: ALICE });
       for (const name of CASE_SCOPED) {
-        await setDoc(doc(db, name, `${name}_doc`), body(name, ALICE));
+        await setDoc(doc(db, name, `${name}_doc`), body(name, ALICE, `${name}_doc`));
       }
       await setDoc(doc(db, 'seals', 'seal_1'), { id: 'seal_1', ownerId: ALICE, caseId: CASE_ID });
     });
@@ -153,7 +172,7 @@ describe.skipIf(!available)('firestore security rules', () => {
       await assertFails(deleteDoc(ref));
       // Not merely "cannot overwrite as Alice" — cannot take the document either, which is
       // the write that would otherwise convert a foreign record into one of Bob's own.
-      await assertFails(setDoc(ref, body(name, BOB)));
+      await assertFails(setDoc(ref, body(name, BOB, id)));
     });
 
     it('refuses an unauthenticated read outright', async () => {
@@ -211,9 +230,9 @@ describe.skipIf(!available)('firestore security rules', () => {
       // 90 writes spread over the collections a real analysis run touches. Comfortably
       // past 20, and past it in a single evaluation rather than 90 separate requests.
       for (let index = 0; index < 30; index += 1) {
-        batch.set(doc(db, 'analysisResults', `finding_${index}`), body('analysisResults', ALICE));
-        batch.set(doc(db, 'auditLogs', `audit_${index}`), body('auditLogs', ALICE));
-        batch.set(doc(db, 'processingJobs', `job_${index}`), body('processingJobs', ALICE));
+        batch.set(doc(db, 'analysisResults', `finding_${index}`), body('analysisResults', ALICE, `finding_${index}`));
+        batch.set(doc(db, 'auditLogs', `audit_${index}`), body('auditLogs', ALICE, `audit_${index}`));
+        batch.set(doc(db, 'processingJobs', `job_${index}`), body('processingJobs', ALICE, `job_${index}`));
       }
       await assertSucceeds(batch.commit());
     });
@@ -223,8 +242,8 @@ describe.skipIf(!available)('firestore security rules', () => {
       // rejected write cannot leave the case half-updated.
       const db = alice();
       const batch = writeBatch(db);
-      batch.set(doc(db, 'claims', 'mine'), body('claims', ALICE));
-      batch.set(doc(db, 'claims', 'theirs'), body('claims', BOB));
+      batch.set(doc(db, 'claims', 'mine'), body('claims', ALICE, 'mine'));
+      batch.set(doc(db, 'claims', 'theirs'), body('claims', BOB, 'theirs'));
       await assertFails(batch.commit());
       await assertFails(getDoc(doc(bob(), 'claims', 'mine')));
     });
@@ -242,7 +261,31 @@ describe.skipIf(!available)('firestore security rules', () => {
       // entire local workspace for anyone who had ever accepted a suggestion.
       await assertSucceeds(
         setDoc(doc(alice(), 'aiSuggestions', 'migrated'),
-          body('aiSuggestions', ALICE, { status: 'ACCEPTED', reviewedAt: 1_700_000_000_000 })),
+          body('aiSuggestions', ALICE, 'migrated', { status: 'ACCEPTED', reviewedAt: 1_700_000_000_000 })),
+      );
+    });
+
+    it('accepts a link the machine drew, which every case on the device rode on', async () => {
+      // `relationshipSchema` allows USER, RULE and AI, and `buildMigrationPlan` re-writes
+      // each record's origin unchanged. Create used to require `origin == 'USER'`, so a
+      // single link inferred by the rule engine or accepted from a model was refused — and
+      // the handover being one batch, the refusal discarded the whole local workspace with
+      // it. Latent only because all three call sites of `linkEntities` happen to pass
+      // 'USER' today, which is one argument away from untrue.
+      for (const origin of ['USER', 'RULE', 'AI']) {
+        await assertSucceeds(
+          setDoc(doc(alice(), 'relationships', `link_${origin}`),
+            body('relationships', ALICE, `link_${origin}`, { origin })),
+        );
+      }
+    });
+
+    it('still refuses an origin the app has no weight for', async () => {
+      // The app reads this field to decide how much an edge counts for. A value it does
+      // not recognise has no defined weight, so it is not storable.
+      await assertFails(
+        setDoc(doc(alice(), 'relationships', 'link_odd'),
+          body('relationships', ALICE, 'link_odd', { origin: 'IMPORTED' })),
       );
     });
 
@@ -251,7 +294,7 @@ describe.skipIf(!available)('firestore security rules', () => {
       // case as accepted unless a review was recorded.
       await assertFails(
         setDoc(doc(alice(), 'aiSuggestions', 'forged'),
-          body('aiSuggestions', ALICE, { status: 'ACCEPTED', reviewedAt: null })),
+          body('aiSuggestions', ALICE, 'forged', { status: 'ACCEPTED', reviewedAt: null })),
       );
     });
 
@@ -259,9 +302,12 @@ describe.skipIf(!available)('firestore security rules', () => {
       const db = alice();
       const batch = writeBatch(db);
       for (const name of CASE_SCOPED) {
-        batch.set(doc(db, name, `migrated_${name}`), body(name, ALICE));
+        batch.set(doc(db, name, `migrated_${name}`), body(name, ALICE, `migrated_${name}`));
       }
       batch.set(doc(db, 'cases', 'case_migrated'), { id: 'case_migrated', ownerId: ALICE });
+      // The record the batch used to die on, in the batch.
+      batch.set(doc(db, 'relationships', 'migrated_inferred'),
+        body('relationships', ALICE, 'migrated_inferred', { origin: 'RULE' }));
       await assertSucceeds(batch.commit());
     });
   });
@@ -277,6 +323,31 @@ describe.skipIf(!available)('firestore security rules', () => {
       await assertFails(updateDoc(doc(alice(), name, `${name}_doc`), { note: 'rewritten' }));
     });
 
+    it('refuses rewriting a machine-derived link as a person’s assertion', async () => {
+      // The direction that matters. Laundering a model's guess into a user's statement is
+      // the one edit worth forbidding here, inside a product whose whole claim is that it
+      // says where each value came from. Everything else about the link stays editable.
+      await env.withSecurityRulesDisabled(async (context) => {
+        await setDoc(doc(context.firestore(), 'relationships', 'inferred'),
+          body('relationships', ALICE, 'inferred', { origin: 'AI' }));
+      });
+      await assertFails(updateDoc(doc(alice(), 'relationships', 'inferred'), { origin: 'USER' }));
+      await assertSucceeds(updateDoc(doc(alice(), 'relationships', 'inferred'), { note: 'reviewed' }));
+    });
+
+    it('lets a retried handover re-write the records it already wrote', async () => {
+      // Append-only collections answer `unchanged()` rather than `false`. The handover
+      // preserves record ids so it is idempotent, and a retry of a batch whose
+      // acknowledgement was lost is therefore an *update* — refused outright by `if false`,
+      // which left the case stuck on the device forever. Identical bytes may be re-written;
+      // a single changed one may not.
+      for (const name of ['auditLogs', 'processingJobs', 'caseAnalyses']) {
+        await assertSucceeds(setDoc(doc(alice(), name, `${name}_doc`), body(name, ALICE, `${name}_doc`)));
+        await assertFails(setDoc(doc(alice(), name, `${name}_doc`),
+          body(name, ALICE, `${name}_doc`, { note: 'rewritten' })));
+      }
+    });
+
     it('refuses a client-written seal, which is the entire value of one', async () => {
       await assertFails(
         setDoc(doc(alice(), 'seals', 'forged'), { id: 'forged', ownerId: ALICE, caseId: CASE_ID }),
@@ -287,7 +358,7 @@ describe.skipIf(!available)('firestore security rules', () => {
     it('refuses a client-written SEAL_CREATED audit entry', async () => {
       await assertFails(
         setDoc(doc(alice(), 'auditLogs', 'fake_seal'),
-          body('auditLogs', ALICE, { action: 'SEAL_CREATED' })),
+          body('auditLogs', ALICE, 'fake_seal', { action: 'SEAL_CREATED' })),
       );
     });
   });
@@ -296,7 +367,7 @@ describe.skipIf(!available)('firestore security rules', () => {
     beforeEach(async () => {
       await env.withSecurityRulesDisabled(async (context) => {
         await setDoc(doc(context.firestore(), 'evidence', 'stored'),
-          body('evidence', ALICE, { sha256: 'abc123', storagePath: 'users/alice/original.pdf' }));
+          body('evidence', ALICE, 'stored', { sha256: 'abc123', storagePath: 'users/alice/original.pdf' }));
       });
     });
 
@@ -314,13 +385,13 @@ describe.skipIf(!available)('firestore security rules', () => {
     it('refuses a note that claims a stored original', async () => {
       await assertFails(
         setDoc(doc(alice(), 'evidence', 'note_1'),
-          body('evidence', ALICE, { id: 'note_1', kind: 'NOTE', sha256: 'abc', storagePath: 'x' })),
+          body('evidence', ALICE, 'note_1', { kind: 'NOTE', sha256: 'abc', storagePath: 'x' })),
       );
     });
 
     it('refuses a document whose id disagrees with its own key', async () => {
       await assertFails(
-        setDoc(doc(alice(), 'evidence', 'key_1'), body('evidence', ALICE, { id: 'different' })),
+        setDoc(doc(alice(), 'evidence', 'key_1'), body('evidence', ALICE, 'key_1', { id: 'different' })),
       );
     });
   });
@@ -328,9 +399,56 @@ describe.skipIf(!available)('firestore security rules', () => {
   describe('records that name no case', () => {
     it.each(CASE_SCOPED)('refuses a %s with a missing or empty caseId', async (name) => {
       const db = alice();
-      await assertFails(setDoc(doc(db, name, 'nocase'), { ...body(name, ALICE), caseId: '' }));
-      const { caseId: _dropped, ...withoutCase } = body(name, ALICE) as Record<string, unknown>;
+      await assertFails(setDoc(doc(db, name, 'nocase'), { ...body(name, ALICE, 'nocase'), caseId: '' }));
+      const { caseId: _dropped, ...withoutCase } = body(name, ALICE, 'nocase2') as Record<string, unknown>;
       await assertFails(setDoc(doc(db, name, 'nocase2'), withoutCase));
+    });
+  });
+
+  describe('size limits', () => {
+    const huge = (length: number) => 'x'.repeat(length);
+
+    it('refuses a case title no person typed', async () => {
+      await assertFails(
+        setDoc(doc(alice(), 'cases', 'case_big'), { id: 'case_big', ownerId: ALICE, title: huge(2001) }),
+      );
+      await assertSucceeds(
+        setDoc(doc(alice(), 'cases', 'case_ok'), { id: 'case_ok', ownerId: ALICE, title: huge(2000) }),
+      );
+    });
+
+    it('refuses an audit summary that is really a payload', async () => {
+      await assertFails(
+        setDoc(doc(alice(), 'auditLogs', 'audit_big'),
+          body('auditLogs', ALICE, 'audit_big', { summary: huge(4001) })),
+      );
+    });
+
+    it('leaves alone the field that legitimately holds a whole document', async () => {
+      // `evidence.extraction` carries the source text of a scanned file and is deliberately
+      // uncapped: a long document approaches Firestore's 1 MiB ceiling for real reasons, and
+      // a limit here would refuse the product's central use rather than an abuse of it.
+      await assertSucceeds(
+        setDoc(doc(alice(), 'evidence', 'long_doc'),
+          body('evidence', ALICE, 'long_doc', { extraction: { sourceText: huge(200_000) } })),
+      );
+    });
+
+    it('accepts a document that simply does not carry the bounded field', async () => {
+      // The trap these limits had to avoid, and the reason they read through
+      // `get(key, default)`. Rules have no null-safe access: `data.description.size() < N`
+      // on a document with no `description` is an evaluation error, and an error is a
+      // denial. `firebase-repository.ts` commits records with `batch.set()` and no merge,
+      // having stripped every undefined key on the way, so a field that is optional in the
+      // schema really is absent from the document — and a bounds check written the obvious
+      // way would refuse that write together with everything batched alongside it.
+      await assertSucceeds(
+        setDoc(doc(alice(), 'cases', 'case_bare'), { id: 'case_bare', ownerId: ALICE }),
+      );
+      await assertSucceeds(
+        setDoc(doc(alice(), 'claims', 'claim_bare'),
+          { id: 'claim_bare', ownerId: ALICE, caseId: CASE_ID }),
+      );
     });
   });
 

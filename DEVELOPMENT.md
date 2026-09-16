@@ -52,7 +52,7 @@ The backend local/start scripts build the shared deterministic domain extractor 
 
 The API health endpoint is GET http://127.0.0.1:8787/health. It confirms the process is available, not that authentication, extraction or AI access succeeds. Protected routes require a real Firebase ID token.
 
-The current Android release uses this PC's local backend through USB. Keep the server bound to loopback and EXPO_PUBLIC_API_BASE_URL=http://localhost:8787. Connect an authorized Android device with USB debugging enabled, then run the following on this PC:
+The current Android release uses this PC's local backend through USB. Keep the server bound to loopback and EXPO_PUBLIC_API_BASE_URL=http://localhost:8787. A native build also requires EXPO_PUBLIC_API_ALLOW_LOOPBACK=1: on a phone `localhost` is the phone, so src/services/api-client.ts discards a loopback address unless the build states that it is tethered. Without that flag the APK ignores the address and silently falls back to the device-local adapter, which is indistinguishable from the backend being down. The flag must be exactly `1`, and it permits only a loopback host — cleartext to a public host stays rejected. Connect an authorized Android device with USB debugging enabled, then run the following on this PC:
 
     adb reverse tcp:8787 tcp:8787
 
@@ -117,6 +117,33 @@ The default local store is functions/.data/database.json and its originals direc
 Do not run two server instances against the same data directory. A public service needs scheduled backup/restore exercises, storage monitoring and graceful process supervision before deployment.
 
 Previous Firestore data is not automatically migrated when the remote API is configured. Profile → Previous cloud cases provides an explicit review/import workflow under the same Firebase account. Cases already present cannot be overwritten. Old source text is recovered as unverified notes, while old originals and AI reports remain in the historical workspace. Imports above 400 records are rejected before writing; read-only review still works. If legacy Firestore rules deny these reads, restore the intended owner-scoped access rather than bypassing authentication or making the collection public.
+
+## Security rules
+
+`rules/firestore.rules` is the only boundary between one account's evidence and another's.
+The Firebase web config shipped in the APK is a public project identifier, so anyone can
+authenticate as themselves and talk to the project directly; the ownership checks in
+`src/data/repository.ts` run on that caller's device and protect nothing. The rules are
+what protect it, and they are only actually verified when Firestore evaluates them:
+
+    npx firebase emulators:start --only firestore --project ddetect-rules-test
+    npx vitest run tests/firestore-rules.test.ts
+
+**That needs a JDK 21 or newer on PATH.** firebase-tools 15 refuses to start the emulator on
+anything older, with `firebase-tools no longer supports Java version before Java 21`. The
+JDK Gradle downloads for the Android build (`~/.gradle/jdks/eclipse_adoptium-17-…`) is 17
+and will not do, so a machine that builds the APK successfully can still be unable to run
+these tests — and `JAVA_HOME` pointing at a JDK that was uninstalled looks identical to
+having one. Check with `java -version`, not with `JAVA_HOME`.
+
+Without the emulator that file skips every case, prints why, and the suite stays green.
+That is deliberate, but a skipped security test proves nothing. `tests/firestore-rules-shape.test.ts`
+is the companion that always runs: it reads the rules as text and checks the mechanical,
+high-consequence properties that can be checked that way — every collection is deletable by
+its owner, no rule grants `write` (which silently refuses every delete), no helper resolves
+a document while authorising a write, and the append-only collections permit no edit.
+
+Do not deploy rules as a way of testing them.
 
 ## Optional Firebase infrastructure
 

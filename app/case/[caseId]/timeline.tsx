@@ -28,6 +28,7 @@ import {
   Notice,
   Pressable,
   readableError,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonList,
@@ -150,7 +151,7 @@ function gutterDay(entry: TimelineEntry): string | null {
 }
 
 export default function TimelineScreen() {
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const router = useRouter();
   const theme = useTheme();
   const { user } = useSession();
@@ -160,11 +161,11 @@ export default function TimelineScreen() {
     caseId ?? null,
   );
   const caseRecord = useCaseRecord(workspace, caseId ?? null);
-  const mutator = useMutator(user?.id ?? null, caseId ?? null, workspace);
-  const report = latestCaseAnalysis(workspace, caseId ?? '');
+  const mutator = useMutator(user?.id ?? null, caseId, workspace);
+  const report = caseId ? latestCaseAnalysis(workspace, caseId) : null;
 
   const timeline = useMemo(
-    () => (caseRecord ? buildTimeline(workspace, caseId) : null),
+    () => (caseRecord ? buildTimeline(workspace, caseRecord.id) : null),
     [workspace, caseId, caseRecord],
   );
 
@@ -264,6 +265,7 @@ export default function TimelineScreen() {
 
   const openEntry = useCallback(
     (entry: TimelineEntry) => {
+      if (!caseId) return;
       router.push(
         entry.kind === 'event'
           ? { pathname: '/case/[caseId]/event/[eventId]', params: { caseId, eventId: entry.id } }
@@ -327,8 +329,17 @@ export default function TimelineScreen() {
                   label="Add evidence"
                   variant="secondary"
                   onPress={() =>
-                    router.push({ pathname: '/case/[caseId]/upload', params: { caseId } })
+                    caseRecord
+                      ? router.push({ pathname: '/case/[caseId]/upload', params: { caseId: caseRecord.id } })
+                      : undefined
                   }
+                  // Held back on the same condition as its neighbour above, which was
+                  // already disabled here. This one was not, so a press before the case
+                  // opened navigated to `/case//upload` — a route with a hole in it.
+                  disabled={!caseRecord}
+                  {...(caseRecord
+                    ? {}
+                    : { accessibilityHint: 'Available once this case has opened.' })}
                 />
               </Row>
 
@@ -376,7 +387,7 @@ export default function TimelineScreen() {
                             <CitationList
                               citations={event.citations}
                               workspace={workspace}
-                              caseId={caseId}
+                              caseId={caseRecord.id}
                             />
                           </Surface>
                         ))}

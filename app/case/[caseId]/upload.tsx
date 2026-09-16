@@ -19,6 +19,7 @@ import {
   Notice,
   ProgressBar,
   Row,
+  routeParam,
   ScreenScroll,
   SPACING,
   Surface,
@@ -72,7 +73,7 @@ function itemFrom(source: { uri: string; name: string; mimeType?: string | null;
 }
 
 export default function EvidenceUploadScreen() {
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const router = useRouter();
   const { user } = useSession();
   const { repository } = useRepository();
@@ -209,7 +210,7 @@ export default function EvidenceUploadScreen() {
         let uploaded = item.uploaded;
         try {
           if (!saved) {
-            const mutation = queueEvidence(current, context, caseId, {
+            const mutation = queueEvidence(current, context, record.id, {
               id: item.id, title: item.title.trim() || item.name, kind: kindFor(item),
               fileName: item.name, mimeType: item.mimeType, sizeBytes: item.size,
               sourceLabel, capturedAt,
@@ -219,7 +220,7 @@ export default function EvidenceUploadScreen() {
             saved = true; patch(item.id, { saved: true });
           }
           if (!uploaded) {
-            const storedFile = await uploadEvidenceFile({ ownerId: user.id, caseId, evidenceId: item.id, uri: item.uri, name: item.name,
+            const storedFile = await uploadEvidenceFile({ ownerId: user.id, caseId: record.id, evidenceId: item.id, uri: item.uri, name: item.name,
               mimeType: item.mimeType, sizeBytes: item.size, onProgress: (progress) => patch(item.id, { progress }), signal: controller.signal });
             // The digest exists only now, so this is the first moment a duplicate can be
             // known. Flagged, not blocked: an identical file is legitimately worth having
@@ -243,7 +244,7 @@ export default function EvidenceUploadScreen() {
           // abandoned.
           if (controller.signal.aborted) throw new Error('Upload cancelled.');
           patch(item.id, { status: 'processing' });
-          const receipt = await requestEvidenceProcessing(caseId, item.id, { repository, ownerId: user.id });
+          const receipt = await requestEvidenceProcessing(record.id, item.id, { repository, ownerId: user.id });
           // `requestEvidenceProcessing` takes no signal (its `ProcessingContext` has no
           // field for one), so a Stop pressed while it runs cannot interrupt it. What this
           // screen can guarantee is that it writes nothing for a job the user abandoned:
@@ -323,7 +324,7 @@ export default function EvidenceUploadScreen() {
       if (processed > 0 && !stopped) {
         setAnalysing(true);
         try {
-          await requestCaseAnalysis(caseId, { repository, ownerId: user.id });
+          await requestCaseAnalysis(record.id, { repository, ownerId: user.id });
           setNotice([...summary, 'The case was analysed again with these included. Open the case to see what changed.'].join(' '));
         } catch {
           // Deliberately silent. The upload is what this screen promised and the upload
@@ -343,7 +344,7 @@ export default function EvidenceUploadScreen() {
     try {
       // A statement is complete in one commit: its text is its content, so it is born
       // extracted — the same path for signed-in and local workspaces.
-      const mutation = createNote(workspace, mutationContext(user.id), caseId, { title: noteTitle.trim(), text: noteText.trim() });
+      const mutation = createNote(workspace, mutationContext(user.id), record.id, { title: noteTitle.trim(), text: noteText.trim() });
       await repository.commit(user.id, mutation.changes);
       setNoteTitle(''); setNoteText('');
       const saved = 'Your statement is saved and read on this device.';
@@ -352,7 +353,7 @@ export default function EvidenceUploadScreen() {
       // the same reason a file does. Silent on failure: the statement is already saved.
       setAnalysing(true);
       try {
-        await requestCaseAnalysis(caseId, { repository, ownerId: user.id });
+        await requestCaseAnalysis(record.id, { repository, ownerId: user.id });
         setNotice(`${saved} The case was analysed again with it included.`);
       } catch {
         // Left as saved. The case screen offers the run again and reports its own failure.
@@ -511,7 +512,8 @@ export default function EvidenceUploadScreen() {
         <TextField label="Statement content" value={noteText} onChangeText={setNoteText} multiline minHeight={TYPE.body.lineHeight * 6} maxLength={4000} />
         <Button label="Save statement" onPress={() => void saveNote()} disabled={busy || !record || !noteTitle.trim() || !noteText.trim()} />
       </Surface>
-      <Button label="Return to case" variant="secondary" disabled={busy} onPress={() => router.replace({ pathname: '/case/[caseId]', params: { caseId } })} />
+      <Button label={caseId ? 'Return to case' : 'Back to cases'} variant="secondary" disabled={busy}
+        onPress={() => caseId ? router.replace({ pathname: '/case/[caseId]', params: { caseId } }) : router.replace('/cases')} />
     </View>
   </ScreenScroll>;
 }

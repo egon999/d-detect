@@ -146,6 +146,96 @@ service cloud.firestore {
           && request.resource.data.caseId == resource.data.caseId));
     }
 
+    /**
+     * A write that produces exactly the document already stored.
+     *
+     * The escape hatch for append-only collections, and it is deliberately the strictest
+     * possible one: not a field allow-list, which is a proxy for "nothing meaningful
+     * changed", but deep equality of the whole map, which *is* that statement.
+     *
+     * It exists because `buildMigrationPlan` (`src/services/migration-plan.ts`) preserves
+     * record ids so the device handover is idempotent — "running it twice writes the same
+     * records rather than a second copy of the case", as its own comment puts it. For every
+     * collection below that answers `update: if false`, that claim was false: once the first
+     * attempt has written a document, a retry is an *update*, and an update was refused
+     * outright. Since the handover commits as a single all-or-nothing batch, a commit that
+     * succeeded but whose acknowledgement was lost left the case permanently stuck on the
+     * device, unreachable by any number of retries.
+     *
+     * Granting this costs append-only nothing. An entry that cannot change cannot lie about
+     * what happened, and that — not the literal refusal of the update verb — is what those
+     * rules are protecting. Nothing in this project writes a server-side timestamp sentinel
+     * (there is no `serverTimestamp()` or `FieldValue` anywhere in `src/`), so a re-run of
+     * the same plan genuinely reproduces the same bytes rather than merely the same shape.
+     */
+    function unchanged() {
+      return ownsExisting() && request.resource.data == resource.data;
+    }
+
+    /**
+     * Size limits, and an honest account of what they do and do not buy.
+     *
+     * Before these, this file contained exactly one bounds check in 437 lines
+     * (`caseId.size() > 0`). Nothing capped a string or an array anywhere. The client
+     * truncates and every record is parsed through a zod schema with `.max()` on each
+     * field, but neither of those is a rule: a hand-rolled client holding a valid ID token
+     * bypasses both, and the Firebase web config needed to obtain one is public by design
+     * and ships in every APK.
+     *
+     * **What this does not fix.** Spark's Firestore quota is project-wide, so exhausting it
+     * takes down every other user's writes rather than only the abuser's — but the binding
+     * limit is 20,000 *writes per day*, counted per operation regardless of size, and no
+     * security rule can limit how many times a caller writes. These caps do not defend that
+     * quota at all. Against the 1 GiB storage quota they are a real but partial mitigation,
+     * and weaker than the numbers suggest, because the collection that actually holds the
+     * bytes is the one exempted below.
+     *
+     * **What it does fix**, and the reason it is worth doing on its own merits: metadata
+     * records stay metadata-sized. An audit entry, a job record or a case title has no
+     * legitimate reason to approach Firestore's 1 MiB document ceiling, and a document that
+     * can is a document whose shape these rules do not describe. That is the same property
+     * the evidence block below already enforces when it says updates "may touch only the
+     * fields the application actually changes" — stated for size rather than for identity.
+     *
+     * **Every cap is roughly ten times its schema counterpart.** A rule tighter than the
+     * client is not a safety margin, it is an outage: it refuses writes the app makes on
+     * purpose, and — because these collections are written in batches — refuses everything
+     * batched alongside them. The relationship `origin` check below is what that mistake
+     * looks like when it ships, and the headroom here is the lesson from it. The numbers
+     * are a ceiling on absurdity, not a second opinion on the schema.
+     */
+    /**
+     * Each of these takes the map and the field name rather than the value, because the
+     * rules language has no null-safe access and an absent field is not a missing value,
+     * it is an *error* — and an error denies the write.
+     *
+     * That is not a theoretical concern here. `firebase-repository.ts` commits every
+     * workspace record with `batch.set()` and no `merge`, so the incoming document is
+     * exactly the object the app handed it; and `cleanForFirestore()` drops any key whose
+     * value is `undefined` on the way. A field that is optional in the zod schema can
+     * therefore be genuinely absent from the stored document, and a rule that reads it
+     * directly would refuse that write — together with everything batched alongside it.
+     * Reading through `get(key, default)` is what keeps a size limit a size limit.
+     *
+     * The default is `''` in all three, including the list and map forms, and deliberately
+     * so: an empty string is not a list and not a map, so an absent field fails the `is`
+     * test and is passed through, which is the same permissiveness a present field of the
+     * wrong type gets. Nothing here is asserting a type. These say one thing only — if this
+     * field is a string/list/map, it is not absurdly large — and leave every question about
+     * shape to the rules that are actually about shape.
+     */
+    function textWithin(data, key, max) {
+      return !(data.get(key, '') is string) || data.get(key, '').size() <= max;
+    }
+
+    function listWithin(data, key, max) {
+      return !(data.get(key, '') is list) || data.get(key, '').size() <= max;
+    }
+
+    function mapWithin(data, key, max) {
+      return !(data.get(key, '') is map) || data.get(key, '').size() <= max;
+    }
+
     // -----------------------------------------------------------------------
     // User profiles
     // -----------------------------------------------------------------------
@@ -185,9 +275,18 @@ service cloud.firestore {
      */
     match /cases/{caseId} {
       allow read: if ownsExisting();
-      allow create: if ownsIncoming();
-      allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged();
+      allow create: if ownsIncoming() && caseWithinBounds();
+      allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged() && caseWithinBounds();
       allow delete: if ownsExisting();
+    }
+
+    /** Ceilings on the case record's free text and its two open-ended lists. */
+    function caseWithinBounds() {
+      return textWithin(request.resource.data, 'title', 2000)
+        && textWithin(request.resource.data, 'description', 40000)
+        && textWithin(request.resource.data, 'category', 1000)
+        && listWithin(request.resource.data, 'tags', 200)
+        && listWithin(request.resource.data, 'participants', 200);
     }
 
     // -----------------------------------------------------------------------
@@ -196,13 +295,19 @@ service cloud.firestore {
 
     match /claims/{docId} {
       allow read: if ownsExisting();
-      allow create, update: if caseScopedWriteAllowed();
+      allow create, update: if caseScopedWriteAllowed()
+        && textWithin(request.resource.data, 'statement', 20000)
+        && textWithin(request.resource.data, 'detail', 40000)
+        && listWithin(request.resource.data, 'requiredEventIds', 500);
       allow delete: if ownsExisting();
     }
 
     match /events/{docId} {
       allow read: if ownsExisting();
-      allow create, update: if caseScopedWriteAllowed();
+      allow create, update: if caseScopedWriteAllowed()
+        && textWithin(request.resource.data, 'title', 2000)
+        && textWithin(request.resource.data, 'description', 40000)
+        && listWithin(request.resource.data, 'claimIds', 500);
       allow delete: if ownsExisting();
     }
 
@@ -252,9 +357,45 @@ service cloud.firestore {
       allow delete: if ownsExisting();
     }
 
+    /**
+     * Links between records — the edges the graph draws and `deriveClaimState` reads.
+     *
+     * `origin` says who asserted the link: a person (`USER`), the deterministic rule engine
+     * (`RULE`), or a model (`AI`). All three are legal in `relationshipSchema`
+     * (`src/domain/models.ts:275`), and `linkEntities` is written to produce all three — it
+     * branches on `origin == 'AI'` to log `SUGGESTION_ACCEPTED` instead of `EVIDENCE_LINKED`,
+     * for the stated reason that "it must be possible to tell which links a person
+     * originated and which they merely approved."
+     *
+     * Create used to require `origin == 'USER'`. That is the same mistake the `aiSuggestions`
+     * block below documents at length, made a second time and not noticed — a create-time
+     * constraint that holds for the records the app writes today and destroys the one write
+     * that does not come from today's app. Signing in hands the device workspace to the
+     * account by re-writing every record under the new owner id (`buildMigrationPlan`),
+     * origins preserved, as **one batch**. A single `RULE` or `AI` link anywhere in that
+     * workspace fails the check, the batch is refused in full, and what the user loses is
+     * not the link — it is every case they had on the device. Latent today only because all
+     * three call sites happen to pass `'USER'`, which is one argument away from untrue.
+     *
+     * What is enforced instead is the property actually worth protecting, and it belongs on
+     * update rather than create: **provenance cannot be revised.** A link recorded as
+     * machine-derived may never be rewritten as user-asserted. That is the direction that
+     * matters — it launders a model's guess into a person's assertion, inside a product
+     * whose entire claim is that it says where each value came from. The opposite direction
+     * has no motive and is refused anyway, the check being equality.
+     *
+     * Create is held to the three legal values so an unrecognised origin cannot be stored:
+     * the app reads this field to decide how much weight an edge carries, and a value it
+     * does not understand has no defined weight.
+     */
     match /relationships/{docId} {
       allow read: if ownsExisting();
-      allow create, update: if caseScopedWriteAllowed() && request.resource.data.origin == 'USER';
+      allow create: if caseScopedWriteAllowed()
+        && request.resource.data.origin in ['USER', 'RULE', 'AI']
+        && textWithin(request.resource.data, 'note', 20000);
+      allow update: if caseScopedWriteAllowed()
+        && request.resource.data.origin == resource.data.origin
+        && textWithin(request.resource.data, 'note', 20000);
       // Machine-derived links used to be undeletable, which meant account erasure stalled
       // on them. Removing one is not a way to falsify anything: the analysis that inferred
       // it re-derives it on the next run.
@@ -287,9 +428,13 @@ service cloud.firestore {
      */
     match /processingJobs/{docId} {
       allow read: if ownsExisting();
-      allow create: if caseScopedWriteAllowed();
-      // Still never edited — a job is a fact about a run that finished.
-      allow update: if false;
+      allow create: if caseScopedWriteAllowed()
+        && textWithin(request.resource.data, 'lastError', 6000)
+        && textWithin(request.resource.data, 'resultPath', 6000)
+        && listWithin(request.resource.data, 'completedSteps', 500);
+      // Still never edited — a job is a fact about a run that finished. A byte-identical
+      // re-write is not an edit; it is what a retried handover looks like. See `unchanged()`.
+      allow update: if unchanged();
       allow delete: if ownsExisting();
     }
 
@@ -329,7 +474,15 @@ service cloud.firestore {
       allow create: if caseScopedWriteAllowed()
         && (request.resource.data.status == 'SUGGESTED'
             || (request.resource.data.status in ['ACCEPTED', 'REJECTED']
-                && request.resource.data.reviewedAt != null));
+                && request.resource.data.reviewedAt != null))
+        // `payload` is `z.record(z.string(), z.unknown())` — its shape varies by `kind` and
+        // a cap here would be a guess at what a future proposal legitimately carries. Its
+        // key count is bounded instead, which no legitimate proposal comes near.
+        && textWithin(request.resource.data, 'summary', 6000)
+        && textWithin(request.resource.data, 'model', 1200)
+        && textWithin(request.resource.data, 'promptVersion', 600)
+        && listWithin(request.resource.data, 'sourceEvidenceIds', 500)
+        && mapWithin(request.resource.data, 'payload', 200);
       allow update: if ownsExisting() && ownsIncoming() && ownerUnchanged() && hasCaseId()
         && request.resource.data.caseId == resource.data.caseId
         && request.resource.data.diff(resource.data).affectedKeys()
@@ -346,7 +499,12 @@ service cloud.firestore {
     match /caseAnalyses/{docId} {
       allow read: if ownsExisting();
       allow create: if caseScopedWriteAllowed();
-      allow update: if false;
+      // A saved report stays verbatim, which a write reproducing it exactly does not
+      // threaten. Permitted so a retried handover can finish; see `unchanged()`.
+      //
+      // Deliberately uncapped, for the same reason `evidence` is: a report carries the
+      // citations it rests on, and a long case legitimately produces a long one.
+      allow update: if unchanged();
       allow delete: if ownsExisting();
     }
 
@@ -379,12 +537,27 @@ service cloud.firestore {
         // unforgeable (see `/seals` below) and a reader checking a bundle looks there, not
         // here — but a user reading their own history would be shown "Record sealed" for
         // an attestation nobody made, and the audit screen is not a place to be lied to.
-        && request.resource.data.action != 'SEAL_CREATED';
+        && request.resource.data.action != 'SEAL_CREATED'
+        // An audit entry is a sentence about an action and a short list of what it touched.
+        // `metadata` is capped by key count rather than by bytes, because rules can measure
+        // a map's size but not its contents; the individual values are short by
+        // construction (`z.record(z.string(), z.string())`, written only by `auditEntry`).
+        && textWithin(request.resource.data, 'summary', 4000)
+        && listWithin(request.resource.data, 'entityRefs', 500)
+        && mapWithin(request.resource.data, 'metadata', 100);
       // Never rewritten: an entry that changed while keeping its id would lie about what
       // happened and look untouched doing it. Removal is a different act — it breaks the
       // hash chain, and `verifySealedHistory` reports the gap — so delete is the owner's,
       // which is what lets them erase the account. The client never calls it on one entry.
-      allow update: if false;
+      //
+      // `unchanged()` is not an exception to that sentence, it is the sentence stated
+      // precisely: a write that reproduces the stored document changes nothing, so there is
+      // nothing for it to lie about. It exists so a retried device handover can complete —
+      // see the helper, which has the full account. Of the three collections that needed
+      // this, the audit log is the one where the reasoning has to be airtight, because it
+      // is the record the hash chain and the seal are computed over. Deep equality means a
+      // permitted update cannot move the chain by a single byte.
+      allow update: if unchanged();
       allow delete: if ownsExisting();
     }
 

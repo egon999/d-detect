@@ -144,21 +144,55 @@ describe('the shape of the security rules', () => {
     // batches up to 400 changes, so one lookup per write puts an ordinary analysis run
     // over a ceiling that refuses the batch in full. Ownership is already pinned by
     // `ownerId` on the document itself, which is the entire reason for that field.
+    //
+    // What is being looked for is the *document-resolving* form, which is always a bare
+    // call on a path: `get(/databases/$(db)/documents/cases/$(id))`. A plain substring
+    // scan for `get(` also matches `request.resource.data.get(key, default)`, which reads
+    // a field out of a map already in scope and resolves nothing — the size limits above
+    // are built on it, because rules have no null-safe access and a bounds check that
+    // reads an absent field directly denies the write instead of permitting it. Matching
+    // the method form would fail this test for a call that cannot cost a lookup, so the
+    // pattern requires the name to start a token.
     const helpers = rules.slice(0, rules.indexOf('match /users/'));
-    for (const call of ['get(', 'getAfter(', 'exists(', 'existsAfter(']) {
-      expect(helpers.includes(call), `a rule helper calls ${call}…)`).toBe(false);
+    for (const call of ['get', 'getAfter', 'exists', 'existsAfter']) {
+      const resolving = new RegExp(String.raw`(?<![.\w])${call}\s*\(`);
+      expect(resolving.test(helpers), `a rule helper calls ${call}(…) on a document path`)
+        .toBe(false);
     }
+
+    // And the scan still sees the hazard it was written for, rather than passing because
+    // the pattern got too clever. A test that can no longer fail is not a test.
+    expect(/(?<![.\w])get\s*\(/.test('return get(/databases/$(db)/documents/x/$(y)).data;'))
+      .toBe(true);
+    expect(/(?<![.\w])get\s*\(/.test("return data.get('title', '').size() < 10;")).toBe(false);
   });
 
   it('refuses updates to the collections that record what happened', () => {
     // Append-only means not rewritable. Deletion is a separate act: it breaks the seal's
     // hash chain and is reported, which is why it is allowed and editing is not.
+    //
+    // Two conditions express that, and the difference between them is the point. `false`
+    // refuses the update verb. `unchanged()` — `ownsExisting() && request.resource.data ==
+    // resource.data`, deep equality over the whole document — refuses every update that
+    // changes anything, which is the property the verb was standing in for. It is granted
+    // because `if false` broke the device handover: `buildMigrationPlan` preserves record
+    // ids so a retry rewrites the same records, and rewriting an existing record is an
+    // update, so a handover whose acknowledgement was lost could never be completed.
+    //
+    // Anything else fails. This test previously read `.toBe('false')`, which pinned the
+    // implementation rather than the property and so reported a correct fix as a
+    // regression; the allow-list is small and every entry is spelled out on purpose,
+    // because a predicate that merely looks restrictive does not belong on this list.
+    const refusesEveryChange = ['false', 'unchanged()'];
     for (const collection of ['auditLogs', 'processingJobs', 'caseAnalyses', 'seals']) {
       const updates = (grants.get(collection) ?? []).filter((grant) => grant.verb === 'update');
       expect(updates.length, `/${collection} declares no update rule`).toBeGreaterThan(0);
       for (const { condition } of updates) {
-        expect(condition, `/${collection} is a record of what happened and must not be editable`)
-          .toBe('false');
+        expect(
+          refusesEveryChange,
+          `/${collection} is a record of what happened and must not be editable. \`${condition}\` ` +
+            `is neither \`false\` nor \`unchanged()\`, so it permits some edit to a stored entry.`,
+        ).toContain(condition);
       }
     }
   });

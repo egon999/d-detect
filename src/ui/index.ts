@@ -24,6 +24,10 @@ export * from './semantics';
 // a value it did not write and cannot narrow to a type.
 export * from './readable';
 
+// `route` is the same idea at the other end of the screen: what it calls for a value the URL
+// handed it, which is the app's other source of data it did not write.
+export * from './route';
+
 export * from './primitives/Text';
 export * from './primitives/Layout';
 export * from './primitives/ErrorBoundary';

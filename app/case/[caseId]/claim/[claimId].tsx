@@ -19,6 +19,7 @@ import {
   Notice,
   RADIUS,
   readableError,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonCard,
@@ -81,7 +82,9 @@ function assessmentProvenance(report: CaseAnalysis): { label: string; note: stri
  * says which wording was assessed instead of silently showing the old conclusion.
  */
 export default function ClaimDetailScreen() {
-  const { caseId, claimId } = useLocalSearchParams<{ caseId: string; claimId: string }>();
+  const params = useLocalSearchParams<{ caseId?: string | string[]; claimId?: string | string[] }>();
+  const caseId = routeParam(params.caseId);
+  const claimId = routeParam(params.claimId);
   const { user } = useSession();
   const { repository } = useRepository();
   const router = useRouter();
@@ -167,7 +170,7 @@ export default function ClaimDetailScreen() {
   }, [user, claim, statement, detail, workspace, repository, reload, action]);
 
   const saveLink = useCallback(async () => {
-    if (!user || !claim || !selectedEvidence || !reason.trim()) return;
+    if (!user || !claim || !caseId || !selectedEvidence || !reason.trim()) return;
     await action(async () => {
       const mutation = linkEntities(workspace, mutationContext(user.id), caseId, {
         from: { kind: 'evidence', id: selectedEvidence },
@@ -337,7 +340,7 @@ export default function ClaimDetailScreen() {
 
               <Text>{assessment.explanation}</Text>
 
-              <CitationList citations={assessment.citations} workspace={workspace} caseId={caseId} />
+              <CitationList citations={assessment.citations} workspace={workspace} caseId={claim.caseId} />
 
               {assessment.missingInformation.length ? (
                 <View style={{ gap: theme.spacing.sm }}>
@@ -394,7 +397,7 @@ export default function ClaimDetailScreen() {
               disabled={busy || running || !ready}
               onPress={() =>
                 void action(async () => {
-                  if (!user) return;
+                  if (!user || !caseId) return;
                   await requestCaseAnalysis(caseId, { repository, ownerId: user.id });
                   reload();
                   setNotice('Assessment finished on this device.');
@@ -404,7 +407,7 @@ export default function ClaimDetailScreen() {
             <Button
               label="Add evidence"
               variant="secondary"
-              onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId } })}
+              onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId: claim.caseId } })}
             />
           </Row>
 
@@ -453,7 +456,7 @@ export default function ClaimDetailScreen() {
                           onPress={() =>
                             router.push({
                               pathname: '/case/[caseId]/evidence/[evidenceId]',
-                              params: { caseId, evidenceId: source.id },
+                              params: { caseId: claim.caseId, evidenceId: source.id },
                             })
                           }
                         />

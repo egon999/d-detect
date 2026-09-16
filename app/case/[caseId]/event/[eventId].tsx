@@ -51,6 +51,7 @@ import {
   LAYOUT,
   Notice,
   readableError,
+  routeParam,
   Row,
   ScreenScroll,
   Section,
@@ -64,7 +65,9 @@ import {
 export default function EventDetailScreen() {
   const theme = useTheme();
   const router = useRouter();
-  const { caseId, eventId } = useLocalSearchParams<{ caseId: string; eventId: string }>();
+  const params = useLocalSearchParams<{ caseId?: string | string[]; eventId?: string | string[] }>();
+  const caseId = routeParam(params.caseId);
+  const eventId = routeParam(params.eventId);
   const { user } = useSession();
 
   // `error` matters here for a specific reason: a failed load leaves the workspace empty,

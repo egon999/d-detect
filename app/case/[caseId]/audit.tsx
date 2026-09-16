@@ -76,6 +76,8 @@ import {
   IconTile,
   Notice,
   Pressable,
+  readableToken,
+  routeParam,
   Row,
   ScreenScroll,
   SkeletonCard,
@@ -166,6 +168,37 @@ const REF_KIND_META: Record<EntityKind, { icon: IconName; noun: string }> = {
 };
 
 /**
+ * Reading the three tables above for a value that came out of storage.
+ *
+ * Each is declared `Record<Union, …>` so that adding a member to the union fails the build
+ * until it has been given an icon and a tone — worth keeping. But that same typing tells
+ * TypeScript every lookup succeeds, and here the key is not a literal from this file: it is
+ * `log.action` and `ref.kind`, read back off a document. Indexing straight into `.icon`
+ * then throws inside render.
+ *
+ * This screen is the one where that matters most. Audit entries are append-only — never
+ * rewritten, never migrated — so they are the oldest records a case holds and the likeliest
+ * to name an action a later build stopped declaring. `audit-chain.ts` says outright that
+ * this is "the one screen that must still render for a case that has been deleted or has
+ * not loaded yet", because "an integrity panel that crashes the screen it is reporting on
+ * would be a poor kind of integrity." The domain layer holds up its end of that; the render
+ * did not.
+ *
+ * The fallbacks show the entry rather than hide it. An action nobody has a label for still
+ * happened, so it is drawn in neutral with a plain mark and `readableToken` turns its stored
+ * name into a phrase — `CASE_STATUS_CHANGED` reads as "Case status changed". A guessed icon
+ * or a borrowed tone would be worse than a plain one: both assert something about an entry
+ * this build does not understand, on the screen whose whole job is not to do that.
+ */
+const UNKNOWN_ACTION: { icon: IconName; tone: Tone } = { icon: 'circle-outline', tone: 'neutral' };
+const UNKNOWN_REF_KIND: { icon: IconName; noun: string } = { icon: 'circle-outline', noun: 'Record' };
+
+const actionMeta = (action: AuditAction) => ACTION_META[action] ?? UNKNOWN_ACTION;
+const refKindMeta = (kind: EntityKind) => REF_KIND_META[kind] ?? UNKNOWN_REF_KIND;
+const actionLabel = (action: AuditAction) =>
+  (AUDIT_ACTION_LABELS[action] ?? readableToken(action)) || 'Recorded';
+
+/**
  * A reference's id with any kind prefix taken off.
  *
  * Participants and findings are cited with their kind already prefixed onto the id
@@ -215,7 +248,7 @@ function refLabel(ref: EntityRef, names: ReadonlyMap<string, string>): string {
   // Truncated because a claim statement is a sentence and a chip is one line. The chip
   // ellipsises too, but doing it here keeps the accessibility label — which `Chip` reads
   // from `label` — as short as what is drawn, rather than reading out a paragraph.
-  return name ? truncate(name, 48) : REF_KIND_META[ref.kind].noun;
+  return name ? truncate(name, 48) : refKindMeta(ref.kind).noun;
 }
 
 /** Where a reference chip leads. The three kinds that have a screen of their own. */
@@ -307,7 +340,7 @@ function formatExactDate(timestamp: number): string {
 
 export default function CaseAuditTrailScreen() {
   const theme = useTheme();
-  const { caseId } = useLocalSearchParams<{ caseId: string }>();
+  const caseId = routeParam(useLocalSearchParams<{ caseId?: string | string[] }>().caseId);
   const { user } = useSession();
   // Which adapter is actually serving this session. The append-only guarantee is a property
   // of the backend, not of the app, so the copy below is conditioned on this rather than
@@ -714,7 +747,7 @@ function AuditRow({
 }) {
   const theme = useTheme();
   const router = useRouter();
-  const meta = ACTION_META[log.action];
+  const meta = actionMeta(log.action);
 
   return (
     <Surface radius="md" style={styles.logCard}>
@@ -726,7 +759,7 @@ function AuditRow({
             <Chip
               tone={meta.tone}
               emphasis="soft"
-              label={AUDIT_ACTION_LABELS[log.action]}
+              label={actionLabel(log.action)}
               size="sm"
               shrink
             />
@@ -746,7 +779,7 @@ function AuditRow({
                   <Chip
                     tone="neutral"
                     emphasis="outline"
-                    icon={REF_KIND_META[ref.kind].icon}
+                    icon={refKindMeta(ref.kind).icon}
                     label={label}
                     size="sm"
                     shrink
@@ -764,7 +797,7 @@ function AuditRow({
                     pressScale={0.96}
                     accessibilityRole="link"
                     accessibilityLabel={label}
-                    accessibilityHint={`Opens this ${REF_KIND_META[ref.kind].noun.toLowerCase()}.`}
+                    accessibilityHint={`Opens this ${refKindMeta(ref.kind).noun.toLowerCase()}.`}
                     onPress={() => router.push(route)}
                     // The chip itself is a label-height pill. The touch area around it is
                     // what has to be reachable, so the wrapper carries the minimum and
