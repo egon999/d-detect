@@ -16,14 +16,36 @@
  * *blockchain*-anything, and never *verified* without saying verified against what. A missing
  * or failing seal is reported as the specific thing that does not line up, never as an
  * accusation: this app knows that a digest differs, and does not know who changed it or why.
+ *
+ * ## Which key signed is part of the claim, not a detail
+ *
+ * `server-sealed` is a claim about independence — that the signature could not have been made
+ * on the device holding the records — and it is only true of a key whose private half lives on
+ * a deployed server. `@domain/crucible/keys` maintains a second family for exactly this reason:
+ * the self-hosted signer in `functions/local-server.js` often runs on the same machine as the
+ * app, so it signs with `dev1` instead, and the id travels on the seal into every export.
+ *
+ * So the wording here turns on `latest.keyId`. A development seal is not a fault and is never
+ * rendered as one — the signature is correct, and it still breaks on any later edit — but it
+ * does not get the green chip or the word *server*, because those assert the one thing it
+ * cannot. Saying otherwise would manufacture the exact claim the split key registry exists to
+ * avoid manufacturing, and it would do it in the app's own voice.
  */
 
 import type { CaseSealState } from '@domain/crucible/case-seal-state';
+// The one runtime import here, and it earns its place. `keys.ts` separates production from
+// development signing ids precisely so the copy can tell a reader which one signed, and says
+// so in its own doc; until this import existed the separation was carried on every seal and
+// read by nothing.
+import { isDevelopmentSealKey } from '@domain/crucible/keys';
 import type { SealBreak } from '@domain/crucible/seal';
 // Both type-only, so this stays a plain module a Node test can import: `@ui/icon` pulls in
 // the native icon font at runtime, and a `import type` is erased before that can happen.
 import type { IconName } from '@ui/icon';
 import type { Tone } from '@ui/tokens';
+// Same discipline, same reason. `@services/crucible/request-seal` reaches Firebase and the
+// platform API at runtime; only the name of its three-state answer is wanted here.
+import type { SealAvailability } from '@services/crucible/request-seal';
 
 /** The one-line answer, and the chip beside it. */
 export interface SealHeadline {
@@ -43,9 +65,31 @@ export interface SealNotice {
 /** What the ribbon needs to know, as little of it as possible. */
 export interface SealCopyInput {
   state: CaseSealState;
-  /** `false` for a device-only session, which has no server to sign anything. */
-  serverBacked: boolean;
+  /**
+   * Whether a signer can be reached, which is not the same as where the case is stored.
+   *
+   * This was `serverBacked: boolean`, and the boolean was the defect. It answered the storage
+   * question, so a Firebase workspace — records on a server, no `sealCase` deployed in front
+   * of them — read as sealable and got an enabled button that could only ever fail. Three
+   * states, because the two unsealable ones need different sentences: one case has never left
+   * the device, the other is on a server with nothing to sign it.
+   */
+  availability: SealAvailability;
 }
+
+/**
+ * The three things a seal is not, in the order a reader needs to hear them.
+ *
+ * One copy, shared by both sealed notices, because this sentence is the part §9 of the concept
+ * actually governs. Written out twice it would drift: a correction to the production wording
+ * would leave the development notice quietly saying last month's version of the caveat, and the
+ * vocabulary sweep would pass both because each is separately clean.
+ *
+ * It is a constant rather than a branch because it is true of every seal this app can make. Key
+ * family, transport and coverage all change what a seal establishes; none of them change these.
+ */
+const SEAL_LIMITS =
+  'It is tamper-evident — it reveals an edit rather than preventing one. It says nothing about whether the records are true, and it is not a legal attestation.';
 
 /**
  * Breaks worth showing a reader.
@@ -125,20 +169,44 @@ export function describeBreak(item: SealBreak): string {
 /**
  * The headline and chip.
  *
- * Ordered by what a reader most needs to know: a break outranks everything, then coverage,
- * then the absence of a seal. `ok` is reserved for a signature that actually checked out —
+ * Ordered by what a reader most needs to know: a mismatch outranks everything, then a seal
+ * this build cannot check at all, then coverage, then the absence of a seal. The second rung
+ * is the one that was missing, and its absence cost the file both ways at once - an
+ * unknown-key seal took the danger chip for a comparison nothing had made, and would have
+ * taken the green one the moment that fault was merely filtered out. `ok` is reserved for a signature that actually checked out —
  * never for the mere existence of a seal, which is the reading a hostile counterparty would
  * be right to reject.
  */
-export function sealHeadline({ state, serverBacked }: SealCopyInput): SealHeadline {
+export function sealHeadline({ state, availability }: SealCopyInput): SealHeadline {
   const { latest, unsealedEntries, chain } = state;
-  const faults = sealFaults(state);
+  const mismatches = sealMismatches(state);
+  const uncheckable = sealUncheckable(state);
 
-  if (faults.length > 0) {
+  if (mismatches.length > 0) {
     return {
       tone: 'danger',
       chip: 'Does not match',
       sentence: 'A seal on this record no longer matches its history.',
+    };
+  }
+  // Second, not first, and the order is load-bearing in both directions.
+  //
+  // A real mismatch outranks an uncheckable seal, because a case can hold both and burying
+  // "this does not add up" under "this build is too old" would lose the one fact the reader
+  // has to act on. But this branch has to come before the two below, because `latest` is set
+  // for an unknown-key seal exactly as it is for a good one: without it a seal that nothing
+  // compared falls straight into the green `Server-sealed` branch, which is the same overclaim
+  // as the danger chip was, pointing the other way.
+  //
+  // `info` rather than `warn`. Nothing is wrong here and nothing needs attention — a key
+  // rotation the reader had no part in produces this, and the remedy, if there is one, is an
+  // app update rather than anything about their record.
+  if (uncheckable.length > 0) {
+    const n = uncheckable.length;
+    return {
+      tone: 'info',
+      chip: 'Cannot be checked',
+      sentence: `${n === 1 ? 'A seal on this record cannot' : `${n} seals on this record cannot`} be checked by this version of the app, so nothing has been compared.`,
     };
   }
   if (latest && unsealedEntries === 0) {
@@ -151,13 +219,25 @@ export function sealHeadline({ state, serverBacked }: SealCopyInput): SealHeadli
     // difference explained rather than papered over.
     const covered = latest.entryCount;
     const since = chain.length - covered;
+    // Read off the key the seal carries, never off how the request was made. The id is the
+    // only part of this that survives into an export a stranger opens, which is exactly why
+    // `keys.ts` puts the distinction in the registry rather than behind an environment flag.
+    //
+    // `ok` is withheld from a development seal, and the demotion is the point rather than a
+    // side effect. A green "Server-sealed" chip asserts an independent signer; `dev1` is
+    // defined as a key whose private half no deployed server holds, so the signature may have
+    // been made by the same machine that produced the records. The signature is still correct
+    // — this is not a fault and must never read as one — it simply attests to less, so it gets
+    // the tone for "true, and here is what it means" rather than the one for "checked out".
+    const development = isDevelopmentSealKey(latest.keyId);
+    const signature = development ? 'development-key signature' : 'server signature';
     return {
-      tone: 'ok',
-      chip: 'Server-sealed',
+      tone: development ? 'info' : 'ok',
+      chip: development ? 'Development seal' : 'Server-sealed',
       sentence:
         since === 0
-          ? `All ${covered} recorded ${covered === 1 ? 'entry is' : 'entries are'} covered by a server signature.`
-          : `A server signature covers ${covered === 1 ? 'the entry' : `the ${covered} entries`} recorded before it; ${since === 1 ? 'the one entry since is the record of the sealing itself' : `the ${since} entries since only record sealing`}.`,
+          ? `All ${covered} recorded ${covered === 1 ? 'entry is' : 'entries are'} covered by a ${signature}.`
+          : `A ${signature} covers ${covered === 1 ? 'the entry' : `the ${covered} entries`} recorded before it; ${since === 1 ? 'the one entry since is the record of the sealing itself' : `the ${since} entries since only record sealing`}.`,
     };
   }
   if (latest) {
@@ -167,7 +247,14 @@ export function sealHeadline({ state, serverBacked }: SealCopyInput): SealHeadli
       sentence: `${unsealedEntries} ${unsealedEntries === 1 ? 'entry has' : 'entries have'} been recorded since the last seal, and no signature covers ${unsealedEntries === 1 ? 'it' : 'them'} yet.`,
     };
   }
-  if (!serverBacked || chain.head === null) {
+  // No new branch for `no-service`, and that is a decision rather than an oversight. The
+  // sentence below is about what has vouched for the history, not about where the history is
+  // kept, and "nothing" is exactly as true for a Firestore case with no signer deployed as it
+  // is for one that never left the phone: storage is not vouching. The alternative sentence —
+  // "A server can sign this history" — is the one that would be false, because in this build
+  // none can, and it is reserved for `available` accordingly. The notice underneath is where
+  // the two states stop sounding alike; it says which of them the reader is in.
+  if (availability !== 'available' || chain.head === null) {
     return {
       tone: 'neutral',
       chip: 'Not sealed',
@@ -188,33 +275,108 @@ export function sealHeadline({ state, serverBacked }: SealCopyInput): SealHeadli
  * limitation note *because* it is the good case: a green chip with no caveat is how a reader
  * ends up believing the seal says more than it does.
  */
-export function sealNotice({ state, serverBacked }: SealCopyInput): SealNotice | null {
+export function sealNotice({ state, availability }: SealCopyInput): SealNotice | null {
   const { latest, chain } = state;
-  const faults = sealFaults(state);
+  const mismatches = sealMismatches(state);
+  const uncheckable = sealUncheckable(state);
 
-  if (faults.length > 0) {
+  if (mismatches.length > 0) {
+    // An uncheckable seal alongside a real mismatch is described *after* the verdict, not
+    // folded into the list before it. "A seal is a signature over one specific history, and
+    // this is not that one" is a claim about the sentences it follows, and a seal nothing
+    // compared cannot be one of them. Each `describeBreak` sentence for an uncheckable kind
+    // disclaims wrongness in its own words, so it survives the move intact — and dropping
+    // them instead would be the other way to get this wrong, silently narrowing the notice to
+    // the faults that happen to fit its title.
+    const aside = uncheckable.length > 0 ? ` ${uncheckable.map(describeBreak).join(' ')}` : '';
     return {
       tone: 'danger',
       icon: 'alert-circle-outline',
-      title: faults.length === 1 ? 'The seal does not match this history' : 'The seals do not match this history',
-      message: `${faults.map(describeBreak).join(' ')} A seal is a signature over one specific history, and this is not that one. That can mean a record was changed after sealing, or that this copy of the case is incomplete. On its own it is not evidence of who changed it, or why.`,
+      title: mismatches.length === 1 ? 'The seal does not match this history' : 'The seals do not match this history',
+      message: `${mismatches.map(describeBreak).join(' ')} A seal is a signature over one specific history, and this is not that one. That can mean a record was changed after sealing, or that this copy of the case is incomplete. On its own it is not evidence of who changed it, or why.${aside}`,
+    };
+  }
+  if (uncheckable.length > 0) {
+    // The absence of a finding, stated as plainly as a finding would be. `describeBreak`
+    // already names the key or the scheme and says an update may add it; the sentence after
+    // it adds the one thing a per-break description cannot say, which is that the app has not
+    // judged the record either way — precisely what the headline above used to assert it had.
+    return {
+      tone: 'info',
+      icon: 'help-circle-outline',
+      title: uncheckable.length === 1 ? 'This version cannot check the seal' : 'This version cannot check these seals',
+      message: `${uncheckable.map(describeBreak).join(' ')} Nothing was compared, so nothing here is a finding about the record: the history on this device has not been judged either way.`,
     };
   }
   if (latest) {
     const n = latest.entryCount;
+    const entries = `${n} ${n === 1 ? 'entry' : 'entries'}`;
+    const them = n === 1 ? 'it' : 'them';
+
+    if (isDevelopmentSealKey(latest.keyId)) {
+      // The notice `keys.ts` said already existed. It does not exist yet at the time of
+      // writing, which is the whole defect: the registry separates the two key families so
+      // that "the copy reads it and says what such a seal does and does not establish", and
+      // the copy read nothing. A `dev1` seal was described in the production words — "a key
+      // held on the server, not on this device" — whose second clause is precisely backwards
+      // for a signer that may be this very machine.
+      //
+      // The order of the message is the order a reader needs it in: what is weaker, why, and
+      // then — at equal length, because this is the part that stays true — what is not
+      // weakened at all. A development key loses independence and keeps tamper-evidence
+      // entirely: the check still fails on any later edit, because that property comes from
+      // the signature covering the chain and not from who holds the key.
+      //
+      // The id is quoted rather than described, because the id is what travels into an export
+      // and what a stranger's verifier will report back.
+      return {
+        tone: 'info',
+        icon: 'flask-outline',
+        title: 'Signed by a development key',
+        message: `This seal was made with "${latest.keyId}", a development key whose private half is not held by a deployed server — it can have been produced on the same machine as these records. So it is not evidence that this history existed anywhere but here. What it does establish is unaffected: the signature checks out against the public key published in this build, so ${entries} existed, in this order, by the time shown above, and any later change to ${them} breaks the check. ${SEAL_LIMITS}`,
+      };
+    }
+
     return {
       tone: 'neutral',
       icon: 'information-outline',
       title: 'What the seal establishes',
-      message: `The signature was made with a key held on the server, not on this device, and it checks out against the public key published in this build. That makes it an existence proof: ${n} ${n === 1 ? 'entry' : 'entries'} existed, in this order, by the time shown above, and any later change to ${n === 1 ? 'it' : 'them'} breaks the check. It is tamper-evident — it reveals an edit rather than preventing one. It says nothing about whether the records are true, and it is not a legal attestation.`,
+      message: `The signature was made with a key held on the server, not on this device, and it checks out against the public key published in this build. That makes it an existence proof: ${entries} existed, in this order, by the time shown above, and any later change to ${them} breaks the check. ${SEAL_LIMITS}`,
     };
   }
-  if (!serverBacked) {
+  if (availability === 'device-only') {
+    // Bound to `device-only` alone, and it has to be. Shown to a signed-in Firebase user it
+    // would state two things that are false — that the case is on this phone only, and that
+    // syncing it would make sealing possible — and the second is advice the reader cannot act
+    // on, which is worse than saying nothing.
     return {
       tone: 'neutral',
       icon: 'cloud-off-outline',
       title: 'Not available for this case',
       message: 'This case is stored only on this device. Sealing means a server reading the record and signing it with a key this device does not hold, so there is nothing here for it to sign. Signing in and syncing the case makes sealing available.',
+    };
+  }
+  if (availability === 'no-service') {
+    // The state the ribbon had no words for, which is why it borrowed the device-only ones.
+    // In order of what a reader needs: what sealing would be, why none is possible here, and
+    // that this is a fact about the build rather than a finding about their record. No
+    // sign-in, no sync, no "yet" — there is nothing the reader can do about a missing
+    // deployment and no seal on the way, and hinting at either would be this file's
+    // characteristic failure.
+    //
+    // The closing sentence says what they do still have, and only when they have it: it
+    // describes the integrity panel directly above this ribbon, in that panel's own term
+    // ("internally consistent"), and stops where the panel stops. Omitted for an empty case,
+    // where there is no chain on screen and describing one would be inventing a reassurance.
+    const check =
+      chain.head === null
+        ? ''
+        : ' The check above is unaffected — the hash chain is recomputed from these entries on this device every time the screen opens, and it shows they are internally consistent with one another and nothing beyond that.';
+    return {
+      tone: 'neutral',
+      icon: 'pen-off',
+      title: 'No sealing service in this build',
+      message: `Sealing means a server reading this history and signing it with a key this device does not hold. No such server is part of this build, so no signature can be made here — for this case or any other. Nothing is wrong with the record: nothing has read it, and nothing has judged it.${check}`,
     };
   }
   if (chain.head === null) {
@@ -234,8 +396,12 @@ export function sealNotice({ state, serverBacked }: SealCopyInput): SealNotice |
 }
 
 /** The button, or `null` when asking the server now would produce nothing. */
-export function sealActionLabel({ state, serverBacked }: SealCopyInput): string | null {
-  if (!serverBacked || !state.sealable) return null;
+export function sealActionLabel({ state, availability }: SealCopyInput): string | null {
+  // `!== 'available'` covers both unsealable states, which is the line that removes the
+  // failing button: a Firebase workspace used to pass the old `serverBacked` test and render
+  // this as the primary action on every case, where the only thing a tap could produce was a
+  // toast. An offer the app knows it cannot honour is not an offer.
+  if (availability !== 'available' || !state.sealable) return null;
   if (state.latest === null) return 'Seal this record';
   const n = state.unsealedEntries;
   return `Seal the ${n} new ${n === 1 ? 'entry' : 'entries'}`;
