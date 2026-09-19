@@ -72,10 +72,11 @@ export const orphanedEvidenceRule: Rule = {
         key: [item.id],
         title: `"${label}" is not linked to anything`,
         explanation:
-          `"${label}" has been added to this case but is not connected to any ` +
-          `claim, event or other document. Every analysis in this app works by following ` +
-          `those connections, so nothing has been checked about this item — it is stored, ` +
-          `and that is all. ` +
+          `"${label}" has been added to this case but is not connected to any claim, event or ` +
+          `other document, so nothing has been checked about it.`,
+        caveat:
+          'Every analysis in this app works by following those connections — an unlinked ' +
+          'document is stored, and that is all. ' +
           (signals > 0
             ? `${signals} dated or numeric value${signals === 1 ? '' : 's'} were read from it ` +
               `and are currently unused. Linking it to a claim or an event brings those into ` +

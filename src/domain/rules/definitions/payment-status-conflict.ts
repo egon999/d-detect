@@ -77,16 +77,16 @@ export const paymentStatusConflictRule: Rule = {
             title: structured
               ? `"${itemLabel}" shows the payment ${status}`
               : `Does "${itemLabel}" describe the payment your account says went through?`,
-            explanation: structured
-              ? `"${itemLabel}" records the transaction as ${status}, while ${contradictedBy}. ` +
-                `Open it and confirm which record describes the payment in question — the same ` +
-                `amount can appear on a retry that succeeded after a first attempt failed.`
-              : `"${itemLabel}" records the transaction as ${status}, while ${contradictedBy}. ` +
-                `That second half is this app's reading of wording you typed — it matched on the ` +
-                `word "${quoted}" — not a value read from a document, so the two may not be about ` +
-                `the same payment and the wording may simply have been read the wrong way. ` +
-                `Nothing here shows the records disagree. Worth a look if the statement and the ` +
-                `document were meant to describe the same transfer.`,
+            explanation: `"${itemLabel}" records the transaction as ${status}, while ${contradictedBy}.`,
+            caveat: structured
+              ? `The same amount can appear on a retry that succeeded after a first attempt ` +
+                `failed, so the two records may be describing different transfers rather than ` +
+                `disagreeing. Open both and check which payment each one is about.`
+              : `The second half of this is the app's reading of wording you typed — it matched ` +
+                `on the word "${quoted}" — not a value read from a document. The two may not be ` +
+                `about the same payment, and the wording may simply have been read the wrong ` +
+                `way. Nothing here shows the records disagree; it is worth a look only if the ` +
+                `statement and the document were meant to describe the same transfer.`,
             severity: structured ? 'HIGH' : 'LOW',
             confidence: structured ? 'STRONG_MATCH' : 'NEEDS_REVIEW',
             inputs: {

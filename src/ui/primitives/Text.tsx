@@ -9,12 +9,26 @@
  * `variant` names a role, not a size. `mono` overrides the family while keeping the size
  * and rhythm of the variant, which is what you want when a name that is normally prose
  * turns out to have been read from a document.
+ *
+ * ## Font scaling
+ *
+ * That same funnel is why the app's text-scaling policy lives here rather than at the call
+ * sites. Scaling is left **on** — this product is read by people building a case out of their
+ * own documents, and a meaningful share of them have already raised the system font size —
+ * and each variant carries the ceiling its rank earns, from `TYPE_SCALE_CAP`. The reasoning
+ * for the per-rank figures is in `tokens.ts`; the short version is that a flat multiplier
+ * magnifies the ranks that need it least and collapses the hierarchy for the readers who are
+ * working hardest.
+ *
+ * A caller may pass its own `maxFontSizeMultiplier` and it wins, which is how the compact
+ * controls apply `CONTROL_SCALE_CAP` — a chip, a badge and a button label are bounded by the
+ * box they sit in, not by their rank.
  */
 
 import React, { forwardRef } from 'react';
 import { StyleSheet, Text as RNText, type TextProps as RNTextProps } from 'react-native';
 
-import { FONT_FAMILY, type TypeToken } from '../tokens';
+import { FONT_FAMILY, TYPE_SCALE_CAP, type TypeToken } from '../tokens';
 import { useTheme } from '../theme';
 import type { Tone } from '../tokens';
 
@@ -64,6 +78,7 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
     mono = false,
     center = false,
     uppercase = false,
+    maxFontSizeMultiplier,
     style,
     children,
     ...rest
@@ -102,6 +117,13 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
         uppercase && styles.uppercase,
         style,
       ]}
+      // Resolved here rather than left to JSX spread order, so the fallback is visible at the
+      // point it happens. `??` and not `||`, and the difference matters: RN reads `null` as
+      // "inherit the global default", which is no ceiling at all, so a `null` arriving from a
+      // prop that was threaded through three components would silently switch the policy off
+      // for that string. A caller that needs a different ceiling names one — which is what the
+      // compact controls do with `CONTROL_SCALE_CAP`.
+      maxFontSizeMultiplier={maxFontSizeMultiplier ?? TYPE_SCALE_CAP[variant]}
       {...rest}
     >
       {children}

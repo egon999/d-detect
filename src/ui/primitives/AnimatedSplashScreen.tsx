@@ -164,7 +164,15 @@ export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreen
             },
           ]}
         >
-          <Text style={styles.brandTitle}>Ddetect</Text>
+          {/*
+            The wordmark is capped where the tagline under it is not, and the asymmetry is the
+            point. A wordmark is brand geometry — it is set against a 110pt logo container that
+            cannot grow, on the one screen in the app with no scroll view to absorb it. The
+            tagline is a sentence about what the app does, so it scales like the prose it is.
+          */}
+          <Text style={styles.brandTitle} maxFontSizeMultiplier={1.3}>
+            Ddetect
+          </Text>
           <Text style={styles.brandTagline}>Where your evidence agrees — and where it doesn&apos;t</Text>
         </Animated.View>
 
@@ -182,7 +190,19 @@ export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreen
       </View>
 
       {/* 1-Tap Skip Bypass Button */}
-      <TouchableOpacity activeOpacity={0.7} onPress={safeFinish} style={styles.skipButton}>
+      <TouchableOpacity
+        activeOpacity={0.7}
+        onPress={safeFinish}
+        style={styles.skipButton}
+        // 12.5pt of text in 7pt of padding is a ~30pt target. `hitSlop` tops it up to the
+        // 44pt floor without moving the control, which is the same trade `Pressable` makes
+        // for the dismiss affordances elsewhere in this directory.
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        accessibilityRole="button"
+        // Spelled out, because the label is "Skip ›" and a screen reader announces the
+        // chevron as a character rather than as the direction it draws.
+        accessibilityLabel="Skip the opening animation"
+      >
         <Text style={styles.skipButtonText}>Skip ›</Text>
       </TouchableOpacity>
     </Animated.View>

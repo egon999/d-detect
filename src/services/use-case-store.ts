@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { reconcileInterruptedEvidence, type Mutation, type MutationContext } from '@data/mutations';
-import type { Repository } from '@data/repository';
+import type { CommitDurability, Repository } from '@data/repository';
 import { emptyWorkspace, type Case, type Workspace } from '@domain/models';
 import { workspaceForCase } from '@data/repository';
 import { useRepository } from './repository-provider';
@@ -142,6 +142,18 @@ export interface WorkspaceState {
  */
 const reconciled = new Set<string>();
 
+type WorkspaceListener = (workspace: Workspace) => void;
+const activeWorkspaceListeners = new Map<string, Set<WorkspaceListener>>();
+
+function notifyWorkspaceOptimistic(key: string, next: Workspace) {
+  const listeners = activeWorkspaceListeners.get(key);
+  if (listeners) {
+    for (const listener of listeners) {
+      listener(next);
+    }
+  }
+}
+
 /**
  * Subscribes to one case's workspace.
  *
@@ -187,6 +199,16 @@ export function useWorkspace(ownerId: string | null, caseId: string | null): Wor
     else setLoading(true);
     setError(null);
 
+    let listeners = activeWorkspaceListeners.get(key);
+    if (!listeners) {
+      listeners = new Set();
+      activeWorkspaceListeners.set(key, listeners);
+    }
+    const optimisticListener: WorkspaceListener = (optimistic) => {
+      setWorkspace(optimistic);
+    };
+    listeners.add(optimisticListener);
+
     const unsubscribe = repository.watchWorkspace(
       ownerId,
       caseId,
@@ -197,6 +219,7 @@ export function useWorkspace(ownerId: string | null, caseId: string | null): Wor
         setLoading(false);
         setRefreshing(false);
         if (!reconciled.has(key)) {
+          if (reconciled.size > 200) reconciled.clear();
           reconciled.add(key);
           // Scoped to this case, not to `next`. Some adapters deliver owner-wide rows on a
           // case subscription, and resetting another case's records — one of which could be
@@ -221,7 +244,16 @@ export function useWorkspace(ownerId: string | null, caseId: string | null): Wor
       },
     );
 
-    return unsubscribe;
+    return () => {
+      unsubscribe();
+      const currentListeners = activeWorkspaceListeners.get(key);
+      if (currentListeners) {
+        currentListeners.delete(optimisticListener);
+        if (currentListeners.size === 0) {
+          activeWorkspaceListeners.delete(key);
+        }
+      }
+    };
   }, [repository, ownerId, caseId, ready, nonce]);
 
   const reload = useCallback(() => setNonce((value) => value + 1), []);
@@ -238,7 +270,7 @@ export function useWorkspace(ownerId: string | null, caseId: string | null): Wor
 // ---------------------------------------------------------------------------
 
 export type MutationResult =
-  | { ok: true }
+  | { ok: true; durability?: CommitDurability }
   | { ok: false; error: Error };
 
 export interface Mutator {
@@ -283,24 +315,54 @@ export function useMutator(
         return { ok: false, error: new Error('Not signed in.') };
       }
 
-      const mutation = apply(workspaceRef.current);
+      // `apply` is inside a try because it throws. It builds the change set by calling into
+      // `@data/mutations`, where sixteen `requireRecord` sites raise "<kind> <id> is not in
+      // this workspace" for a record the edit names and the workspace does not hold. That is
+      // reachable in ordinary use: `useWorkspace` collapses to `emptyWorkspace()` when the
+      // open case is absent, so a case deleted on another device while a detail screen is
+      // open makes the next edit on that screen throw.
+      //
+      // Left outside, the throw rejected the promise `mutate` hands back — past every
+      // `if (result.ok)` a screen wrote, into a `void`-ed handler with no `.catch`. Silence in
+      // production, a full-screen LogBox in development, and in neither case the `{ ok: false }`
+      // this module's contract promises.
+      let mutation: T;
+      try {
+        mutation = apply(workspaceRef.current);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+      }
+
+      // Only past the throw is the optimistic workspace adopted. A failed `apply` must leave
+      // the ref exactly as it was, or a screen would render a workspace no mutation produced.
+      const previousWorkspace = workspaceRef.current;
       workspaceRef.current = mutation.workspace;
       onApplied?.(mutation.workspace);
+      if (ownerId && caseId) {
+        notifyWorkspaceOptimistic(`${ownerId}:${caseId}`, mutation.workspace);
+      }
 
       if (mutation.changes.length === 0) return { ok: true, value: mutation };
 
       setInFlight((count) => count + 1);
       try {
-        await repository.commit(ownerId, mutation.changes);
-        return { ok: true, value: mutation };
+        const outcome = await repository.commit(ownerId, mutation.changes);
+        return { ok: true, durability: outcome?.durability, value: mutation };
       } catch (error) {
+        // Roll back optimistic state on commit failure so the UI and subsequent mutations
+        // do not operate on unpersisted/rejected state.
+        workspaceRef.current = previousWorkspace;
+        onApplied?.(previousWorkspace);
+        if (ownerId && caseId) {
+          notifyWorkspaceOptimistic(`${ownerId}:${caseId}`, previousWorkspace);
+        }
         const caught = error instanceof Error ? error : new Error(String(error));
         return { ok: false, error: caught, value: mutation };
       } finally {
         setInFlight((count) => Math.max(0, count - 1));
       }
     },
-    [repository, ownerId, onApplied],
+    [repository, ownerId, caseId, onApplied],
   );
 
   return useMemo(() => ({ mutate, busy: inFlight > 0 }), [mutate, inFlight]);

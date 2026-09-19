@@ -3,6 +3,7 @@ import { StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 import { Image as ExpoImage } from 'expo-image';
 import { Text } from './Text';
 import { useTheme } from '../theme';
+import { CONTROL_SCALE_CAP } from '../tokens';
 import { accountInitials } from '@services/auth/account';
 
 export interface UserAvatarProps {
@@ -83,8 +84,19 @@ export function UserAvatar({ photoURL, displayName, size = 44, style }: UserAvat
         Bold. Setting `fontWeight: '700'` on top of that made Android synthesise a fake
         bold over an already-weighted face, which smears the two initials this component
         exists to render. See `src/ui/primitives/Text.tsx`.
+
+        Capped at the control ceiling, and this is the one place in the app where the box
+        genuinely cannot grow: an avatar is a circle of a size the caller chose, drawn with
+        `overflow: 'hidden'`, and letting it grow would make it an ellipse or push the header
+        row it sits in out of shape. The initials are also the only text in the app a reader
+        loses nothing by not reading — the container already carries the full display name as
+        its `accessibilityLabel`, so a screen reader says "Priya Sharma's avatar" either way.
       */}
-      <Text variant={size >= 56 ? 'title' : 'label'} style={{ color: theme.colors.accent }}>
+      <Text
+        variant={size >= 56 ? 'title' : 'label'}
+        style={{ color: theme.colors.accent }}
+        maxFontSizeMultiplier={CONTROL_SCALE_CAP}
+      >
         {initials}
       </Text>
     </View>

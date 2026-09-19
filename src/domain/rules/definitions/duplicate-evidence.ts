@@ -42,8 +42,10 @@ export const duplicateEvidenceRule: Rule = {
         title: 'Identical files uploaded twice',
         explanation:
           `"${firstLabel}" and "${secondLabel}" are byte-for-byte identical ` +
-          `(same SHA-256 fingerprint). They are one source, not two, so they cannot corroborate ` +
-          `each other. Keep whichever has the better context and unlink or delete the other.`,
+          `(same SHA-256 fingerprint).`,
+        caveat:
+          'They are one source, not two, so they cannot corroborate each other. Keep whichever ' +
+          'has the better context and unlink or delete the other.',
         confidence: 'EXACT_MATCH',
         supportingEvidenceIds: [first.id, second.id],
         inputs: {

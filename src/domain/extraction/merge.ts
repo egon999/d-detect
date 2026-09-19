@@ -134,7 +134,57 @@ export function effectiveExtraction(
       additions[index - list.length] = emptyField(key, value, evidence.id);
     }
 
-    result[key] = additions.length ? [...updated, ...additions] : updated;
+    /*
+      `additions` is assigned by index, so it is sparse whenever a confirmed index sits more
+      than one place past the end of the list — and spreading a sparse array does not skip its
+      holes, it yields `undefined` at each one. `result[key]` could therefore contain
+      `undefined` while its type still said `TextField[]`. `noUncheckedIndexedAccess` cannot
+      see it: the hole is inside the array, not at an index expression.
+
+      What that cost: the evidence screen maps these fields and reads `field.original` during
+      render, so the hole was a `TypeError` in the render phase, past any try/catch, caught by
+      the navigation ErrorBoundary and shown as a full-app error screen. And the only control
+      that can delete the offending correction lives on the screen that now throws — so the
+      record became permanently unreachable with no in-app way back.
+
+      Reached by ordinary shrinkage. `confirmedFields` is deliberately carried across
+      reprocessing untouched, so a noisy first pass that finds four phone numbers, a user who
+      corrects the fourth, and a cleaner re-run that finds one leaves `phones.3` pointing two
+      places past the end. Two stale paths with a gap between them do it as well.
+
+      The holes are FILLED, not compacted, and that distinction is the fix rather than a detail
+      of it. `updated.length === list.length`, and an addition assigned from stale index `i`
+      lands at `list.length + (i - list.length)`, which is `i` — so the sparse array is
+      positionally *correct*, and the path the screen derives from a field's position still
+      matches the override key the value came from. Compacting would move the value typed for
+      `phones.3` into position 1, where the screen derives `phones.1`, finds no confirmation
+      for it, and renders something a person typed as an unconfirmed machine reading, while
+      `phones.3` stays stale forever. That trades a crash for silent corruption, which is the
+      worse of the two.
+
+      A filled hole carries no value and no `sourceQuote`, so it asserts nothing about the
+      document, and `emptyField` marks it `MANUAL` so it can never be attributed to the
+      extractor.
+
+      This is a floor, not the cure, and it is still the floor now that the cure exists. A field
+      path is an index into whatever one extraction run happened to find, so the durable fix is
+      to re-key `confirmedFields` in the same write that replaces an `extraction` — which is
+      what `rekeyConfirmedFields` does, applied by `persistEvidenceExtraction`, the funnel every
+      extraction replacement in the app goes through.
+
+      That does not make this dead code, and removing it would be a mistake. Records written
+      before the re-key existed still carry stale paths and are only rewritten when someone
+      reprocesses them; a workspace can arrive from device storage carrying whatever it was
+      stored with; and this function is a read path, which has to render whatever it is handed
+      rather than assume the write path that produced it. The two agree where they meet: the
+      re-key appends compactly from the end of the new list, so for a record it has touched
+      there is no hole here to fill.
+    */
+    const dense = additions.length
+      ? Array.from(additions, (field) => field ?? emptyField(key, '', evidence.id))
+      : additions;
+
+    result[key] = dense.length ? [...updated, ...dense] : updated;
   }
 
   result.dates = base.dates.map((field, index) => {
@@ -171,6 +221,20 @@ export function isFieldConfirmed(evidence: Pick<Evidence, 'confirmedFields'>, pa
 /**
  * Counts how much of an extraction a human has actually reviewed. Drives the
  * "evidence health" indicator on the case screen.
+ *
+ * Both halves are measured against the same set of fields, which they previously were not.
+ * `total` counted the raw extraction's lists while `confirmed` counted every key in
+ * `confirmedFields` — and those are different sets twice over: `documentType`, `title` and
+ * `summary` are confirmable and belong to no list, and a path left over from a longer earlier
+ * extraction is counted against a list that no longer has that position. The indicator could
+ * read "6 of 3 reviewed", which is not an off-by-one a reader can discount but a pair of
+ * numbers that cannot be interpreted at all.
+ *
+ * The denominator is the lists as `effectiveExtraction` renders them — what the reviewer is
+ * actually looking at, including the positions a confirmed value extends the list to — and the
+ * numerator counts only confirmations that resolve to a position in it. The three whole-record
+ * fields are counted on both sides, because a user who corrects a document's title has
+ * reviewed something and the old `total` gave them nowhere to be counted.
  */
 export function confirmationStats(evidence: Pick<Evidence, 'extraction' | 'confirmedFields'>): {
   total: number;
@@ -178,9 +242,51 @@ export function confirmationStats(evidence: Pick<Evidence, 'extraction' | 'confi
 } {
   const base = evidence.extraction;
   if (!base) return { total: 0, confirmed: 0 };
-  const total =
-    base.dates.length + base.amounts.length + TEXT_FIELD_KEYS.reduce((sum, key) => sum + base[key].length, 0);
-  return { total, confirmed: Object.keys(evidence.confirmedFields ?? {}).length };
+  const overrides = evidence.confirmedFields ?? {};
+  const paths = Object.keys(overrides);
+
+  // `dates` and `amounts` are applied by mapping the extracted list, so a confirmation past
+  // their end is not materialised and must not be counted as a field. Only `TEXT_FIELD_KEYS`
+  // can grow, and only as far as the highest confirmed index reaches.
+  const extentOf = (key: string, length: number): number => {
+    let extent = length;
+    for (const path of paths) {
+      if (!path.startsWith(`${key}.`)) continue;
+      const index = parseFieldIndex(path);
+      if (index !== null && index + 1 > extent) extent = index + 1;
+    }
+    return extent;
+  };
+
+  const lengths = new Map<string, number>([
+    ['dates', base.dates.length],
+    ['amounts', base.amounts.length],
+    ...TEXT_FIELD_KEYS.map((key) => [key, extentOf(key, base[key].length)] as const),
+  ]);
+
+  let total = 0;
+  for (const length of lengths.values()) total += length;
+
+  const WHOLE_RECORD = ['documentType', 'title', 'summary'] as const;
+  total += WHOLE_RECORD.length;
+
+  let confirmed = 0;
+  for (const path of paths) {
+    if ((WHOLE_RECORD as readonly string[]).includes(path)) {
+      confirmed += 1;
+      continue;
+    }
+    const key = path.slice(0, path.indexOf('.'));
+    const index = parseFieldIndex(path);
+    // A path naming no list, or a position the effective extraction does not reach, is
+    // counted against nothing. It is left in storage — it is the user's input, and a
+    // reprocess re-keys it (`rekeyConfirmedFields`) rather than discarding it — but it is
+    // not a review of a field that is on screen.
+    if (index === null || index < 0) continue;
+    if (index < (lengths.get(key) ?? 0)) confirmed += 1;
+  }
+
+  return { total, confirmed };
 }
 
 /**

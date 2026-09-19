@@ -201,6 +201,7 @@ function AppShell() {
           <Stack.Screen name="new-case" options={{ presentation: 'modal' }} />
           <Stack.Screen name="notifications" options={{ presentation: 'modal' }} />
           <Stack.Screen name="search" options={{ presentation: 'modal' }} />
+          <Stack.Screen name="previous-cases" options={{ title: 'Cases on this Device' }} />
           <Stack.Screen name="about" />
           <Stack.Screen name="+not-found" options={{ presentation: 'modal' }} />
         </Stack>

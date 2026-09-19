@@ -3,6 +3,7 @@ import React, { useCallback, useMemo } from 'react';
 import { RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { calculateRecoveryLedger } from '@domain/analysis/recovery-ledger';
 import { closingDeadlines } from '@domain/analysis/worklist';
 import type { Case } from '@domain/models';
 import { CaseCard } from '@features/cases/case-card';
@@ -133,6 +134,11 @@ export default function HomeScreen() {
    */
   const deadline = React.useMemo(
     () => (activeCase ? (closingDeadlines(workspace, Date.now())[0] ?? null) : null),
+    [activeCase, workspace],
+  );
+
+  const activeLedger = useMemo(
+    () => (activeCase ? calculateRecoveryLedger(workspace, activeCase.id) : null),
     [activeCase, workspace],
   );
 
@@ -334,17 +340,20 @@ export default function HomeScreen() {
                 <Text variant="label" colorToken="textSecondary" style={styles.flex}>
                   Most recent case
                 </Text>
-                {/*
-                  The tone comes from `CASE_STATUS_TONE`, not from a conditional written
-                  here. This read `tone={status === 'OPEN' ? 'ok' : 'neutral'}`, and `ok` is
-                  the app's one settled tone: it painted an open, unresolved dispute the
-                  same green as a finished one.
-                */}
-                <Chip
-                  label={CASE_STATUS_LABELS[activeCase.status]}
-                  tone={CASE_STATUS_TONE[activeCase.status]}
-                  size="sm"
-                />
+                <Row align="center" gap="xs">
+                  {activeLedger && activeLedger.totalClaimableMinor > 0 ? (
+                    <Chip
+                      label={activeLedger.formattedTotalClaimable}
+                      tone="accent"
+                      size="sm"
+                    />
+                  ) : null}
+                  <Chip
+                    label={CASE_STATUS_LABELS[activeCase.status]}
+                    tone={CASE_STATUS_TONE[activeCase.status]}
+                    size="sm"
+                  />
+                </Row>
               </Row>
 
               {/*

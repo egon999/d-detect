@@ -89,7 +89,8 @@ export const timelineGapRule: Rule = {
         title: `${days} days with nothing recorded`,
         explanation:
           `Nothing is recorded between "${before.event.title}" on ${formatDate(before.date)} and ` +
-          `"${after.event.title}" on ${formatDate(after.date)} — a gap of ${days} days. ` +
+          `"${after.event.title}" on ${formatDate(after.date)} — a gap of ${days} days.`,
+        caveat:
           (bothEvidenced
             ? 'Both surrounding events have evidence attached, so the records are otherwise ' +
               'complete here. If something happened during this period, the document that ' +

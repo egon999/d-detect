@@ -101,7 +101,8 @@ export const responseOverdueRule: Rule = {
       title: `${daysElapsed} days since this complaint, with no reply recorded`,
       explanation:
         `"${complaint.title}" is dated ${on}${reference ? ` and carries reference ${reference}` : ''}, ` +
-        `and ${daysElapsed} days have passed since. Nothing else in this case is dated after it. ` +
+        `and ${daysElapsed} days have passed since. Nothing else in this case is dated after it.`,
+      caveat:
         `Under ${profile.scheme}, a ${profile.sector} provider is generally expected to respond ` +
         `within ${profile.replyWindowDays} days, after which ${profile.nextStep} is usually the ` +
         `next step — you can reach it at ${profile.where}. ` +

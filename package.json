@@ -11,7 +11,7 @@
     "test:watch": "vitest",
     "emulators": "firebase emulators:start",
     "functions:build": "npm --prefix functions run build",
-    "lint:expo": "expo-doctor",
+    "lint:expo": "npx expo-doctor",
     "setup:cloudinary": "node scripts/setup-cloudinary.mjs",
     "apk": "node scripts/build-apk.mjs"
   },
@@ -26,8 +26,8 @@
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-google-signin/google-signin": "^16.1.5",
     "@react-native-ml-kit/text-recognition": "^2.0.0",
-    "@types/pako": "^2.0.4",
     "expo": "~55.0.31",
+    "expo-asset": "~55.0.20",
     "expo-audio": "~55.0.18",
     "expo-blur": "~55.0.18",
     "expo-constants": "~55.0.17",
@@ -69,6 +69,15 @@
   },
   "overrides": {
     "expo-asset": "~55.0.20"
+  },
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "@react-native-ml-kit/text-recognition"
+        ]
+      }
+    }
   },
   "private": true
 }

@@ -5,9 +5,12 @@ import {
   AuditActionEnum,
   CaseStatusEnum,
   ClaimStateEnum,
+  CloudStatusEnum,
+  type CloudStatus,
   DatePrecisionEnum,
   EntityKindEnum,
   EvidenceKindEnum,
+  type EvidenceKind,
   ExtractionMethodEnum,
   FindingStatusEnum,
   MatchConfidenceEnum,
@@ -173,6 +176,8 @@ export const userProfileSchema = z.object({
   email: z.string().max(255),
   displayName: z.string().max(120).default(''),
   photoURL: z.string().max(1000).nullable().default(null),
+  phone: z.string().max(40).optional(),
+  address: z.string().max(300).optional(),
 });
 export type UserProfile = z.infer<typeof userProfileSchema>;
 
@@ -246,6 +251,15 @@ export const evidenceSchema = z.object({
   /** Lowercase hex SHA-256 of the file bytes. The only basis for an exact-duplicate claim. */
   sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
 
+  /** Remote delivery / backup URL when mirrored to Cloud Storage / Cloudinary. */
+  cloudUrl: z.string().max(1000).nullable().optional(),
+  /** Remote asset identifier (e.g. Cloudinary public_id). */
+  cloudPublicId: z.string().max(300).nullable().optional(),
+  /** Cloud sync lifecycle state. Default: LOCAL_ONLY */
+  cloudStatus: CloudStatusEnum.optional(),
+  /** Timestamp when remote sync succeeded. */
+  cloudSyncedAt: timestampSchema.nullable().optional(),
+
   extraction: extractionSchema.nullable().default(null),
   /**
    * Human corrections, keyed by field path (e.g. `invoiceNumbers.0`, `documentType`).
@@ -306,8 +320,24 @@ export const analysisResultSchema = z.object({
   resultType: AnalysisTypeEnum,
   severity: SeverityEnum,
   title: z.string().max(200),
-  /** Plain-language explanation aimed at a non-technical reader. */
+  /**
+   * Plain-language statement of what the records say. The observation only.
+   *
+   * The 2000-character ceiling is a storage guard, not the editorial budget: rule copy is held
+   * to roughly 180 characters by `tests/rule-copy.test.ts`, because `FindingCard` renders this
+   * in full. The ceiling stays wide so that a finding written by the AI layer, or one carried
+   * over from a build before the split, is stored rather than rejected.
+   */
   explanation: z.string().max(2000),
+  /**
+   * Why this reading might be wrong — the hedge, the assumption, the thing to check.
+   *
+   * Empty on a finding that compared exact values out of machine-readable text, and on every
+   * record written before this field existed; the default is what makes those load. See
+   * `docs/copy-doctrine.md` for why this is a separate field rather than two more sentences
+   * on `explanation`.
+   */
+  caveat: z.string().max(1200).default(''),
   supportingEvidenceIds: z.array(idSchema).default([]),
   relatedClaimIds: z.array(idSchema).default([]),
   relatedEventIds: z.array(idSchema).default([]),
@@ -602,3 +632,4 @@ export const COLLECTIONS = {
   seals: 'seals',
 } as const;
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];
+export { CloudStatusEnum, type CloudStatus, EvidenceKindEnum, type EvidenceKind };

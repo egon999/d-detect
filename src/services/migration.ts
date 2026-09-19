@@ -22,7 +22,13 @@
 
 import { createAsyncStorageStore } from '@data/local/async-storage-store';
 import { LocalRepository } from '@data/local/local-repository';
-import type { Repository } from '@data/repository';
+import {
+  remove,
+  WORKSPACE_COLLECTIONS,
+  type Change,
+  type Repository,
+  type StoredRecord,
+} from '@data/repository';
 import type { Case, Workspace } from '@domain/models';
 
 import { planCaseHandover, type CaseHandoverPlan } from './migration-plan';
@@ -89,18 +95,44 @@ export async function loadDeviceCase(deviceOwnerId: string, caseId: string): Pro
 }
 
 /**
- * Deletes everything device storage holds under one device owner id.
+ * Deletes one case from device storage: its case row, and every record filed under it.
  *
  * Separated from `handOverDeviceCase` so the UI can offer it as its own decision, taken after
  * the account copy is visibly confirmed. A single tap that writes to the account *and* deletes
  * the only other copy leaves no state in which the user can check the move worked.
  *
- * Note the granularity: the device owner id, not the case. `LocalRepository.clear` works on the
- * owner prefix, and an anonymous session's owner id covers exactly the cases created in that
- * session — so the caller must only offer this once nothing else under that id is left to move.
+ * ## Why this is not `LocalRepository.clear`
+ *
+ * It used to be, and that was the bug. `clear` works on the owner key prefix, and a device
+ * owner id is not one case — an anonymous session's id covers everything created in that
+ * session. So the button offering to remove the copy of the case just moved was removing every
+ * case under that id, including ones the user had not moved and which therefore existed
+ * nowhere else. Unrecoverable, silent, and from a control that promised one case.
+ *
+ * ## Why it is assembled out of `loadWorkspace` and `commit`
+ *
+ * `Repository` has no per-case delete and should not grow one for this: `commit` already
+ * deletes records the caller can name, and `loadWorkspace` is how the caller names them. The
+ * pairing is total for this case and touches nothing else — the local adapter reads the whole
+ * case shard plus the index row, without the `deletedAt` filter `listCases` applies, so a case
+ * the user had already discarded on the device goes too rather than lingering unreachable.
+ *
+ * Records only. The originals do not belong to this copy any more: `handOverDeviceCase` has
+ * already moved each file to the account's own path in this device's private store, so
+ * deleting files here would take the account copy's originals with them.
  */
-export async function clearDeviceCases(deviceOwnerId: string): Promise<void> {
-  await deviceRepository().clear(deviceOwnerId);
+export async function clearDeviceCase(deviceOwnerId: string, caseId: string): Promise<void> {
+  const repository = deviceRepository();
+  const workspace = await repository.loadWorkspace(deviceOwnerId, caseId);
+
+  const changes: Change[] = [];
+  for (const collection of WORKSPACE_COLLECTIONS) {
+    for (const record of workspace[collection] as StoredRecord[]) {
+      changes.push(remove(collection, record.id));
+    }
+  }
+
+  await repository.commit(deviceOwnerId, changes);
 }
 
 export interface HandoverOutcome {
@@ -126,7 +158,7 @@ export interface HandoverOptions {
   caseId: string;
   /** The workspace already read by `loadDeviceCase`, so the review and the write agree. */
   workspace: Workspace;
-  /** Remove the device copy once the account copy is confirmed. Off by default. */
+  /** Remove this case's device copy once the account copy is confirmed. Off by default. */
   clearDeviceCopy?: boolean;
   now?: number;
 }
@@ -181,7 +213,7 @@ export async function handOverDeviceCase(options: HandoverOptions): Promise<Hand
 
   if (options.clearDeviceCopy) {
     try {
-      await deviceRepository().clear(options.deviceOwnerId);
+      await clearDeviceCase(options.deviceOwnerId, options.caseId);
     } catch {
       // The account copy is the one that matters and it is already written. A leftover
       // device copy costs storage, not correctness.

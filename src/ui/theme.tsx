@@ -96,7 +96,16 @@ function buildTheme(scheme: ColorSchemeName): Theme {
     layout: LAYOUT,
     elevation,
     text: (token) => memo(`text:${token}`, () => TYPE[token]),
-    tone: (tone) => memo(`tone:${tone}`, () => colors.tones[tone]),
+    // The `?? neutral` is not dead code, despite the signature constraining `tone` to a key
+    // that exists. Callers reach this by indexing a lookup table with a value read back out of
+    // storage — `RELATIONSHIP_TONE[edge.type]`, `ACTION_META[log.action]` — and TypeScript
+    // types those indexes as present whether or not they are. A record written by an older
+    // build with an enum member since renamed therefore arrives here as `undefined`, and every
+    // call site dereferences the result on the same expression (`theme.tone(x).fg`). Without
+    // the fallback, one stale row anywhere in a case becomes a render-phase TypeError, which
+    // the navigation ErrorBoundary catches by replacing the entire app with an error screen.
+    // With it, the same row renders in grey. A colour is not worth a crash.
+    tone: (tone) => memo(`tone:${tone}`, () => colors.tones[tone] ?? colors.tones.neutral),
     elevationFor: (token) => elevation[token],
   };
 }

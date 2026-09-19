@@ -1,5 +1,4 @@
 import {
-  caseSchema,
   emptyWorkspace,
   userProfileSchema,
   type Case,
@@ -9,10 +8,12 @@ import {
 import {
   applyChanges,
   assertOwnership,
+  Skipped,
   WORKSPACE_COLLECTIONS,
   type Change,
   type CommitOutcome,
   type Repository,
+  type SkipSource,
   type StoredRecord,
   type Unsubscribe,
   type WorkspaceCollection,
@@ -68,6 +69,17 @@ function parseJson<T>(raw: string | null, fallback: T): T {
 /** Every persisted record carries a caseId except the `Case` document itself. */
 const caseIdOf = (record: StoredRecord): string => (record as { caseId?: string }).caseId ?? '';
 
+/**
+ * How a skipped row is named in a log line from this adapter.
+ *
+ * The tallying itself is `Skipped`, on the port beside `RECORD_SCHEMAS`, because the device
+ * store and the two remote ones face the same drift and had already answered it differently
+ * once — this adapter's answer, before the shard boundary existed, was to validate nothing.
+ * What stays here is the wording: `[local]` is how a developer reading a log tells a row this
+ * phone lost from one a server did.
+ */
+const LOCAL_SKIPS: SkipSource = { adapter: 'local', noun: 'record' };
+
 export class LocalRepository implements Repository {
   readonly kind = 'local' as const;
 
@@ -111,6 +123,8 @@ export class LocalRepository implements Repository {
   // Writes
   // -------------------------------------------------------------------------
 
+  private commitChain: Promise<unknown> = Promise.resolve();
+
   /**
    * Applies a change set.
    *
@@ -119,11 +133,21 @@ export class LocalRepository implements Repository {
    * thing to atomic the platform gives — and the shards are independent, so a torn
    * write can leave a case stale but never leaves a record half-written.
    *
+   * Writes are serialized through a promise-based mutex chain so concurrent writes
+   * cannot race each other during shard read-modify-write cycles.
+   *
    * Always `SERVER`: this device *is* the store of record here, so there is no second copy
    * for a returned commit to still be waiting on.
    */
   async commit(ownerId: string, changes: readonly Change[]): Promise<CommitOutcome> {
     if (!changes.length) return { durability: 'SERVER' };
+    const run = () => this.executeCommit(ownerId, changes);
+    const next = this.commitChain.then(run, run);
+    this.commitChain = next.catch(() => {});
+    return next;
+  }
+
+  private async executeCommit(ownerId: string, changes: readonly Change[]): Promise<CommitOutcome> {
     assertOwnership(ownerId, changes);
 
     const caseChanges = changes.filter((change) => change.collection === 'cases');
@@ -269,13 +293,27 @@ export class LocalRepository implements Repository {
 
   private async readIndex(ownerId: string): Promise<Case[]> {
     const raw = await this.store.get(indexKey(ownerId));
-    const parsed = parseJson<unknown[]>(raw, []);
-    // Validate at the boundary: a record written by an older build of the app is
-    // dropped rather than allowed to flow into the reasoning engine half-shaped.
-    return parsed.flatMap((item) => {
-      const result = caseSchema.safeParse(item);
-      return result.success ? [result.data] : [];
-    });
+    // The same boundary the shard below holds, on the same terms, which it did not used to be.
+    // Dropping the drifted row was already right — a case written by an older build must not
+    // flow into the reasoning engine half-shaped — but it was done in silence and only ever
+    // over a list.
+    //
+    // Silence is the wrong answer to a case that has disappeared. It is the most alarming thing
+    // this app can do to a user, it is the one screen they cannot navigate around, and there was
+    // no line anywhere saying it had happened or how many times.
+    //
+    // And the list was assumed, not checked: `parseJson` was asked for an `unknown[]` and casts
+    // to it without looking, so an index a build had written as an object keyed by id reached
+    // `.flatMap` and threw a `TypeError` straight out of `listCases`. That is a strictly worse
+    // failure than the shard equivalent it mirrors — a shard that will not read costs one case,
+    // while this backs the screen the app opens on, so every case in the account becomes
+    // unreachable at once. `keep` answers with an empty list instead.
+    const skipped = new Skipped(LOCAL_SKIPS);
+    const cases = skipped.keep('cases', parseJson<unknown>(raw, []));
+    // Named apart from the shard's scope on purpose: `loadWorkspace` reads both in one call, and
+    // a log that called them both "a case" could not say which of the two lost the row.
+    skipped.report('the case list');
+    return cases;
   }
 
   private async caseIdsFor(ownerId: string): Promise<string[]> {
@@ -284,11 +322,22 @@ export class LocalRepository implements Repository {
 
   private async readShard(ownerId: string, caseId: string): Promise<Shard> {
     const raw = await this.store.get(caseKey(ownerId, caseId));
-    const parsed = parseJson<Partial<Shard>>(raw, {});
+    const parsed = parseJson<Partial<Record<ScopedCollection, unknown>>>(raw, {});
     const shard = emptyShard();
+    // The same boundary `readIndex` holds, over the collections every screen renders from.
+    // `parseJson` above rejects only a shard that is not JSON; a row that is valid JSON and
+    // the wrong shape passed straight through — and the keys are versioned `v1` with no
+    // migration behind them, so a record written by any build this phone has ever run is
+    // read back exactly as it was written, for as long as the app stays installed.
+    //
+    // Per row rather than per shard, because the alternative is an unopenable case: one
+    // stale claim would otherwise take the case's evidence, links and audit trail with it,
+    // and there is no screen from which a user can reach a case the app refuses to read.
+    const skipped = new Skipped(LOCAL_SKIPS);
     for (const collection of SCOPED_COLLECTIONS) {
-      shard[collection] = parsed[collection] ?? [];
+      shard[collection] = skipped.keep(collection, parsed[collection]);
     }
+    skipped.report('a case');
     return shard;
   }
 

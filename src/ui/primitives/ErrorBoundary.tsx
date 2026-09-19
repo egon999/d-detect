@@ -56,7 +56,16 @@ export class ErrorBoundary extends React.Component<Props, State> {
         <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
           <View style={styles.card}>
             <View style={styles.iconCircle}>
-              <Text style={styles.iconText}>!</Text>
+              {/*
+                A literal ceiling, not the token — this file imports nothing by design (see the
+                header), and a 52pt circle drawn around a 26pt glyph is the one box on this
+                screen that cannot grow with it. Everything else here is inside a `ScrollView`
+                and scales freely, which is what matters: the reader who needs this screen is
+                reading an error message, not a decorative exclamation mark.
+              */}
+              <Text style={styles.iconText} maxFontSizeMultiplier={1.4}>
+                !
+              </Text>
             </View>
 
             <Text style={styles.title}>This screen stopped working</Text>
@@ -75,7 +84,16 @@ export class ErrorBoundary extends React.Component<Props, State> {
               </Text>
             </View>
 
-            <TouchableOpacity style={styles.primaryButton} onPress={this.reset} activeOpacity={0.8}>
+            <TouchableOpacity
+              style={styles.primaryButton}
+              onPress={this.reset}
+              activeOpacity={0.8}
+              // `TouchableOpacity` marks itself accessible but names no role, so this
+              // announced as plain text on the one screen whose entire purpose is to offer
+              // the reader a way out.
+              accessibilityRole="button"
+              accessibilityLabel="Try this screen again"
+            >
               <Text style={styles.primaryButtonText}>Try this screen again</Text>
             </TouchableOpacity>
 

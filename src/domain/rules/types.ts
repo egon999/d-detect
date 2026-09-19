@@ -60,8 +60,31 @@ export interface RuleFinding {
    */
   key: readonly string[];
   title: string;
-  /** Plain language, aimed at a reader with no technical or legal background. */
+  /**
+   * What the records say. Plain language, aimed at a reader with no technical or legal
+   * background, and **only the observation** — no hedging, no caveat, no instruction.
+   *
+   * Kept to roughly one or two sentences on purpose, and pinned by `tests/rule-copy.test.ts`.
+   * `FindingCard` renders this without truncation, which is only safe while it is short: the
+   * card used to clip a four-sentence paragraph at three lines, so the app's careful reasoning
+   * reached the reader cut off in the middle of a word. A budget here is what lets the card
+   * stop clipping. See `docs/copy-doctrine.md`.
+   */
   explanation: string;
+  /**
+   * Why this reading might be wrong.
+   *
+   * The hedge that used to be sentences three and four of `explanation`, where it was the
+   * first thing truncation ate — so the one part of a finding that tells a reader not to trust
+   * it was reliably the part they never saw. Split out, it gets a named control of its own on
+   * the card, and no length budget: a caveat that needs four sentences may have four.
+   *
+   * Mandatory whenever the finding is hedged — a `NEEDS_REVIEW` confidence or a `LOW` severity
+   * on a conflict-shaped rule means something about this reading is uncertain, and a test
+   * fails a rule that hedges without saying why. Omit it only when the finding rests entirely
+   * on values read out of machine-readable text and compared exactly.
+   */
+  caveat?: string;
   /** Overrides the rule's default severity when a specific instance warrants it. */
   severity?: Severity;
   confidence: MatchConfidence;

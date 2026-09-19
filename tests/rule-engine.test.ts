@@ -141,7 +141,11 @@ describe('runAnalysis', () => {
     const mismatch = run.results.find((result) => result.resultType === 'AMOUNT_MISMATCH');
     expect(mismatch).toBeDefined();
     expect(mismatch?.explanation).toContain('INR 900.00');
-    expect(mismatch?.explanation).toContain('mall retail outlet');
+    // Why the two figures were put side by side is a reason to doubt the comparison, not part
+    // of what the records say, so it lives in the caveat. Asserted on that field alone: an
+    // `a ?? b` or a concatenation would pass wherever the text ended up and stop testing the
+    // split at all.
+    expect(mismatch?.caveat).toContain('mall retail outlet');
   });
 
   it('raises one finding per shared reference, not one per pair of documents', () => {

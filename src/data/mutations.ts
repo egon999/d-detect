@@ -2,6 +2,7 @@ import { evaluateCaseClaims } from '../domain/analysis/claim-state';
 import type { AuditAction, CaseStatus, EvidenceKind, RelationshipType } from '../domain/enums';
 import { CASE_STATUS_LABELS } from '../domain/enums';
 import { extractFromText, type ExtractedTextMethod } from '../domain/extraction/deterministic';
+import { rekeyConfirmedFields } from '../domain/extraction/rekey';
 import { hashText } from '../domain/hashing';
 import { newId } from '../domain/ids';
 import { evidenceSchema } from '../domain/models';
@@ -21,6 +22,7 @@ import type {
 } from '../domain/models';
 import { normalizeDate } from '../domain/normalize/dates';
 import { runAnalysis } from '../domain/rules/engine';
+import type { AnalysisRunResult } from '../domain/rules/types';
 import { applyChanges, put, type Change } from './repository';
 
 /**
@@ -596,6 +598,9 @@ export interface StoredFileInput {
   sizeBytes: number;
   /** Hex SHA-256 of the stored bytes. Required: duplicate detection has no other basis. */
   sha256: string;
+  cloudUrl?: string | null;
+  cloudPublicId?: string | null;
+  cloudStatus?: 'SYNCED' | 'PENDING' | 'FAILED' | 'LOCAL_ONLY';
 }
 
 /**
@@ -639,6 +644,10 @@ export function recordEvidenceFile(
     storagePath: input.storagePath,
     sizeBytes: input.sizeBytes,
     sha256: input.sha256,
+    cloudUrl: input.cloudUrl ?? existing.cloudUrl ?? null,
+    cloudPublicId: input.cloudPublicId ?? existing.cloudPublicId ?? null,
+    cloudStatus: input.cloudStatus ?? existing.cloudStatus ?? 'LOCAL_ONLY',
+    cloudSyncedAt: input.cloudStatus === 'SYNCED' ? context.now : (existing.cloudSyncedAt ?? null),
     // UPLOADING says "the bytes are on their way". Once they are safely stored the item
     // is queued for reading.
     //
@@ -665,6 +674,48 @@ export function recordEvidenceFile(
         `Stored the original of "${short(existing.title)}"`,
         [{ kind: 'evidence', id: evidenceId }],
         { kind: existing.kind, sizeBytes: String(input.sizeBytes) },
+      ),
+    ),
+  ]);
+}
+
+/**
+ * Updates cloud mirror synchronization state and remote asset locator on an evidence record.
+ */
+export function updateEvidenceCloudSync(
+  workspace: Workspace,
+  context: MutationContext,
+  evidenceId: string,
+  sync: {
+    cloudUrl?: string | null;
+    cloudPublicId?: string | null;
+    cloudStatus: 'SYNCED' | 'PENDING' | 'FAILED' | 'LOCAL_ONLY';
+  },
+): Mutation {
+  const existing = requireRecord(
+    workspace.evidence.find((item) => item.id === evidenceId && !item.deletedAt),
+    'Evidence',
+    evidenceId,
+  );
+  const next: Evidence = {
+    ...existing,
+    cloudUrl: sync.cloudUrl ?? existing.cloudUrl ?? null,
+    cloudPublicId: sync.cloudPublicId ?? existing.cloudPublicId ?? null,
+    cloudStatus: sync.cloudStatus,
+    cloudSyncedAt: sync.cloudStatus === 'SYNCED' ? context.now : (existing.cloudSyncedAt ?? null),
+    updatedAt: context.now,
+  };
+  return commit(workspace, [
+    put('evidence', next),
+    put(
+      'auditLogs',
+      auditEntry(
+        context,
+        existing.caseId,
+        'EVIDENCE_CLOUD_SYNCED',
+        `Updated cloud backup status for "${short(existing.title)}" to ${sync.cloudStatus}`,
+        [{ kind: 'evidence', id: evidenceId }],
+        { cloudStatus: sync.cloudStatus, cloudUrl: sync.cloudUrl ?? '' },
       ),
     ),
   ]);
@@ -744,29 +795,74 @@ export function failEvidenceUpload(
 }
 
 /**
+ * Marks an evidence item whose original file is stored but whose extraction processing
+ * failed or was interrupted as FAILED.
+ */
+export function failEvidenceProcessing(
+  workspace: Workspace,
+  context: MutationContext,
+  evidenceId: string,
+  reason: string,
+): Mutation {
+  const existing = requireRecord(
+    workspace.evidence.find((item) => item.id === evidenceId && !item.deletedAt),
+    'Evidence',
+    evidenceId,
+  );
+
+  const next: Evidence = {
+    ...existing,
+    state: 'FAILED',
+    failureReason: reason.slice(0, 400),
+    updatedAt: context.now,
+  };
+
+  return commit(workspace, [
+    put('evidence', next),
+    put(
+      'auditLogs',
+      auditEntry(
+        context,
+        existing.caseId,
+        'EVIDENCE_PROCESSED',
+        `Processing of "${short(existing.title)}" did not complete`,
+        [{ kind: 'evidence', id: evidenceId }],
+        { kind: existing.kind },
+      ),
+    ),
+  ]);
+}
+
+/**
  * Moves records that claim to be mid-flight but are not.
  *
  * ## Why this is needed at all
  *
  * Nothing in this app processes evidence in the background. `requestEvidenceProcessing` runs
  * inline, in the screen that started it, in that screen's event loop. So the moment the
- * process is gone — killed, crashed, backgrounded out — every `UPLOADING`, `QUEUED` and
- * `PROCESSING` row in the database is describing work that will never resume, and nothing
- * anywhere noticed. A user reopening the app saw spinners that would spin until they deleted
- * the case.
+ * process is gone — killed, crashed, backgrounded out — any row still claiming to be running
+ * is describing work that will never resume, and nothing anywhere noticed. A user reopening
+ * the app saw a spinner that would spin until they deleted the case.
  *
  * ## What it does, and what it deliberately does not
  *
  * - `UPLOADING` with no stored original → `FAILED`. The bytes never arrived and now never
- *   will; see {@link failEvidenceUpload}.
+ *   will; see {@link failEvidenceUpload}. This is the common case: it is the state
+ *   `queueEvidence` writes, and the only edge out of it needs the bytes to have landed.
  * - `PROCESSING` → `QUEUED`. The original is present, the reading is not, and `QUEUED` is
  *   the state that says so. This also un-sticks the Process button, which treats `PROCESSING`
  *   as "already running" and disables itself with no timeout — the one state that could
  *   permanently lock a record out of being read.
- * - `QUEUED` is left alone. Its bytes are stored and its record is honest: it is a document
- *   waiting to be read, which is what `QUEUED` means, and the Process button already works on
- *   it. Rewriting it to `FAILED` would report a failure that did not happen. Making it
- *   *findable* is `attention.ts`'s job, not this one's.
+ *
+ *   Defensive rather than routine: `case-analysis.ts` deliberately never persists
+ *   `PROCESSING` for exactly this reason, so in a device-only build this branch fires only
+ *   for records written by the `functions/` server path or by an older build. It stays
+ *   because a state that cannot be recovered from is worse than a branch that rarely runs.
+ * - `QUEUED` is left alone, and this is where an interrupted extraction actually lands. Its
+ *   bytes are stored and its record is honest: it is a document waiting to be read, which is
+ *   what `QUEUED` means, and the Process button already works on it. Rewriting it to `FAILED`
+ *   would report a failure that did not happen. Making it *findable* is `attention.ts`'s job,
+ *   not this one's.
  *
  * Returns `null` when there is nothing to move, so a caller can skip the commit entirely
  * rather than writing an empty batch and an audit entry about nothing.
@@ -848,17 +944,20 @@ export interface ExtractionOutcomeInput {
  * Persists the result of processing one evidence item on this device.
  *
  * The caller (`requestEvidenceProcessing`) decides what happened; this mutation decides
- * what may be written about it. Three rules are enforced here rather than trusted
+ * what may be written about it. Four rules are enforced here rather than trusted
  * upstream, because each one is an invariant a later reader depends on:
  *
  * - A non-extracted state carries a reason, and an extracted state carries an extraction
  *   with passages. A REVIEW_REQUIRED with nothing to review, or an EXTRACTED with no
  *   extraction, is a record that lies about itself.
  * - The recorded digest never changes once set (see `recordEvidenceFile` for why).
- * - `confirmedFields` and `confirmedAt` are never touched. A person's corrections layer
- *   over the extraction at read time (`effectiveExtraction`) and must survive every
- *   reprocess — and so does the CONFIRMED state itself, because the corrections still
- *   apply to the fresh extraction.
+ * - `confirmedAt` is never touched, and neither is the CONFIRMED state: a person's
+ *   corrections layer over the extraction at read time (`effectiveExtraction`) and must
+ *   survive every reprocess, because they still apply to the fresh extraction.
+ * - No correction is dropped, and none is left pointing at a value it was not made for.
+ *   Every value in `confirmedFields` survives; its *key* is re-derived against the new
+ *   extraction, because a key is a position in the old one. `rekeyConfirmedFields` carries
+ *   the reasoning, and the audit entry below reports what moved.
  */
 export function persistEvidenceExtraction(
   workspace: Workspace,
@@ -886,9 +985,32 @@ export function persistEvidenceExtraction(
     );
   }
 
+  const corrections = rekeyConfirmedFields(
+    existing.extraction,
+    input.extraction,
+    existing.confirmedFields,
+  );
+
   const next: Evidence = {
     ...existing,
     extraction: input.extraction,
+    /*
+      The corrections are carried across, and their keys are re-pointed at the reading each one
+      was about.
+
+      This used to be a plain carry, and the comment above this function said `confirmedFields`
+      was never touched. Half of that was right: the *values* are a person's own words about
+      their own evidence and are never dropped, re-typed or overridden here. The keys are a
+      different thing — `phones.3` is a pointer into whatever the extraction in this record
+      happened to hold, so replacing the extraction and leaving the pointer is how a correction
+      came to sit on a value nobody typed it for. See `rekeyConfirmedFields` for the full
+      account, including why a stranded correction is kept rather than dropped.
+
+      `confirmedAt` stays exactly as it was, and deliberately: re-keying is this function's
+      bookkeeping, not a review. Stamping it with `context.now` would have the record claim the
+      person confirmed something at the moment a machine re-read the file.
+    */
+    confirmedFields: corrections.confirmedFields,
     // A confirmed item that is re-read stays confirmed: the corrections still apply.
     state: input.state === 'EXTRACTED' && existing.state === 'CONFIRMED' ? 'CONFIRMED' : input.state,
     failureReason: input.state === 'EXTRACTED' ? null : (reason ?? '').slice(0, 600),
@@ -896,6 +1018,20 @@ export function persistEvidenceExtraction(
     ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
     updatedAt: context.now,
   };
+
+  /*
+    What happened to the corrections is reported, not just done.
+
+    A re-key is the app moving something a person entered, and the audit trail is where this
+    product says what it did. Counts only, and no field values: the values came off the document
+    and `confirmEvidenceFields` already holds the line that audit entries name fields rather
+    than quoting them. Both numbers are omitted when they are zero, so an ordinary reprocess
+    writes the entry it always wrote.
+  */
+  const rekeyNote =
+    corrections.moved || corrections.stranded
+      ? ` ${describeRekey(corrections.moved, corrections.stranded)}`
+      : '';
 
   return commit(workspace, [
     put('evidence', next),
@@ -905,14 +1041,47 @@ export function persistEvidenceExtraction(
         context,
         existing.caseId,
         'EVIDENCE_PROCESSED',
-        `Processed "${short(existing.title)}"`,
+        `Processed "${short(existing.title)}".${rekeyNote}`,
         [{ kind: 'evidence', id: evidenceId }],
         // The outcome and the extractor version, never document contents.
-        { state: next.state, extractor: input.extraction?.extractorVersion ?? 'none' },
+        {
+          state: next.state,
+          extractor: input.extraction?.extractorVersion ?? 'none',
+          ...(corrections.moved ? { correctionsMoved: String(corrections.moved) } : {}),
+          ...(corrections.stranded ? { correctionsStranded: String(corrections.stranded) } : {}),
+        },
       ),
     ),
   ]);
 }
+
+/**
+ * The one sentence a person reads about a re-key, in the audit trail.
+ *
+ * Says what happened to their corrections and nothing about what the document contains. Kept
+ * out of the mutation body because it is prose with two plural forms and a pair of independent
+ * clauses, and inlining it made the write harder to read than the write deserved.
+ */
+function describeRekey(moved: number, stranded: number): string {
+  const parts: string[] = [];
+  if (moved) {
+    parts.push(
+      moved === 1
+        ? 'One correction now points at the same value in its new place'
+        : `${moved} corrections now point at the same values in their new places`,
+    );
+  }
+  if (stranded) {
+    parts.push(
+      stranded === 1
+        ? 'one correction has no matching reading in this pass and is kept as your own entry'
+        : `${stranded} corrections have no matching reading in this pass and are kept as your own entries`,
+    );
+  }
+  const sentence = parts.join(', and ');
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+}
+
 /** Convenience for callers that already hold the text: hashes it the same way the seed does. */
 export function hashForText(text: string): string {
   return hashText(text);
@@ -1280,7 +1449,7 @@ export function reviewAiSuggestion(
     updatedAt: context.now,
   };
 
-  return commit(workspace, [
+  const changes: Change[] = [
     put('aiSuggestions', next),
     put(
       'auditLogs',
@@ -1293,7 +1462,104 @@ export function reviewAiSuggestion(
         { kind: existing.kind, model: existing.model },
       ),
     ),
-  ]);
+  ];
+
+  if (status === 'ACCEPTED') {
+    const payload = (existing.payload ?? {}) as Record<string, unknown>;
+
+    // 1. For RELATIONSHIP suggestions, establish the concrete link
+    if (existing.kind === 'RELATIONSHIP') {
+      const targetKind =
+        (payload.targetKind as 'claim' | 'event' | undefined) ??
+        (payload.to && typeof payload.to === 'object' ? (payload.to as EntityRef).kind : undefined);
+      const targetId =
+        (payload.targetId as string | undefined) ??
+        (payload.to && typeof payload.to === 'object' ? (payload.to as EntityRef).id : undefined);
+      const fromEvidenceId =
+        existing.evidenceId ??
+        existing.sourceEvidenceIds[0] ??
+        (payload.from && typeof payload.from === 'object' ? (payload.from as EntityRef).id : undefined);
+
+      if (targetKind && targetId && fromEvidenceId) {
+        const from: EntityRef = { kind: 'evidence', id: fromEvidenceId };
+        const to: EntityRef = { kind: targetKind as EntityRef['kind'], id: targetId };
+
+        if (refExists(workspace, from) && refExists(workspace, to)) {
+          const relationshipType = ((payload.relationshipType ?? payload.type ?? 'RELATED_TO') as RelationshipType);
+          const alreadyLinked = workspace.relationships.some(
+            (r) =>
+              r.caseId === existing.caseId &&
+              r.from.kind === from.kind &&
+              r.from.id === from.id &&
+              r.to.kind === to.kind &&
+              r.to.id === to.id &&
+              r.type === relationshipType,
+          );
+          if (!alreadyLinked) {
+            const relRecord: EvidenceRelationship = {
+              id: idFor(context, 'rel'),
+              ownerId: context.ownerId,
+              caseId: existing.caseId,
+              createdAt: context.now,
+              updatedAt: context.now,
+              from,
+              to,
+              type: relationshipType,
+              origin: 'AI',
+              material: Boolean(payload.material),
+              note: typeof payload.note === 'string' ? payload.note.trim() : existing.summary,
+              createdByRuleId: null,
+            };
+            changes.push(put('relationships', relRecord));
+          }
+        }
+      }
+    }
+
+    // 2. For FIELD_EXTRACTION suggestions, apply confirmed fields to evidence
+    if (existing.kind === 'FIELD_EXTRACTION' && existing.evidenceId) {
+      const ev = workspace.evidence.find((item) => item.id === existing.evidenceId && !item.deletedAt);
+      if (ev) {
+        const confirmed: Record<string, string> = {};
+        if (typeof payload.documentType === 'string' && payload.documentType.trim()) {
+          confirmed.documentType = payload.documentType.trim();
+        }
+        if (typeof payload.refinedTitle === 'string' && payload.refinedTitle.trim()) {
+          confirmed.title = payload.refinedTitle.trim();
+        } else if (typeof payload.title === 'string' && payload.title.trim()) {
+          confirmed.title = payload.title.trim();
+        }
+        if (typeof payload.modelSummary === 'string' && payload.modelSummary.trim()) {
+          confirmed.summary = payload.modelSummary.trim();
+        } else if (typeof payload.summary === 'string' && payload.summary.trim()) {
+          confirmed.summary = payload.summary.trim();
+        }
+        if (payload.confirmedFields && typeof payload.confirmedFields === 'object') {
+          for (const [k, v] of Object.entries(payload.confirmedFields)) {
+            if (typeof v === 'string') confirmed[k] = v;
+          }
+        }
+        if (payload.fields && typeof payload.fields === 'object') {
+          for (const [k, v] of Object.entries(payload.fields)) {
+            if (typeof v === 'string') confirmed[k] = v;
+          }
+        }
+
+        if (Object.keys(confirmed).length > 0) {
+          const updatedEvidence: Evidence = {
+            ...ev,
+            confirmedFields: { ...ev.confirmedFields, ...confirmed },
+            confirmedAt: context.now,
+            state: ev.state === 'REVIEW_REQUIRED' ? 'CONFIRMED' : ev.state,
+            updatedAt: context.now,
+          };
+          changes.push(put('evidence', updatedEvidence));
+        }
+      }
+    }
+  }
+
+  return commit(workspace, changes);
 }
 
 /**
@@ -1303,12 +1569,18 @@ export function reviewAiSuggestion(
  * claim states and the case's `lastAnalyzedAt`, because a half-applied analysis would
  * show a case whose claim states disagree with its own findings. Only records that
  * actually changed are written.
+ *
+ * The run itself is returned alongside the mutation. `runDirectCaseAnalysis` needs the
+ * findings to build its report and used to get them by calling `runAnalysis` a second
+ * time and persisting the results by hand — which is how it came to persist `results`
+ * and silently drop `resolved`. Handing the run back is what lets one caller both
+ * persist correctly and read what was persisted.
  */
 export function runCaseAnalysis(
   workspace: Workspace,
   context: MutationContext,
   caseId: string,
-): Mutation & { findingCount: number; resolvedCount: number } {
+): Mutation & { findingCount: number; resolvedCount: number; run: AnalysisRunResult } {
   const run = runAnalysis(workspace, caseId, context.now);
 
   const changes: Change[] = [];
@@ -1362,6 +1634,7 @@ export function runCaseAnalysis(
     ...commit(workspace, changes),
     findingCount: run.results.length,
     resolvedCount: run.resolved.length,
+    run,
   };
 }
 
@@ -1372,6 +1645,11 @@ function isSameFinding(a: AnalysisResult, b: AnalysisResult): boolean {
     a.status === b.status &&
     a.title === b.title &&
     a.explanation === b.explanation &&
+    // The caveat is a reader-visible field with its own control on the card, so a run that
+    // changes only the hedge — the quarantine naming a different unconfirmed read after a
+    // re-extraction, say — still has to be written back. Leaving it out of this comparison
+    // would freeze the first caveat a finding was ever given onto every later version of it.
+    a.caveat === b.caveat &&
     a.confidence === b.confidence &&
     // Provisional-ness is what a reader notices most: confirming an OCR value flips a
     // finding from a hedged question to a plain statement (or clears it), and that

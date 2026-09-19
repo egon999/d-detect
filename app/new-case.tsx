@@ -1,77 +1,47 @@
 /**
  * New case.
  *
- * The first real thing a person does in the app, so it asks for one thing — a title — and
- * treats everything else as optional. Everything on this screen can be changed later from
- * inside the case; nothing here is a decision the person is stuck with.
+ * The first real thing a person does in the app, and it asks for two things: a name for the
+ * case, and — optionally — the one statement they want the evidence to settle.
  *
- * ## Why the category presets do not fill in the claim
+ * ## Why it stops there
  *
- * They used to. Choosing "Financial & Payment" wrote a template into the claim field —
- * `The payment of amount was completed on [date] via [UPI/Bank]` — and if the person did
- * not edit it, that string was saved as their claim. A claim is a factual assertion the
- * analysis then tries to check against evidence, so the app ended up assessing a sentence
- * with `[date]` in it that nobody had ever asserted.
+ * It used to ask for eight fields across four headed sections — a category from seven preset
+ * chips or a text box of your own, a background paragraph, a date, and a repeatable list of
+ * people — under a subtitle reading "A title is all you need to begin. Everything else can be
+ * added later." The second half of that sentence was false. `updateCase` had no caller
+ * anywhere in the app, so everything collected here was collected once and then frozen for
+ * the life of the case. The form was long *because* nothing downstream could change it.
  *
- * The presets now set the category only, and the example they carry is shown as a hint
- * under the field — visible while writing, never submitted.
+ * `app/case/[caseId]/details.tsx` is that caller now. Category, background, the date and the
+ * people moved there, where they can be answered by someone who has read their documents
+ * rather than guessed at by someone who has not yet uploaded one.
+ *
+ * ## Why the claim stayed
+ *
+ * It is the only field here that changes what the app does next. A claim is what findings are
+ * assessed against, so a case created with one has something to check from the first upload
+ * and a case created without one has nothing. It is still optional, and the composer on the
+ * case screen adds more.
+ *
+ * ## Why nothing fills a field in for the reader
+ *
+ * The category presets used to. Choosing "Financial & Payment" wrote a template into the
+ * claim field — `The payment of amount was completed on [date] via [UPI/Bank]` — and if the
+ * person did not edit it, that string was saved as their claim. A claim is a factual
+ * assertion the analysis then tries to check against evidence, so the app ended up assessing
+ * a sentence with `[date]` in it that nobody had ever asserted. The presets are gone; the
+ * rule they taught is not.
  */
 
 import { useRouter } from 'expo-router';
 import React, { useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, View } from 'react-native';
-import type { CaseParticipant } from '@domain/models';
-import { newId } from '@domain/ids';
+import { KeyboardAvoidingView, Platform, View } from 'react-native';
 import { useRepository, useSession } from '@services';
 import { mutationContext, useWorkspace } from '@services/use-case-store';
 import { createCase, createClaim } from '@data/mutations';
 import { caseSchema, claimSchema } from '@domain/models';
-import { Button, Chip, Notice, Pressable, Row, ScreenScroll, Stack, Surface, Text, TextField, readableError, useTheme } from '@ui';
-
-/**
- * Dispute categories, with one worked example each.
- *
- * `example` is shown as a hint, never written into the field. It is phrased as a whole
- * sentence a person could have written themselves, because that is what the claim field
- * wants — not a form with blanks in it.
- */
-const PRESET_CATEGORIES = [
-  {
-    id: 'financial',
-    label: 'Payment',
-    example: 'I paid the full amount on 14 March and it was never credited.',
-  },
-  {
-    id: 'harassment',
-    label: 'Harassment',
-    example: 'They kept messaging me after I asked them to stop.',
-  },
-  {
-    id: 'contract',
-    label: 'Broken agreement',
-    example: 'The work we agreed on in the contract was never delivered.',
-  },
-  {
-    id: 'fraud',
-    label: 'Misrepresentation',
-    example: 'They described the item as new, and it arrived used.',
-  },
-  {
-    id: 'commerce',
-    label: 'Delivery',
-    example: 'The order was marked delivered but nothing arrived.',
-  },
-  {
-    id: 'workplace',
-    label: 'Unpaid work',
-    example: 'My salary for October and November has not been paid.',
-  },
-  {
-    id: 'property',
-    label: 'Rent and deposit',
-    example: 'My deposit was not returned after I moved out.',
-  },
-] as const;
+import { Button, Notice, ScreenScroll, Stack, Surface, Text, TextField, readableError, useTheme } from '@ui';
 
 export default function NewCaseScreen() {
   const router = useRouter();
@@ -81,12 +51,7 @@ export default function NewCaseScreen() {
   const { workspace } = useWorkspace(user?.id ?? null, null);
 
   const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
-  const [customCategory, setCustomCategory] = useState('');
-  const [incidentDate, setIncidentDate] = useState('');
   const [initialClaim, setInitialClaim] = useState('');
-  const [participants, setParticipants] = useState<CaseParticipant[]>([]);
   const [busy, setBusy] = useState(false);
   /**
    * The two failures this form can have, kept apart.
@@ -99,21 +64,6 @@ export default function NewCaseScreen() {
    */
   const [titleError, setTitleError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-
-  const preset = selectedPreset ? PRESET_CATEGORIES.find((item) => item.id === selectedPreset) ?? null : null;
-  const activeCategory = preset?.label ?? customCategory;
-
-  const handleSelectPreset = (next: (typeof PRESET_CATEGORIES)[number]) => {
-    // Selecting the chosen one again clears it, so a category can be unset without
-    // reaching for the text field.
-    if (selectedPreset === next.id) {
-      setSelectedPreset(null);
-      setCustomCategory('');
-      return;
-    }
-    setSelectedPreset(next.id);
-    setCustomCategory('');
-  };
 
   async function submit() {
     if (busy || !user || !ready) return;
@@ -131,14 +81,16 @@ export default function NewCaseScreen() {
       const context = mutationContext(user.id);
       const caseMutation = createCase(workspace, context, {
         title: cleanTitle,
-        description: description.trim() || undefined,
-        category: activeCategory.trim() || undefined,
-        incidentDate: incidentDate.trim() || null,
-        participants: participants.filter((p) => p.name.trim().length > 0),
         priority: 'NORMAL',
       });
 
-      const createdCase = caseMutation.workspace.cases[caseMutation.workspace.cases.length - 1];
+      const caseChange = caseMutation.changes.find(
+        (change) => change.collection === 'cases' && change.op === 'put',
+      );
+      const createdCaseId = caseChange && caseChange.op === 'put' ? caseChange.record.id : null;
+      const createdCase = createdCaseId
+        ? caseMutation.workspace.cases.find((item) => item.id === createdCaseId)
+        : null;
       if (!createdCase) {
         throw new Error('The case could not be created. Try again.');
       }
@@ -150,7 +102,13 @@ export default function NewCaseScreen() {
         const claimMutation = createClaim(caseMutation.workspace, context, createdCase.id, {
           statement: initialClaim.trim(),
         });
-        const createdClaim = claimMutation.workspace.claims[claimMutation.workspace.claims.length - 1];
+        const claimChange = claimMutation.changes.find(
+          (change) => change.collection === 'claims' && change.op === 'put',
+        );
+        const createdClaimId = claimChange && claimChange.op === 'put' ? claimChange.record.id : null;
+        const createdClaim = createdClaimId
+          ? claimMutation.workspace.claims.find((item) => item.id === createdClaimId)
+          : null;
         if (createdClaim) {
           claimSchema.parse(createdClaim);
         }
@@ -224,147 +182,23 @@ export default function NewCaseScreen() {
               maxLength={160}
               autoFocus
               placeholder="Deposit not returned by landlord"
-              hint="A short name you will recognise later."
             />
 
-            <View style={{ gap: theme.spacing.sm }}>
-              <Text variant="label">Category</Text>
-              <Text variant="caption" colorToken="textSecondary">
-                Pick the closest one, or write your own below.
-              </Text>
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={{ gap: theme.spacing.sm, paddingVertical: theme.spacing.xs }}
-              >
-                {PRESET_CATEGORIES.map((item) => (
-                  <Pressable
-                    key={item.id}
-                    onPress={() => handleSelectPreset(item)}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: selectedPreset === item.id }}
-                    accessibilityLabel={`Category: ${item.label}`}
-                  >
-                    <Chip label={item.label} tone={selectedPreset === item.id ? 'accent' : 'neutral'} />
-                  </Pressable>
-                ))}
-              </ScrollView>
-              <TextField
-                label="Your own category"
-                value={customCategory}
-                onChangeText={(value) => {
-                  setCustomCategory(value);
-                  setSelectedPreset(null);
-                }}
-                maxLength={80}
-                placeholder="Freelance milestone dispute"
-              />
-            </View>
-          </Surface>
-
-          <Surface padding="lg" radius="lg" style={{ gap: theme.spacing.lg }}>
             {/*
-              The heading, and nothing beside it. Each of these three sections used to carry
-              a grey "Optional" chip, and two of the fields inside them repeated it as a
-              label hint, and the category caption said it in words — six statements of one
-              fact, on a screen whose subtitle already says a title is all you need. A badge
-              that appears on every section is not telling the reader which ones are optional.
+              `labelHint`, not a caption under the field and not a grey chip beside the
+              heading. Three of the four sections this screen used to have carried an
+              "Optional" badge, two of the fields inside them repeated it as a hint, and the
+              subtitle said it in words — the badge that appears on everything tells the
+              reader nothing about which thing it is on. One word, on the one field that is.
             */}
-            <Text variant="heading">The first thing to check</Text>
-            <Text variant="bodySmall" colorToken="textSecondary">
-              Write one statement you want the evidence to settle. Keep it specific enough that a
-              document could confirm or contradict it. You can add more later.
-            </Text>
             <TextField
-              label="Statement to check"
+              label="The first thing to check"
+              labelHint="Optional"
               value={initialClaim}
               onChangeText={setInitialClaim}
               multiline
               maxLength={2000}
               placeholder="I paid the full amount and it was never credited."
-              {...(preset ? { hint: `For example: ${preset.example}` } : {})}
-            />
-          </Surface>
-
-          <Surface padding="lg" radius="lg" style={{ gap: theme.spacing.lg }}>
-            <Text variant="heading">Background</Text>
-            <TextField
-              label="What happened?"
-              value={description}
-              onChangeText={setDescription}
-              multiline
-              maxLength={4000}
-              placeholder="Describe what happened and what you are trying to establish."
-            />
-            <TextField
-              label="When did it happen?"
-              value={incidentDate}
-              onChangeText={setIncidentDate}
-              maxLength={60}
-              placeholder="14 March 2026, or October 2025 to January 2026"
-            />
-          </Surface>
-
-          <Surface padding="lg" radius="lg" style={{ gap: theme.spacing.lg }}>
-            <Text variant="heading">People involved</Text>
-            <Text variant="bodySmall" colorToken="textSecondary">
-              Adding a name lets the app show you where that person appears across your documents.
-            </Text>
-            {participants.map((person, index) => (
-              /*
-                No border on this one. It is a panel inside a card that already has an edge,
-                and `variant="sunken"` gives it a fill a shade below its parent's — which is
-                what separates it. A hairline as well would be the third statement of the
-                same boundary.
-              */
-              <Surface
-                key={person.id}
-                variant="sunken"
-                bordered={false}
-                padding="md"
-                radius="md"
-                style={{ gap: theme.spacing.md }}
-              >
-                <Row between align="center">
-                  <Text variant="label">Person {index + 1}</Text>
-                  <Button
-                    label="Remove"
-                    variant="ghost"
-                    size="sm"
-                    onPress={() => setParticipants((prev) => prev.filter((p) => p.id !== person.id))}
-                  />
-                </Row>
-                <TextField
-                  label="Name"
-                  value={person.name}
-                  maxLength={120}
-                  placeholder="Their name, or the company's"
-                  onChangeText={(name) =>
-                    setParticipants((values) =>
-                      values.map((p) => (p.id === person.id ? { ...p, name } : p)),
-                    )
-                  }
-                />
-                <TextField
-                  label="How are they involved?"
-                  value={person.role}
-                  maxLength={80}
-                  placeholder="Landlord, witness, the bank"
-                  onChangeText={(role) =>
-                    setParticipants((values) =>
-                      values.map((p) => (p.id === person.id ? { ...p, role } : p)),
-                    )
-                  }
-                />
-              </Surface>
-            ))}
-            <Button
-              label="Add a person"
-              variant="secondary"
-              icon="account-plus-outline"
-              onPress={() =>
-                setParticipants((values) => [...values, { id: newId('person'), name: '', role: '' }])
-              }
             />
           </Surface>
 

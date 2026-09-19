@@ -235,7 +235,7 @@ describe('the quarantine', () => {
     expect(quarantine.severity).toBe('MEDIUM');
     expect(quarantine.unconfirmedReads.length).toBeGreaterThan(0);
     expect(quarantine.explanation).toContain('The amounts differ.');
-    expect(quarantine.explanation).toMatch(/read from an image/i);
+    expect(quarantine.caveat).toMatch(/read from an image/i);
   });
 
   it('leaves the same finding alone when the values came out of the file as characters', () => {
@@ -316,8 +316,8 @@ describe('the quarantine', () => {
     expect(quarantine.unconfirmedReads).toEqual([
       { evidenceId: 'evd_shot', path: 'amounts.0', label: 'Amount', reading: amount.original },
     ]);
-    // Named in the explanation, so the finding itself is the prompt.
-    expect(quarantine.explanation).toContain(amount.original);
+    // Named in the caveat, so the finding itself carries the prompt.
+    expect(quarantine.caveat).toContain(amount.original);
   });
 });
 
@@ -364,7 +364,7 @@ describe('a date conflict read off two photographs', () => {
     expect(finding!.provisional).toBe(true);
     expect(finding!.confidence).toBe('NEEDS_REVIEW');
     expect(finding!.severity).toBe('MEDIUM');
-    expect(finding!.explanation).toMatch(/read from an image/i);
+    expect(finding!.caveat).toMatch(/read from an image/i);
 
     // Exactly the two dates compared — not every field of both documents.
     expect(finding!.unconfirmedReads).toHaveLength(2);

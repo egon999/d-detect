@@ -27,6 +27,7 @@ function finding(overrides: Partial<AnalysisResult> = {}): AnalysisResult {
     severity: 'HIGH',
     title: 'Amounts do not agree',
     explanation: 'The invoice says INR 85,000 and the receipt says INR 40,000.',
+    caveat: '',
     supportingEvidenceIds: [],
     relatedClaimIds: [],
     relatedEventIds: [],

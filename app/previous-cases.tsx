@@ -244,8 +244,12 @@ export default function DeviceCasesScreen() {
     try {
       // Imported here rather than at module load: this is the one destructive action on the
       // screen, and keeping it next to its use makes that obvious when reading the file.
-      const { clearDeviceCases } = await import('@services/migration');
-      await clearDeviceCases(selected.entry.deviceOwnerId);
+      //
+      // Scoped to the case id, not just the owner id. This called `clearDeviceCases`, which
+      // deletes the whole device owner prefix — every anonymous case on the phone, including
+      // ones never moved and held nowhere else — from a button that names one case.
+      const { clearDeviceCase } = await import('@services/migration');
+      await clearDeviceCase(selected.entry.deviceOwnerId, selected.entry.record.id);
       setCleared(true);
       void load();
     } catch (caught) {
@@ -253,7 +257,7 @@ export default function DeviceCasesScreen() {
         title: 'The device copy was not removed',
         message: readableError(
           caught,
-          'The copy on this device could not be removed. It is still here, and the copy in your account is untouched.',
+          'The copy of this case on this device could not be removed. It is still here, and the copy in your account is untouched.',
         ),
         detail: errorDetail(caught) ?? null,
       });
@@ -426,19 +430,7 @@ export default function DeviceCasesScreen() {
 
               {outcome ? (
                 <Stack gap="md">
-                  <Notice
-                    tone="ok"
-                    title="Moved into your account"
-                    message={
-                      outcome.filesMissing
-                        ? `The case is in your account. ${outcome.filesMoved} original ${
-                            outcome.filesMoved === 1 ? 'file' : 'files'
-                          } came with it; ${outcome.filesMissing} could not be found on this device and need adding again.`
-                        : `The case and all ${outcome.filesMoved} of its original ${
-                            outcome.filesMoved === 1 ? 'file' : 'files'
-                          } are now in your account.`
-                    }
-                  />
+                  <Notice tone="ok" title="Moved into your account" message={handoverSummary(outcome)} />
                   <Button
                     label="Open the case"
                     onPress={() =>
@@ -452,16 +444,17 @@ export default function DeviceCasesScreen() {
                     <Notice
                       tone="info"
                       title="Device copy removed"
-                      message="The account copy is the only one now."
+                      message="Device storage no longer has this case. The record is in your account, and its original files are still on this phone, where this app keeps them."
                     />
                   ) : (
                     <Stack gap="xs">
                       <Text variant="caption" colorToken="textSecondary">
-                        A copy is still on this device, taking up space. Removing it cannot be
-                        undone.
+                        A copy of this case is still in device storage, taking up space. Removing
+                        it takes this case and nothing else, cannot be undone, and leaves the
+                        original files on this phone.
                       </Text>
                       <Button
-                        label="Remove the copy on this device"
+                        label="Remove the device copy of this case"
                         variant="secondary"
                         loading={clearing}
                         disabled={clearing}
@@ -475,7 +468,7 @@ export default function DeviceCasesScreen() {
                   <Notice
                     tone="info"
                     title="What moving does"
-                    message="Claims, events, documents, findings and the history move across as they are, and the original files move with them. Nothing is re-analysed and nothing is discarded. The copy on this device is left alone until you remove it."
+                    message="Claims, events, documents, findings and the history move across as they are. Nothing is re-analysed and nothing is discarded. The original files stay on this phone — this app keeps originals on the device — and are refiled under your account so the case can still open them. The copy in device storage is left alone until you remove it."
                   />
                   {inAccount.has(record.id) && (
                     <Notice
@@ -512,6 +505,39 @@ export default function DeviceCasesScreen() {
       </Stack>
     </ScreenScroll>
   );
+}
+
+/**
+ * What a finished handover actually did, in the two halves that did different things.
+ *
+ * The record crossed into the account. The original bytes did not, and there is nowhere for
+ * them to go: this build has no remote file store — `src/services/storage/evidence-storage.ts`
+ * sets out why, the Firebase project being on Spark where Storage is unavailable — so
+ * `moveEvidenceFile` moves each original from the device owner's folder to the account's,
+ * both of them inside this phone's own private app directory.
+ *
+ * This said the files "are now in your account", which is the one sentence here a user could
+ * act on to their cost: it is the reassurance someone reads before wiping the handset. Said as
+ * a function rather than inline because the true version has to state where the originals are
+ * in the same breath as the count, and there are four combinations of moved and missing.
+ */
+function handoverSummary(outcome: HandoverOutcome): string {
+  const originals = (count: number) => `${count} original ${count === 1 ? 'file' : 'files'}`;
+  const parts = ['The case record is in your account.'];
+
+  if (outcome.filesMoved) {
+    parts.push(
+      `Its ${originals(outcome.filesMoved)} stay on this phone, where this app keeps originals — ` +
+        'they did not go to your account with the record.',
+    );
+  }
+  // Unchanged wording: a missing original is the one thing on this screen the user has to do
+  // something about, and it reads the same whether or not anything else came across.
+  if (outcome.filesMissing) {
+    parts.push(`${outcome.filesMissing} could not be found on this device and need adding again.`);
+  }
+
+  return parts.join(' ');
 }
 
 const styles = StyleSheet.create({

@@ -5,8 +5,9 @@ import type { AIExtractionSuggestion, CaseCitation, Workspace } from '@domain/mo
 import { isConflictFinding } from '@domain/enums';
 import { ASSESSMENT_LABELS, evidenceBasis, latestCaseAnalysis, reportIsStale, resolveCitation } from '@domain/analysis/case-report';
 import { runEvidenceIntelligence, type DiscoveredAssertion } from '@domain/analysis/evidence-intelligence';
-import { aiAvailable, confidenceBand, isOnDeviceSuggestion, requestCaseAnalysis, useMutator, useRepository } from '@services';
+import { aiAvailable, confidenceBand, describeAiRunFailure, isOnDeviceSuggestion, readAiRunFailure, requestCaseAnalysis, subscribeToAiRunFailures, useMutator, useRepository, type AiRunFailure } from '@services';
 import { AISetupNotice } from './ai-setup-notice';
+import { flatCitations, readReasoning, type ReasonedPayload } from './reasoning';
 import {
   ASSERTION_KIND_LABELS,
   Button,
@@ -112,23 +113,64 @@ function ReadingStamp({ method }: { method: string }) {
 }
 
 /**
- * Citations carried inside a suggestion payload, when the producing pass included any.
+ * What a cross-document pass found, rendered beneath the summary that counts it.
  *
- * No suggestion kind written today carries citations (the cross-document operations that
- * produce verified citations are not persisted as suggestions yet), so this usually
- * returns nothing. It exists so that the day one does, the section renders its quotes
- * and their sources without a second wiring pass - and so nothing in the payload is ever
- * rendered unchecked: each entry must name a document, a segment and a quote.
+ * The four passes — reconciliation, support strength, missing information and timeline
+ * coherence — verify every citation they return against the real segment text and persist the
+ * whole result. Until this component existed the panel looked for a flat `payload.citations`
+ * array that none of them writes, so a card that had computed *"the bank statement says
+ * ₹12,400 and the receipt says ₹14,200, here is the line from each"* rendered the sentence and
+ * discarded both lines. The reasoning was real and the gauge was missing.
+ *
+ * Readings are compact and the passages are grouped once at the foot, rather than a quote
+ * nested under every value. Three documents disagreeing is three short rows a reader can scan
+ * in one pass; the same content as three nested bordered blocks is a screen they scroll past.
  */
-function payloadCitations(payload: Record<string, unknown>): Array<{ evidenceId: string; segmentId: string; quote: string }> {
-  if (!Array.isArray(payload.citations)) return [];
-  return payload.citations.filter(
-    (entry): entry is { evidenceId: string; segmentId: string; quote: string } =>
-      typeof entry === 'object' && entry !== null &&
-      typeof (entry as { evidenceId?: unknown }).evidenceId === 'string' &&
-      typeof (entry as { segmentId?: unknown }).segmentId === 'string' &&
-      typeof (entry as { quote?: unknown }).quote === 'string',
-  );
+function ReasoningView({ reasoning, workspace, caseId }: { reasoning: ReasonedPayload; workspace: Workspace; caseId: string }) {
+  return <Stack gap="md">
+    {reasoning.verdict ? <Stack gap="xs">
+      <Chip label={reasoning.verdict.label} tone={reasoning.verdict.tone} size="sm" />
+      {reasoning.verdict.reason ? <Text variant="bodySmall">{reasoning.verdict.reason}</Text> : null}
+    </Stack> : null}
+
+    {reasoning.findings.map((finding) => {
+      // A support assessment names the claim by id rather than repeating its text, so the
+      // heading is resolved here. A claim deleted since the pass ran is said so plainly: the
+      // assessment is still a real record of what was found, and silently dropping it would
+      // leave a status chip floating above an explanation of nothing.
+      const claim = finding.subjectId
+        ? workspace.claims.find((item) => item.id === finding.subjectId && item.caseId === caseId && !item.deletedAt)
+        : undefined;
+      const heading = finding.title || claim?.statement || (finding.subjectId ? 'A claim no longer in this case' : '');
+      // Every passage under one finding, in one list. `CitationList` prints the source
+      // document beneath each quote, so a reader can still tell which reading a line came from.
+      const passages = [...finding.citations, ...finding.readings.flatMap((reading) => reading.citations)];
+
+      return <Stack key={finding.key} gap="sm">
+        {finding.status || heading ? <Row gap="sm" align="center" wrap>
+          {finding.status ? <Chip label={finding.status.label} tone={finding.status.tone} size="sm" /> : null}
+          {heading ? <Text variant="subheading" style={{ flex: 1 }}>{heading}</Text> : null}
+        </Row> : null}
+        {finding.detail ? <Text variant="bodySmall">{finding.detail}</Text> : null}
+        {finding.readings.map((reading, index) => {
+          const source = workspace.evidence.find(
+            (item) => item.id === reading.evidenceId && item.caseId === caseId && !item.deletedAt,
+          );
+          return <Row key={`${finding.key}:reading:${index}`} gap="sm" align="center" wrap>
+            {/* Mono, because the value is the document's characters rather than the app's words. */}
+            <Text variant="mono">{reading.value}</Text>
+            <Text variant="caption" colorToken="textSecondary" style={{ flex: 1 }} numberOfLines={1}>
+              {source?.title ?? 'A document no longer in this case'}
+            </Text>
+          </Row>;
+        })}
+        {finding.note ? <Text variant="caption" colorToken="textSecondary">{finding.note}</Text> : null}
+        {passages.length > 0 ? <CitationList citations={passages} workspace={workspace} caseId={caseId} /> : null}
+      </Stack>;
+    })}
+
+    {reasoning.footnote ? <Text variant="caption" colorToken="textSecondary">{reasoning.footnote}</Text> : null}
+  </Stack>;
 }
 
 /**
@@ -185,6 +227,19 @@ export function CitationList({ citations, workspace, caseId }: { citations: Case
 }
 
 /**
+ * Why a reading stopped, said in the section it was supposed to fill.
+ *
+ * `warn`, not `danger`: the case is untouched, the deterministic assessment above is
+ * complete, and the usual cause is a key or a connection the reader can fix in a minute.
+ * The sentence itself comes from the transport's own fixed vocabulary, which is the only
+ * text in the app written with the provider's answer in hand.
+ */
+function AiRunFailureNotice({ failure }: { failure: AiRunFailure }) {
+  const { title, message } = describeAiRunFailure(failure);
+  return <Notice title={title} message={message} tone="warn" />;
+}
+
+/**
  * The case's AI suggestions: what a connected model proposed, for a person to accept or
  * dismiss.
  *
@@ -203,6 +258,27 @@ export function AiSuggestionsSection({ workspace, caseId }: { workspace: Workspa
   const ownerId = workspace.cases.find((item) => item.id === caseId)?.ownerId ?? null;
   const mutator = useMutator(ownerId, caseId, workspace);
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
+  /**
+   * Why the last reading for this case stopped, if it did.
+   *
+   * The passes are fire-and-forget and cannot reject, so a run that died and a run that
+   * found nothing both arrive here as the same thing: no suggestions. They are not the same
+   * thing to the person reading, and until this state existed the section said *"Nothing
+   * here yet"* — a sentence about a successful, empty run — over a run that had just failed.
+   * See `@services`' `run-outcome` for why this is held for the session rather than stored.
+   *
+   * Subscribed rather than read once: a failure lands after the deterministic assessment has
+   * already returned, so there is nothing to wait on and nothing that would re-render this
+   * section when it arrives — a stopped run commits no changes, so no workspace event fires.
+   */
+  const [aiFailure, setAiFailure] = useState<AiRunFailure | null>(() => readAiRunFailure(caseId));
+
+  useEffect(() => {
+    setAiFailure(readAiRunFailure(caseId));
+    return subscribeToAiRunFailures((changed) => {
+      if (changed === caseId) setAiFailure(readAiRunFailure(caseId));
+    });
+  }, [caseId]);
 
   useEffect(() => {
     let alive = true;
@@ -235,12 +311,27 @@ export function AiSuggestionsSection({ workspace, caseId }: { workspace: Workspa
         have yet. */}
     {aiConfigured === null ? <Text variant="bodySmall" colorToken="textSecondary">Checking whether a model is connected…</Text> : null}
     {aiConfigured === false ? <AISetupNotice action="read what your documents mean, propose connections to your claims and events, and say what the case is missing" compact /> : null}
-    {aiConfigured && suggestions.length === 0 ? <Text variant="bodySmall" colorToken="textSecondary">Nothing here yet. Suggestions appear after a document is read or an assessment is run.</Text> : null}
+    {/*
+      Above the list rather than below it, and shown even when suggestions did arrive. A run
+      that stopped mid-sequence still commits what it found before it stopped, so the reader
+      is looking at a partial result — and a partial result that does not say it is partial
+      is the same error as a missing one that does not say it is missing.
+    */}
+    {aiFailure ? <AiRunFailureNotice failure={aiFailure} /> : null}
+    {/*
+      Suppressed when a run just failed. This sentence describes an empty run that finished,
+      which is the one thing that did not happen, and it was reading over a dead run before
+      the notice above existed.
+    */}
+    {aiConfigured && suggestions.length === 0 && !aiFailure ? <Text variant="bodySmall" colorToken="textSecondary">Nothing here yet. Suggestions appear after a document is read or an assessment is run.</Text> : null}
     {ordered.map((item) => {
       const sources = item.sourceEvidenceIds
         .map((id) => workspace.evidence.find((entry) => entry.id === id && entry.caseId === caseId && !entry.deletedAt))
         .filter((entry) => entry !== undefined);
-      const citations = payloadCitations(item.payload);
+      // A cross-document pass stores a nested result; everything else carries its citations
+      // flat at the top of the payload. Exactly one of the two reads any given record.
+      const reasoning = readReasoning(item.kind, item.payload);
+      const citations = reasoning ? [] : flatCitations(item.payload);
       /*
         Some of these were produced by comparing values on this device, with no model
         involved: amounts in one currency are arithmetic and shared identifiers are string
@@ -282,16 +373,19 @@ export function AiSuggestionsSection({ workspace, caseId }: { workspace: Workspa
           {sources.map((source) => <Button key={source.id} label={`Open ${source.title}`} variant="ghost" size="sm" onPress={() => router.push({ pathname: '/case/[caseId]/evidence/[evidenceId]', params: { caseId, evidenceId: source.id } })} />)}
         </Row> : null}
         {/*
-          Paper, for the same reason `CitationList` is paper: these characters are the reader's
-          document, and everything else on this card is a model talking about it. Set on a sheet
-          the `“…”` marks are redundant — worse than redundant, since the payload's quote is a
-          fragment and the marks punctuated the model's cut as though the document had written it.
+          The verified reasoning behind the summary: which documents disagree and on what,
+          which passages carry a claim, which gap would settle the question, where the dates
+          break. Every quote below resolved against the source text at its stored offsets —
+          anything that no longer matches its document was dropped before it reached here.
         */}
-        {citations.length > 0 ? <Stack gap="sm">
-          {citations.map((citation, index) => <PaperSheet key={`${citation.evidenceId}:${citation.segmentId}:${index}`}>
-            <Text variant="mono" selectable style={{ color: theme.colors.paper.text }}>{citation.quote}</Text>
-          </PaperSheet>)}
-        </Stack> : null}
+        {reasoning ? <ReasoningView reasoning={reasoning} workspace={workspace} caseId={caseId} /> : null}
+        {/*
+          Paper, for the same reason `CitationList` is paper: these characters are the reader's
+          document, and everything else on this card is a model talking about it. Routed
+          through `CitationList` rather than a bare sheet so a quote can be opened at its
+          source, which is the whole point of having verified it.
+        */}
+        {citations.length > 0 ? <CitationList citations={citations} workspace={workspace} caseId={caseId} /> : null}
         {item.status === 'SUGGESTED' ? <Row gap="sm" wrap>
           <Button label="Accept" size="sm" disabled={mutator.busy} onPress={() => review(item.id, 'ACCEPTED')} />
           <Button label="Dismiss" size="sm" variant="secondary" disabled={mutator.busy} onPress={() => review(item.id, 'REJECTED')} />
@@ -331,24 +425,44 @@ export function CaseAnalysisPanel({ workspace, caseId }: { workspace: Workspace;
           statement: assertion.statement,
           detail: assertion.detail,
         });
+
+        // Accumulated, rather than taken from `claimMutation` alone. Each `linkEntities` call
+        // below produces its own `changes`, and returning the claim's set beside the linked
+        // workspace saved the claim and silently dropped every link: they appeared at once
+        // from the optimistic workspace, then vanished the moment the subscription emitted
+        // what had actually been written. Nothing errored, which is what made it hard to see.
+        const changes = [...claimMutation.changes];
         let nextWs = claimMutation.workspace;
-        const newClaim = nextWs.claims.find((c) => c.statement === assertion.statement.trim() && !c.deletedAt);
-        if (newClaim) {
+
+        // Read back out of the mutation instead of searched for by statement. The panel only
+        // offers assertions that match no existing claim, so a search would normally find the
+        // right row — but it would silently attach the links to someone else's identical claim
+        // if that ever stopped holding, and the record just created is already in hand.
+        const created = claimMutation.changes.find(
+          (change) => change.op === 'put' && change.collection === 'claims',
+        );
+        const newClaimId = created && created.op === 'put' ? created.record.id : null;
+
+        if (newClaimId) {
           for (const evId of assertion.sourceEvidenceIds) {
             try {
               const linkMut = linkEntities(nextWs, mCtx, caseId, {
                 from: { kind: 'evidence', id: evId },
-                to: { kind: 'claim', id: newClaim.id },
+                to: { kind: 'claim', id: newClaimId },
                 type: assertion.corroboration === 'CONTRADICTED' ? 'CONTRADICTS' : 'SUPPORTS',
                 origin: 'USER',
               });
               nextWs = linkMut.workspace;
+              changes.push(...linkMut.changes);
             } catch {
-              // Ignore duplicate link error
+              // One source that cannot be linked — already linked, or since removed from the
+              // case — skips that link rather than failing the promotion. The claim is what
+              // the user asked for, and the remaining sources still attach.
             }
           }
         }
-        return { ...claimMutation, workspace: nextWs };
+
+        return { ...claimMutation, workspace: nextWs, changes };
       });
     } finally {
       setPromotingId(null);

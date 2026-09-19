@@ -435,7 +435,6 @@ export default function EvidenceGraphScreen() {
   const conflictCount =
     graph.nodes.filter((n) => n.kind === 'conflict').length +
     graph.edges.filter((e) => e.type === 'CONTRADICTS').length;
-  const entityCount = graph.nodes.filter((n) => n.kind === 'entity').length;
 
   const filteredNodes = useMemo(() => {
     switch (activeTab) {
@@ -649,51 +648,45 @@ export default function EvidenceGraphScreen() {
               />
             ) : null}
 
-            {/* Counts and the action that produces new links. */}
-            <Surface padding="lg" radius="lg" style={styles.panel}>
-              <Text variant="bodySmall" colorToken="textSecondary">
-                Claims, documents, people and conflicts in this case, and the recorded links
-                between them.
-              </Text>
+            {/*
+              The action that produces new links, and nothing else.
 
-              {/*
-                Every count is neutral. A head-count is not a finding, and painting one in
-                `danger` or `ok` tells the reader the app has concluded something about the
-                case from how many rows it has.
-              */}
-              <Row gap="sm" wrap>
-                <Chip label={`${graph.nodes.length} records`} tone="neutral" />
-                <Chip label={`${claimsCount} claims`} tone="neutral" />
-                <Chip label={`${evidenceCount} documents`} tone="neutral" />
-                <Chip label={`${graph.edges.length} links`} tone="neutral" />
-                {conflictCount > 0 ? (
-                  <Chip label={`${conflictCount} conflicts`} tone="neutral" />
-                ) : null}
-                {entityCount > 0 ? <Chip label={`${entityCount} people`} tone="neutral" /> : null}
-              </Row>
+              This was a panel above the filters: a sentence describing the screen, then six
+              neutral chips counting records, claims, documents, links, conflicts and people.
+              Five of those six numbers are printed again one row below, inside the filter tabs
+              - `All (12)`, `Claims (3)`, `Evidence (6)`, `Conflicts (1)`, `Links (18)`. A count
+              earns its place there, where it says how much a tab holds before the reader spends
+              a tap finding out; here it said the same thing with no tap attached to it.
 
+              The sentence went with them. The screen is titled "Connections", subtitled with the
+              case, and the map below is what it was describing.
+
+              The sixth figure, the head-count of people, is gone rather than moved. It was the
+              one count no filter used, and a tally of names is not a fact about a case - the
+              people are in the map and in the lists, where they are records you can open rather
+              than a number you cannot do anything with.
+            */}
+            <View style={styles.assessAction}>
+              <Button
+                label="Run an assessment"
+                icon="scale-balance"
+                size="sm"
+                variant="secondary"
+                loading={analyzing}
+                disabled={!user || analyzing}
+                onPress={() => void triggerAnalysis()}
+              />
               {/*
                 Disabled while signed out, because `triggerAnalysis` returns early without a
                 user: an enabled button that swallows the tap is worse than one that is plainly
                 unavailable and says why.
               */}
-              <View style={styles.assessAction}>
-                <Button
-                  label="Run an assessment"
-                  icon="scale-balance"
-                  size="sm"
-                  variant="secondary"
-                  loading={analyzing}
-                  disabled={!user || analyzing}
-                  onPress={() => void triggerAnalysis()}
-                />
-                {!user ? (
-                  <Text variant="caption" colorToken="textSecondary">
-                    Sign in to run an assessment.
-                  </Text>
-                ) : null}
-              </View>
-            </Surface>
+              {!user ? (
+                <Text variant="caption" colorToken="textSecondary">
+                  Sign in to run an assessment.
+                </Text>
+              ) : null}
+            </View>
 
             {/*
               Five exclusive views. Selection is the gold accent surface, not the blue CTA:

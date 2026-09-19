@@ -39,9 +39,11 @@ export const harassmentIndicatorRule: Rule = {
           title: `Threatening wording found in "${label}"`,
           explanation:
             `${count} message${count === 1 ? '' : 's'} from ${senders} in "${label}" ` +
-            `use wording flagged as coercive or threatening — for example: "${sampleQuote}". ` +
-            `Flagging is based on wording alone and carries no finding about intent; read the ` +
-            `surrounding conversation before treating it as harassment.`,
+            `use wording flagged as coercive or threatening — for example: "${sampleQuote}".`,
+          caveat:
+            'Flagging is based on wording alone and carries no finding about intent. The same ' +
+            'words can be a quotation, a joke, or a description of something someone else ' +
+            'said. Read the surrounding conversation before treating it as harassment.',
           severity: 'HIGH',
           // Wording matching is a keyword test, not a judgement about what was meant, so
           // this is reported for a person to confirm rather than as an established match.

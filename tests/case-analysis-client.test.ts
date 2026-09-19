@@ -57,6 +57,7 @@ import { extractFromText } from '@domain/extraction/deterministic';
 import { hashText } from '@domain/hashing';
 import type { Repository } from '../src/data/repository';
 import type { Evidence, ProcessingJob, Workspace } from '../src/domain/models';
+import type { AnalysisResult } from '../src/domain/models';
 import { claim, testCase, workspace } from './helpers';
 
 const FILE_TEXT = 'Payment confirmed\nPaid INR 40,000.00 on 26/03/2024\nUTR: 40382881';
@@ -518,5 +519,109 @@ describe('runDirectCaseAnalysis — what the assessment can see', () => {
     const { repository } = fakeRepository(() => workspace({ claims: [], evidence: [] }));
     await expect(runDirectCaseAnalysis(repository, 'user_test', 'case_test'))
       .rejects.toMatchObject({ code: 'failed-precondition' });
+  });
+});
+
+/**
+ * What a run has to write besides the findings it produced.
+ *
+ * This path built its change set by hand: `runAnalysis` returns `results` and `resolved`,
+ * and only `results` was ever persisted. A conflict could therefore be raised but never
+ * lowered — the user corrects the misread amount behind a mismatch, or deletes the document
+ * that disagreed, re-runs, and the stored finding keeps `status: 'OPEN'` for good. The report
+ * built in the same function says there is no conflict while the `analysisResults` collection
+ * the case screen reads still says there is one, and no code path exists to reconcile them.
+ *
+ * `runCaseAnalysis` in `@data/mutations` already wrote all of it correctly and had no
+ * production caller at all. These pin the three things that were missing once this path went
+ * through it.
+ */
+describe('runDirectCaseAnalysis — what the run persists beyond its findings', () => {
+  /** A finding left over from an earlier run that no rule will produce again. */
+  const staleFinding = (overrides: Partial<AnalysisResult> = {}): AnalysisResult => ({
+    id: 'an_stale',
+    ownerId: 'user_test',
+    caseId: 'case_test',
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    resultType: 'AMOUNT_MISMATCH',
+    severity: 'HIGH',
+    title: 'Amounts disagree',
+    explanation: 'Two documents named different totals.',
+    caveat: '',
+    supportingEvidenceIds: [],
+    relatedClaimIds: [],
+    relatedEventIds: [],
+    triggeredRuleIds: ['amount-mismatch'],
+    aiSuggestionIds: [],
+    inputs: {},
+    confidence: 'EXACT_MATCH',
+    status: 'OPEN',
+    provisional: false,
+    unconfirmedReads: [],
+    reviewedAt: null,
+    reviewNote: '',
+    ...overrides,
+  });
+
+  const readableCase = (analysisResults: AnalysisResult[]) =>
+    workspace({
+      claims: [],
+      analysisResults,
+      evidence: [
+        fileEvidence({
+          id: 'evd_receipt',
+          title: 'Payment receipt',
+          extraction: extractFromText({ evidenceId: 'evd_receipt', title: 'Payment receipt', text: FILE_TEXT, method: 'OCR' }),
+        }),
+      ],
+    });
+
+  it('closes a finding that no rule produced this time', async () => {
+    const { repository, commit } = fakeRepository(() => readableCase([staleFinding()]));
+
+    await runDirectCaseAnalysis(repository, 'user_test', 'case_test');
+
+    const written = committed<AnalysisResult>(commit, 'analysisResults');
+    const closed = written.find((result) => result.id === 'an_stale');
+    // Written, not deleted: the history of what the case used to look like is part of the
+    // audit story, so the record stays and its status moves.
+    expect(closed?.status).toBe('RESOLVED');
+  });
+
+  it('leaves a finding a person already dismissed alone', async () => {
+    // `DISMISSED` is a human decision. Re-filing it as RESOLVED would overwrite what someone
+    // judged with what a rule noticed, and the two are not the same statement.
+    const { repository, commit } = fakeRepository(() =>
+      readableCase([staleFinding({ status: 'DISMISSED' })]),
+    );
+
+    await runDirectCaseAnalysis(repository, 'user_test', 'case_test');
+
+    const written = committed<AnalysisResult>(commit, 'analysisResults');
+    expect(written.find((result) => result.id === 'an_stale')).toBeUndefined();
+  });
+
+  it('records that the analysis ran', async () => {
+    // `ANALYSIS_RUN` is in the audit enum and the audit screen has an icon for it, and no
+    // production path had ever written one — so the trail the seal signs was silent about
+    // the single most consequential action in the app.
+    const { repository, commit } = fakeRepository(() => readableCase([]));
+
+    await runDirectCaseAnalysis(repository, 'user_test', 'case_test');
+
+    const audit = committed<{ action: string }>(commit, 'auditLogs');
+    expect(audit.map((entry) => entry.action)).toContain('ANALYSIS_RUN');
+  });
+
+  it('stamps the case exactly once', async () => {
+    // Both this function and the mutation it now delegates to used to write the case row.
+    const { repository, commit } = fakeRepository(() => readableCase([]));
+
+    await runDirectCaseAnalysis(repository, 'user_test', 'case_test');
+
+    const cases = committed<{ lastAnalyzedAt: number | null }>(commit, 'cases');
+    expect(cases).toHaveLength(1);
+    expect(cases[0]?.lastAnalyzedAt).toBeGreaterThan(0);
   });
 });

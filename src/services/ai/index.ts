@@ -8,5 +8,6 @@ export * from './credentials';
 export * from './groq-client';
 export * from './prompts';
 export * from './provenance';
+export * from './run-outcome';
 export * from './semantic-assistant';
 export * from './case-analysis';

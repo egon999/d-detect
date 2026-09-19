@@ -187,6 +187,31 @@ describe('erasing everything', () => {
     // that can name them — invisible to every screen, and permanent.
     expect(order).toEqual(['records', 'files']);
   });
+
+  it('drops the adapter cache last, after the deletions it would otherwise discard', async () => {
+    seedDevice();
+    const dropLocalCache = vi.fn(async () => {
+      order.push('cache');
+    });
+
+    await eraseEverything(fakeRepository({ dropLocalCache }), 'user_signed_in');
+
+    // Not merely tidy sequencing. Clearing Firestore's persistence drops pending writes along
+    // with cached documents, so running it before `clear` was acknowledged would throw away
+    // the deletions the erase depends on — emptying the device while leaving the account full,
+    // and telling the user the opposite.
+    expect(order).toEqual(['records', 'files', 'cache']);
+    expect(dropLocalCache).toHaveBeenCalledTimes(1);
+  });
+
+  it('completes for an adapter that holds no cache to drop', async () => {
+    seedDevice();
+    // `dropLocalCache` is optional on the port: the device adapter is the store of record and
+    // has nothing cached behind it. The erase has to finish rather than fail on a missing
+    // method, which is why the call site uses `?.()` and not a no-op on every adapter.
+    await expect(eraseEverything(fakeRepository(), 'user_signed_in')).resolves.toBeUndefined();
+    expect(order).toEqual(['records', 'files']);
+  });
 });
 
 describe('measuring what an erase would take', () => {

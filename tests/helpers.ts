@@ -22,6 +22,7 @@ import { normalizeDate } from '@domain/normalize/dates';
 
 export const OWNER = 'user_test';
 export const CASE_ID = 'case_test';
+export const NOW = 1_700_000_000_000;
 
 let counter = 0;
 const nextId = (prefix: string) => `${prefix}_${(counter += 1)}`;
@@ -79,6 +80,10 @@ export function evidence(
     confirmedAt: null,
     failureReason: null,
     deletedAt: null,
+    cloudStatus: 'LOCAL_ONLY',
+    cloudUrl: null,
+    cloudPublicId: null,
+    cloudSyncedAt: null,
     ...rest,
   };
 }

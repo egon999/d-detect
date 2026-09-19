@@ -93,12 +93,12 @@ export const eventDateConflictRule: Rule = {
             explanation:
               `"${label(first.item.id)}" gives ${formatDate(first.date)} while ` +
               `"${label(second.item.id)}" gives ${formatDate(second.date)} for the event ` +
-              `"${event.title}". ` +
-              (ambiguous
-                ? 'At least one of these was written in a format where the day and month ' +
-                  'could be read either way, so this may be a formatting difference rather than ' +
-                  'a real disagreement. Open both sources and confirm the intended dates.'
-                : `${classification.explanation} Open both sources before changing the event date.`),
+              `"${event.title}".`,
+            caveat: ambiguous
+              ? 'At least one of these was written in a format where the day and month ' +
+                'could be read either way, so this may be a formatting difference rather than ' +
+                'a real disagreement. Open both sources and confirm the intended dates.'
+              : `${classification.explanation} Open both sources before changing the event date.`,
             severity: ambiguous ? 'MEDIUM' : classification.material ? 'HIGH' : 'MEDIUM',
             confidence: 'NEEDS_REVIEW',
             supportingEvidenceIds: [first.item.id, second.item.id],

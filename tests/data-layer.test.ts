@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { auditLogSchema, caseSchema, claimSchema, evidenceSchema } from '@domain/models';
 import { createMemoryStore } from '@/data/local/key-value-store';
 import { LocalRepository } from '@/data/local/local-repository';
@@ -33,7 +33,7 @@ import {
 import { hashText } from '@domain/hashing';
 import { extractFromText } from '@domain/extraction/deterministic';
 import { SAMPLE_CASE_ID, seedSampleWorkspace } from './fixtures/build-sample-workspace';
-import { CASE_ID, claim, evidence, event, link, OWNER, ref, resetIds, workspace } from './helpers';
+import { CASE_ID, claim, evidence, event, link, OWNER, ref, resetIds, testCase, workspace } from './helpers';
 
 /**
  * The write side.
@@ -755,6 +755,25 @@ describe('LocalRepository', () => {
     expect(other.auditLogs.every((entry) => entry.caseId === secondId)).toBe(true);
   });
 
+  it('safely serializes concurrent commits to the same case without losing writes', async () => {
+    const { store, caseId } = await seeded();
+    const current = await store.loadWorkspace(OWNER, caseId);
+    const claim1 = createClaim(current, context(), caseId, { statement: 'Concurrent claim 1' });
+    const claim2 = createClaim(current, context(), caseId, { statement: 'Concurrent claim 2' });
+
+    await Promise.all([
+      store.commit(OWNER, claim1.changes),
+      store.commit(OWNER, claim2.changes),
+    ]);
+
+    const loaded = await store.loadWorkspace(OWNER, caseId);
+    expect(loaded.claims).toHaveLength(2);
+    expect(loaded.claims.map((c) => c.statement).sort()).toEqual([
+      'Concurrent claim 1',
+      'Concurrent claim 2',
+    ]);
+  });
+
   it('hides a soft-deleted case from the list without losing its records', async () => {
     const { store, caseId } = await seeded();
     const current = await store.loadWorkspace(OWNER, caseId);
@@ -878,6 +897,226 @@ describe('LocalRepository', () => {
     const repo = new LocalRepository(store);
     await store.setMany([[`detact:v1:${OWNER}:cases`, JSON.stringify([{ id: 'case_bad' }])]]);
     expect(await repo.listCases(OWNER)).toEqual([]);
+  });
+
+  /**
+   * The shard boundary.
+   *
+   * The case index has always been validated on the way in; the per-case shard was not, and
+   * the keys are versioned `v1` with no migration behind them — so a row written by any
+   * build the phone has ever run comes back exactly as it was written. These read a shard
+   * the adapter never wrote, which is the only way to stand in for an older build.
+   */
+  describe('a shard holding records an older build wrote', () => {
+    const INDEX_KEY = `detact:v1:${OWNER}:cases`;
+    const SHARD_KEY = `detact:v1:${OWNER}:case:${CASE_ID}`;
+
+    const storeHolding = (shard: Record<string, unknown>) =>
+      createMemoryStore({
+        [INDEX_KEY]: JSON.stringify([testCase()]),
+        [SHARD_KEY]: JSON.stringify(shard),
+      });
+
+    let warnings: string[] = [];
+
+    beforeEach(() => {
+      warnings = [];
+      vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.map(String).join(' '));
+      });
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('drops the rows that no longer parse and keeps their valid siblings', async () => {
+      const good = claim('Still readable', { id: 'clm_good' });
+      const edge = link(ref.evidence('evd_1'), ref.claim('clm_good'), 'SUPPORTS', { id: 'rel_good' });
+      const repo = new LocalRepository(
+        storeHolding({
+          // `PROBABLY_TRUE` and `REFUTES` are not members of their enums. They are the
+          // shape this actually takes in practice: a renamed member, still stored.
+          claims: [good, { ...good, id: 'clm_stale', state: 'PROBABLY_TRUE' }],
+          relationships: [edge, { ...edge, id: 'rel_stale', type: 'REFUTES' }],
+        }),
+      );
+
+      const loaded = await repo.loadWorkspace(OWNER, CASE_ID);
+      expect(loaded.claims.map((item) => item.id)).toEqual(['clm_good']);
+      expect(loaded.relationships.map((item) => item.id)).toEqual(['rel_good']);
+      // And the case still opens. A boundary that failed the whole shard would leave the
+      // user no screen from which to reach any of it.
+      expect(loaded.cases[0]?.id).toBe(CASE_ID);
+    });
+
+    it('reports the skip by collection and count, naming no record and no owner', async () => {
+      const good = claim('Still readable', { id: 'clm_good' });
+      const repo = new LocalRepository(
+        storeHolding({
+          claims: [good, { ...good, id: 'clm_stale', state: 'PROBABLY_TRUE' }],
+        }),
+      );
+
+      await repo.loadWorkspace(OWNER, CASE_ID);
+      expect(warnings.some((line) => line.includes('claims'))).toBe(true);
+      // The tally is the part worth acting on: one stale row and a shard full of them read
+      // the same in a log otherwise.
+      expect(warnings.some((line) => line.includes('1 unreadable record'))).toBe(true);
+      // `Skipped` is shared with the two remote adapters, and the prefix is the one thing that
+      // must not be shared with them: a row this phone lost and a row a server returned
+      // unreadable send a developer to different files. Pinned because a shared class is
+      // exactly where that gets flattened into one voice.
+      expect(warnings.every((line) => line.startsWith('[local]'))).toBe(true);
+      const logged = warnings.join('\n');
+      expect(logged).not.toContain('clm_stale');
+      expect(logged).not.toContain(OWNER);
+    });
+
+    it('returns a shard whose every row is valid exactly as it was stored', async () => {
+      const note = evidence('Invoice No: INV-2024-018', { id: 'evd_note' });
+      const target = claim('The balance is outstanding', { id: 'clm_target' });
+      const edge = link(ref.evidence('evd_note'), ref.claim('clm_target'), 'SUPPORTS', { id: 'rel_edge' });
+      const repo = new LocalRepository(
+        storeHolding({ evidence: [note], claims: [target], relationships: [edge] }),
+      );
+
+      const loaded = await repo.loadWorkspace(OWNER, CASE_ID);
+      // Compared against the JSON round trip, which is what "unchanged" means for a store
+      // that holds text: the parse must not be quietly rewriting anything on the way back.
+      expect(loaded.evidence).toEqual(JSON.parse(JSON.stringify([note])));
+      expect(loaded.claims).toEqual(JSON.parse(JSON.stringify([target])));
+      expect(loaded.relationships).toEqual(JSON.parse(JSON.stringify([edge])));
+      expect(warnings).toEqual([]);
+    });
+
+    it('skips a collection that is not a list instead of throwing while reading it', async () => {
+      // Drift is not only per row: a slot that was once keyed by id would make the parse
+      // loop itself the thing that makes the case unopenable.
+      const repo = new LocalRepository(storeHolding({ claims: { clm_a: claim('Keyed by id') } }));
+      const loaded = await repo.loadWorkspace(OWNER, CASE_ID);
+      expect(loaded.claims).toEqual([]);
+      expect(loaded.cases[0]?.id).toBe(CASE_ID);
+    });
+
+    it('says nothing about a collection an older build had not invented yet', async () => {
+      // An absent slot is not a skipped record. Warning on one would put a line in the log
+      // for every case written before `seals` existed.
+      const repo = new LocalRepository(storeHolding({ claims: [claim('Fine', { id: 'clm_ok' })] }));
+      const loaded = await repo.loadWorkspace(OWNER, CASE_ID);
+      expect(loaded.seals).toEqual([]);
+      expect(loaded.claims).toHaveLength(1);
+      expect(warnings).toEqual([]);
+    });
+  });
+
+  /**
+   * The other half of the same boundary: the case index.
+   *
+   * The index has always dropped a row that will not parse, so the drift itself was handled —
+   * but on terms the shard above no longer shares. Two gaps, and neither is cosmetic.
+   *
+   * It dropped the row in silence. A case disappearing from the list is the most alarming thing
+   * this app can do to a user, and there was no line anywhere saying it had happened, let alone
+   * how many times. The tally is the number worth acting on for exactly the reason it is on the
+   * shard: one stale case and an index full of them read identically otherwise.
+   *
+   * And it trusted the slot to be a list. `parseJson` types the index as `unknown[]` without
+   * checking, so an index a build wrote as an object keyed by id reached `.flatMap` and threw a
+   * `TypeError` out of `listCases` — which is worse than the shard equivalent, not better: a
+   * shard that will not read costs one case, while the index backs the screen the app opens on,
+   * so the whole account reads as empty and every case in it is unreachable.
+   */
+  describe('a case index holding rows an older build wrote', () => {
+    const INDEX_KEY = `detact:v1:${OWNER}:cases`;
+
+    /** The index is written as a bare array of cases, so a raw value stands in for any build. */
+    const repoHolding = (index: unknown) =>
+      new LocalRepository(createMemoryStore({ [INDEX_KEY]: JSON.stringify(index) }));
+
+    /** `IN_PROGRESS` is not a member of `CaseStatusEnum`; `IN_REVIEW` is what it was renamed to. */
+    const staleCase = () => ({
+      ...testCase(),
+      id: 'case_stale',
+      title: 'Deposit withheld after the tenancy ended',
+      status: 'IN_PROGRESS',
+    });
+
+    let warnings: string[] = [];
+
+    beforeEach(() => {
+      warnings = [];
+      vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.map(String).join(' '));
+      });
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('reports the dropped case by collection and count, naming no record and no owner', async () => {
+      const stale = staleCase();
+      const repo = repoHolding([testCase(), stale]);
+
+      expect((await repo.listCases(OWNER)).map((item) => item.id)).toEqual([CASE_ID]);
+      expect(warnings.some((line) => line.includes('cases'))).toBe(true);
+      expect(warnings.some((line) => line.includes('1 unreadable record'))).toBe(true);
+      // Named apart from the shard's tally, which says "a case". `loadWorkspace` reads the
+      // index and a shard in one call, so a log that gave both the same scope could not say
+      // which of the two is losing rows — and they fail for different reasons.
+      expect(warnings.some((line) => line.includes('read the case list with'))).toBe(true);
+      // The same rule the shard and both other adapters hold to. This is an evidence app: a
+      // log line that carried the row would carry the title of a case a user is in a dispute
+      // over, and the storage key it came from already carries the owner id.
+      const logged = warnings.join('\n');
+      expect(logged).not.toContain('case_stale');
+      expect(logged).not.toContain(stale.title);
+      expect(logged).not.toContain(OWNER);
+    });
+
+    it('still lists the readable cases of an index a build wrote as an object', async () => {
+      const repo = repoHolding({ [CASE_ID]: testCase() });
+
+      // Nothing is recoverable from a slot that is not a list, but the read has to answer
+      // rather than reject: `listCases` rejecting is a case list that shows an error where
+      // the user's cases were, and no screen from which to reach any of them.
+      expect(await repo.listCases(OWNER)).toEqual([]);
+      expect(warnings.some((line) => line.includes('cases'))).toBe(true);
+    });
+
+    it('opens a case whose shard is intact even when the index around it drifted', async () => {
+      // The two reads are independent and `loadWorkspace` awaits both. A drifted index row
+      // must not cost the case whose row still parses, and must not cost the shard either.
+      const repo = new LocalRepository(
+        createMemoryStore({
+          [INDEX_KEY]: JSON.stringify([testCase(), staleCase()]),
+          [`detact:v1:${OWNER}:case:${CASE_ID}`]: JSON.stringify({
+            claims: [claim('Still readable', { id: 'clm_good' })],
+          }),
+        }),
+      );
+
+      const loaded = await repo.loadWorkspace(OWNER, CASE_ID);
+      expect(loaded.cases.map((item) => item.id)).toEqual([CASE_ID]);
+      expect(loaded.claims.map((item) => item.id)).toEqual(['clm_good']);
+    });
+
+    it('says nothing about an index whose every row still parses', async () => {
+      const repo = repoHolding([testCase()]);
+
+      expect((await repo.listCases(OWNER)).map((item) => item.id)).toEqual([CASE_ID]);
+      expect(warnings).toEqual([]);
+    });
+
+    it('says nothing about a user who has no index yet', async () => {
+      // An absent key is a new account, not a skipped record — the same distinction the shard
+      // draws for a collection an older build had not invented.
+      const repo = new LocalRepository(createMemoryStore());
+
+      expect(await repo.listCases(OWNER)).toEqual([]);
+      expect(warnings).toEqual([]);
+    });
   });
 
   it('clears everything belonging to one user and nobody else', async () => {

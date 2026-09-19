@@ -194,8 +194,22 @@ export function AssessmentPlate({
       */}
       <View style={{ gap: theme.spacing.lg }}>
         <Row gap="lg" align="flex-start">
-          {/* The user's own sentence. Sans, and not emphasised — see the file header. */}
-          <Text variant="subheading" style={styles.flex}>
+          {/*
+            The user's own sentence. Sans, and not emphasised — see the file header.
+
+            Three lines, because `claimSchema` accepts two thousand characters and people use
+            them: a claim written as a paragraph set the plate forty lines tall, pushed its own
+            assessment off the bottom of the screen, and turned a list of claims into a list of
+            essays with no way to see the second one. Three lines is where the codebase already
+            clamps a body of user text (`finding-card`), and it holds enough of any sentence to
+            recognise which claim this is, which is all this element has to do — the statement
+            is rendered whole, unclamped, on the claim screen this plate opens.
+
+            The clamp is safe only because `accessibilityLabel` above is written out rather than
+            inferred from the children: a screen reader gets the entire statement and the status
+            word, not the three lines that happened to fit.
+          */}
+          <Text variant="subheading" numberOfLines={3} style={styles.flex}>
             {claim.statement}
           </Text>
           <View style={styles.chevron}>

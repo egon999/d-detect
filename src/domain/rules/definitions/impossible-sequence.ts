@@ -151,11 +151,12 @@ export const impossibleSequenceRule: Rule = {
             key: ['paid-before-issued', group.field, group.value],
             title: `Payment against ${group.value} is dated before the invoice`,
             explanation:
-              `"${label(paid.item)}" records payment on ${formatDate(paid.date)}, which is ` +
-              `${early} days before "${label(issued.item)}" was issued on ` +
-              `${formatDate(issued.date)}. Both reference ${group.value}. An advance or retainer ` +
-              `paid before invoicing explains this completely; so does a mistyped year on either ` +
-              `document. Open both and confirm which date is right.`,
+              `"${label(paid.item)}" records payment on ${formatDate(paid.date)}, ${early} days ` +
+              `before "${label(issued.item)}" was issued on ${formatDate(issued.date)}. Both ` +
+              `reference ${group.value}.`,
+            caveat:
+              `An advance or a retainer paid before invoicing explains this completely, and so ` +
+              `does a mistyped year on either document. Open both and confirm which date is right.`,
             confidence: 'NEEDS_REVIEW',
             supportingEvidenceIds: [issued.item.id, paid.item.id].sort(),
             inputs: {
@@ -183,8 +184,10 @@ export const impossibleSequenceRule: Rule = {
             explanation:
               `"${label(delivered.item)}" records delivery on ${formatDate(delivered.date)}, ` +
               `${gap} days after "${label(paid.item)}" records payment on ` +
-              `${formatDate(paid.date)}. Paying before delivery is a normal arrangement, so this ` +
-              `is only worth checking if the agreement was payment on receipt.`,
+              `${formatDate(paid.date)}.`,
+            caveat:
+              'Paying before delivery is a normal arrangement, so this is only worth checking ' +
+              'if the agreement was payment on receipt.',
             severity: 'MEDIUM',
             confidence: 'NEEDS_REVIEW',
             supportingEvidenceIds: [paid.item.id, delivered.item.id].sort(),
@@ -211,9 +214,12 @@ export const impossibleSequenceRule: Rule = {
             key: ['due-before-issued', group.field, group.value],
             title: `Due date on ${group.value} precedes the invoice date`,
             explanation:
-              `"${label(due.item)}" gives a due date of ${formatDate(due.date)}, which is ` +
-              `before the invoice date of ${formatDate(issued.date)}. A payment term cannot expire ` +
-              `before the invoice exists, so one of these two dates is likely to be wrong.`,
+              `"${label(due.item)}" gives a due date of ${formatDate(due.date)}, before the ` +
+              `invoice date of ${formatDate(issued.date)}.`,
+            caveat:
+              'A payment term cannot expire before the invoice exists, so one of these two ' +
+              'dates is likely to be wrong — most often a typed year, or a template default ' +
+              'nobody changed.',
             severity: 'MEDIUM',
             confidence: 'NEEDS_REVIEW',
             supportingEvidenceIds: [...new Set([issued.item.id, due.item.id])].sort(),
@@ -249,9 +255,10 @@ export const impossibleSequenceRule: Rule = {
             explanation:
               `"${label(billed.item)}" bills ${formatAmount(billed.amount)} against ` +
               `${group.value}, and "${label(settled.item)}" records a payment of ` +
-              `${formatAmount(settled.amount)} — ${formatAmount(gap)} less. A deduction, a ` +
-              `withheld tax, a platform fee or a part payment all produce this. It is recorded ` +
-              `here so the shortfall is visible rather than assumed to be settled.`,
+              `${formatAmount(settled.amount)} — ${formatAmount(gap)} less.`,
+            caveat:
+              'A deduction, a withheld tax, a platform fee or a part payment all produce this. ' +
+              'It is recorded so the shortfall is visible rather than assumed to be settled.',
             confidence: 'NEEDS_REVIEW',
             supportingEvidenceIds: [...new Set([billed.item.id, settled.item.id])].sort(),
             inputs: {

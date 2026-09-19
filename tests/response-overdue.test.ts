@@ -81,8 +81,10 @@ describe('response-overdue, end to end', () => {
 });
 
 describe('what the finding is allowed to say', () => {
-  const explanationFor = (now = JUNE_1): string =>
-    overdueFindings([evidence(BANK_COMPLAINT, { title: 'Complaint to bank' })], now)[0]!.explanation;
+  const explanationFor = (now = JUNE_1): string => {
+    const finding = overdueFindings([evidence(BANK_COMPLAINT, { title: 'Complaint to bank' })], now)[0]!;
+    return `${finding.explanation} ${finding.caveat ?? ''}`;
+  };
 
   it('names the scheme it is quoting, never the window on its own authority', () => {
     const explanation = explanationFor();
@@ -201,7 +203,7 @@ describe('when the date itself was read off a scan', () => {
     // and an OCR misread of the start date moves the answer without contradicting anything.
     const finding = overdueFindings(scanned(), JUNE_1)[0]!;
 
-    expect(finding.explanation).toMatch(/read from an image/i);
+    expect(finding.caveat ?? finding.explanation).toMatch(/read from an image/i);
     expect(finding.inputs['Where the date came from']).toBe('Read from an image — unconfirmed');
   });
 

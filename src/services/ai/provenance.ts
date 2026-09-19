@@ -50,7 +50,7 @@
 
 import { EXTRACTOR_VERSION } from '@domain/extraction/deterministic';
 import type { MatchConfidence } from '@domain/enums';
-import { newId } from '@domain/ids';
+import { deterministicId, newId } from '@domain/ids';
 import type {
   AIExtractionSuggestion,
   AmountField,
@@ -287,6 +287,19 @@ export interface SuggestionRecordInput {
   sourceEvidenceIds?: string[];
   /** The model's own confidence where it reported one, clamped to 0..1. Omit if it did not. */
   confidence?: number;
+  /**
+   * What this suggestion *is about*, as a stable set of parts. Present means the record's id
+   * is derived from it rather than minted at random, so a second run that reaches the same
+   * proposal writes the same row instead of adding another one.
+   *
+   * Deliberately excludes `model`, `promptVersion` and every word of the summary. A proposal
+   * to connect a particular receipt to a particular claim is the same proposal whether it was
+   * phrased by one model or another, and keying on the speaker would mean switching providers
+   * silently duplicated every suggestion in the case.
+   *
+   * Omit it where a record genuinely has no identity beyond the moment it was written.
+   */
+  identity?: readonly string[];
   now?: number;
 }
 
@@ -339,7 +352,7 @@ export function aiSuggestionRecord(input: SuggestionRecordInput): AIExtractionSu
       : null;
 
   return {
-    id: newId('sug'),
+    id: input.identity ? deterministicId('sug', ...input.identity) : newId('sug'),
     ownerId: input.ownerId,
     caseId: input.caseId,
     createdAt: now,
@@ -355,6 +368,28 @@ export function aiSuggestionRecord(input: SuggestionRecordInput): AIExtractionSu
     sourceEvidenceIds: input.sourceEvidenceIds ?? [],
     reviewedAt: null,
   };
+}
+
+/**
+ * The ids of suggestions a person has already accepted or rejected.
+ *
+ * Every regeneration pass now builds its records with deterministic ids (see `identity` on
+ * `SuggestionRecordInput`), so a re-run reaches the same id for the same proposal instead of
+ * minting a new one — which is what stops the collection growing without bound on every
+ * analysis. But a plain `put` of that id would overwrite whatever is there, and a proposal
+ * the user already decided on is exactly what must not be overwritten: reopening an
+ * `ACCEPTED` record loses the acceptance, and reopening a `REJECTED` one puts a suggestion
+ * the person dismissed back in front of them, at the top of the list, after every single run.
+ *
+ * A caller that regenerates suggestions filters its `put`s through this set, so a decided
+ * proposal is left exactly as the person left it and only the still-open ones are refreshed.
+ * `SUGGESTED` is deliberately not in the set: an open proposal is not a decision, and letting
+ * a re-run replace it with the current reading is the point.
+ */
+export function decidedSuggestionIds(
+  existing: readonly Pick<AIExtractionSuggestion, 'id' | 'status'>[],
+): ReadonlySet<string> {
+  return new Set(existing.filter((item) => item.status !== 'SUGGESTED').map((item) => item.id));
 }
 
 // ---------------------------------------------------------------------------

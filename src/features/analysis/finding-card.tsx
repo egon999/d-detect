@@ -182,15 +182,33 @@ export function FindingCard({
           {finding.title}
         </Text>
 
-        <Text
-          variant="bodySmall"
-          colorToken="textSecondary"
-          style={{ marginTop: theme.spacing.sm }}
-          numberOfLines={expanded ? undefined : 3}
-        >
+        {/*
+          Not clipped, and that is the change this card was waiting for.
+
+          This used to be `numberOfLines={expanded ? undefined : 3}` over an explanation that
+          ran 200–730 characters, because the rules wrote the observation, the hedge and the
+          suggested next step into one paragraph. Three lines is about 150 characters, so on
+          the most-read screen in the product the app's reasoning reached the reader cut off
+          mid-sentence — and the part it cut was reliably the hedge, the one part that tells
+          someone not to trust the finding.
+
+          `explanation` is now the observation alone and is held to a budget by
+          `tests/rule-copy.test.ts`. That is what makes showing it in full safe. The hedge
+          moved to `caveat` below, where it gets a control of its own. See
+          `docs/copy-doctrine.md`.
+        */}
+        <Text variant="bodySmall" colorToken="textSecondary" style={{ marginTop: theme.spacing.sm }}>
           {finding.explanation}
         </Text>
       </Pressable>
+
+      {/*
+        Only where the prompt is not already carrying it. A provisional finding renders
+        `ProvisionalPrompt` immediately below, which states the same doubt in its own words
+        beside the one tap that resolves it — showing both would put the warning on the card
+        twice, which is exactly what the old concatenated explanation did.
+      */}
+      {finding.caveat && !finding.provisional ? <Caveat text={finding.caveat} /> : null}
 
       {finding.provisional ? (
         <ProvisionalPrompt
@@ -278,6 +296,62 @@ export function FindingCard({
         <ReviewRow finding={finding} onReview={onReview} />
       ) : null}
     </Surface>
+  );
+}
+
+/**
+ * The caveat, behind a control.
+ *
+ * ## Why this is a disclosure and not just more body text
+ *
+ * Every hedge in this product used to be sentences three and four of the finding's
+ * explanation, in the same grey at the same size as the observation, inside a block the card
+ * clipped at three lines. So the doubt was both the least visible thing on the card and the
+ * first thing truncation removed. A reader skimming eight findings saw eight confident-looking
+ * statements and none of the reasons not to believe them.
+ *
+ * Collapsing it looks like demoting it and is the opposite. A named control a reader can find
+ * and open — with a count of nothing, no badge, no colour competing with the severity rule — is
+ * more reachable than a sentence that was never on screen. The label asks the question the
+ * reader has, so opening it is a decision rather than a guess.
+ *
+ * It is not tone-coloured. A hedge tinted amber would read as a second severity, and the card
+ * already has one signal for "how much should this worry you"; a second one saying something
+ * different is how a card stops being scannable.
+ */
+function Caveat({ text }: { text: string }) {
+  const theme = useTheme();
+  const [open, setOpen] = useState(false);
+
+  return (
+    <View style={{ marginTop: theme.spacing.md }}>
+      <Pressable
+        onPress={() => setOpen((value) => !value)}
+        pressScale={1}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        accessibilityHint="Explains what this finding assumes and why the reading could be wrong."
+        style={styles.showAll}
+      >
+        <Row gap="xs" align="center">
+          <Icon name="help-circle-outline" size={14} color={theme.colors.textTertiary} />
+          <Text variant="caption" colorToken="textTertiary">
+            Why this might be wrong
+          </Text>
+          <Icon
+            name={open ? 'chevron-up' : 'chevron-down'}
+            size={14}
+            color={theme.colors.textTertiary}
+          />
+        </Row>
+      </Pressable>
+
+      {open ? (
+        <Text variant="bodySmall" colorToken="textSecondary" style={{ marginTop: theme.spacing.xs }}>
+          {text}
+        </Text>
+      ) : null}
+    </View>
   );
 }
 
@@ -422,10 +496,24 @@ export function ProvisionalPrompt({
     >
       <Row gap="sm" align="flex-start">
         <Icon name={PROVISIONAL_FINDING.icon} size={16} color={palette.fg} />
+        {/*
+          The finding's own caveat, not a second wording of it.
+
+          These two strings used to be written independently and shown together: the quarantine
+          glued a sentence naming the unconfirmed reads onto `explanation`, and this box stated
+          the same warning in different words directly underneath. A reader met the doubt twice
+          on one card, once truncated. The caveat is now a field, so the box says whatever the
+          finding actually carries — including anything the *rule* knew about its own weakness,
+          which this hard-coded line could never say.
+
+          The fallbacks remain for a finding stored before `caveat` existed, and for the AI
+          layer, which can mark a finding provisional without producing one.
+        */}
         <Text variant="bodySmall" colorToken="textSecondary" style={styles.flex}>
-          {reads.length > 0
-            ? 'One of the values compared here was read from an image, and nobody has checked it yet. Characters can be misread, so this is shown as a question rather than a conclusion.'
-            : 'This rests on a reading nobody has checked yet, so it is shown as a question rather than a conclusion.'}
+          {finding.caveat ||
+            (reads.length > 0
+              ? 'One of the values compared here was read from an image, and nobody has checked it yet. Characters can be misread, so this is shown as a question rather than a conclusion.'
+              : 'This rests on a reading nobody has checked yet, so it is shown as a question rather than a conclusion.')}
         </Text>
       </Row>
 

@@ -1,5 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 /**
  * Domain logic is deliberately free of React Native and Firebase imports, so the
@@ -30,6 +30,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts'],
+    exclude: [...configDefaults.exclude, 'tests/scratch-probe.test.ts', 'tests/**/*.scratch.test.ts'],
     globals: false,
     maxWorkers: 4,
     testTimeout: 10000,

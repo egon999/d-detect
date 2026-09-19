@@ -65,7 +65,8 @@ import type { ExtractedTextMethod } from '@domain/extraction/deterministic';
 import type { IngestResult } from '@services/ingestion/types';
 import type { PrivateEvidenceFile } from '../storage/evidence-storage';
 import type { ChatProvider } from './groq-client';
-import type { AIResult } from './groq-client';
+import type { AIFailureReason, AIResult } from './groq-client';
+import { clearAiRunFailure, recordAiRunFailure } from './run-outcome';
 import type { CitationAudit } from './semantic-assistant';
 import type { Change, Repository } from '@data/repository';
 import type {
@@ -260,8 +261,68 @@ function safeFailureMessage(error: unknown): string {
  */
 const MAX_AI_RELATIONSHIP_DOCUMENTS = 8;
 
-/** Most documents the dispute-synthesis payload carries. One request per analysis run. */
+/** Most documents a cross-document payload carries. One request per pass per analysis run. */
 const MAX_AI_SYNTHESIS_DOCUMENTS = 20;
+
+/**
+ * Wall-clock ceiling on one case's suggestion run.
+ *
+ * The passes below are fire-and-forget, and until this existed nothing bounded how long they
+ * could run for. The arithmetic: `requestGroqJson` walks a three-model chain twice per model
+ * and gives each attempt its own 45-second timeout, so a single request can spend about 270
+ * seconds before it concludes that nothing is answering. A full run issues up to
+ * `MAX_AI_RELATIONSHIP_DOCUMENTS` relationship requests and four synthesis requests, in
+ * sequence — close to an hour of a device holding the radio open against a provider that
+ * stopped answering in the first minute, with no handle anywhere in the app to stop it.
+ *
+ * Six minutes, chosen against the healthy case rather than the broken one. A run where every
+ * request is answered on its first attempt costs a few seconds per relationship document and
+ * some tens of seconds per synthesis pass — three minutes for a large case — so this leaves
+ * the working path roughly double the room it needs while cutting the pathological path by an
+ * order of magnitude.
+ *
+ * Reaching it does not discard work. The deadline arrives as a cancelled request, `filePass`
+ * reads that the way it reads any other dead radio, and everything filed up to that point is
+ * committed on the way out. A case that ran out of budget has fewer suggestions than it might
+ * have had; it does not have none.
+ */
+export const CASE_AI_BUDGET_MS = 6 * 60_000;
+
+/**
+ * What a user is told when the deadline above is what stopped their run.
+ *
+ * Written here rather than taken from the transport, because the transport cannot tell the
+ * budget apart from a user walking away and says *"Cancelled."* for both. A reading that
+ * came back short for a reason of the app's own making says so, and says what it means for
+ * the suggestions underneath it.
+ */
+const RAN_OUT_OF_TIME =
+  'The reading had not finished when its time ran out, so it covers fewer documents than it would have. Run it again to continue further.';
+
+/**
+ * The controller for each case's in-flight suggestion run.
+ *
+ * Keyed by case rather than held per call because whatever wants to stop a run is never the
+ * caller that started one: `requestCaseAnalysis` fires this with `void` and returns, so the
+ * promise is unreachable by the time a user has walked away from the screen. The case id is
+ * the one handle both sides have.
+ *
+ * Superseding rather than racing is a fix as much as a precaution. Two runs on one case both
+ * reach the commit at the end and each files its own suggestion records, so tapping analyse
+ * twice used to fill the panel with every finding in it twice.
+ */
+const inFlightSuggestions = new Map<string, AbortController>();
+
+/**
+ * Stops the suggestion run for a case, if one is going.
+ *
+ * Does nothing for a case with no run, which is the ordinary state and the reason it reports
+ * nothing back: a caller on an unmount path should not have to know whether there was
+ * anything to stop before it is allowed to ask.
+ */
+export function cancelCaseAiSuggestions(caseId: string): void {
+  inFlightSuggestions.get(caseId)?.abort();
+}
 
 /**
  * The provider the AI passes send to, or `null` when AI is off.
@@ -399,7 +460,66 @@ async function runEvidenceAiSuggestions(context: ProcessingContext, evidence: Ev
  * which to assert, so the four passes below were never covered by anything. Awaiting the
  * function directly is the honest way to test it; racing the floating promise is not.
  */
-export async function runCaseAiSuggestions(context: ProcessingContext, caseId: string): Promise<void> {
+export async function runCaseAiSuggestions(
+  context: ProcessingContext,
+  caseId: string,
+  options?: {
+    /** Caller cancellation, combined with the budget below rather than replacing it. */
+    signal?: AbortSignal;
+    /** Overrides `CASE_AI_BUDGET_MS`. Tests set it low; nothing in the app passes it. */
+    budgetMs?: number;
+  },
+): Promise<void> {
+  // Supersede whatever was already running for this case. See `inFlightSuggestions`.
+  inFlightSuggestions.get(caseId)?.abort();
+  const controller = new AbortController();
+  inFlightSuggestions.set(caseId, controller);
+
+  // A new attempt invalidates the last one's ending before this one's is known, rather than
+  // after it succeeds: an old failure left standing over a run in flight is the same false
+  // statement `./run-outcome` exists to remove, only pointing the other way.
+  clearAiRunFailure(caseId);
+
+  /**
+   * Set by the deadline and read by `noteStop`, because an abort is the one thing the
+   * transport cannot describe.
+   *
+   * `groq-client` reports every aborted signal as a `network` failure whose message reads
+   * *"Cancelled."* — so without this flag the run that ran out of time and the run the user
+   * abandoned are the same event, and this file would have to either report both or neither.
+   */
+  let budgetExpired = false;
+  const deadline = setTimeout(() => {
+    budgetExpired = true;
+    controller.abort();
+  }, options?.budgetMs ?? CASE_AI_BUDGET_MS);
+  const onCallerAbort = () => controller.abort();
+  options?.signal?.addEventListener('abort', onCallerAbort);
+  // Every model call below reads this one signal, so the three reasons a run can end — the
+  // budget, the caller, a newer run for the same case — are indistinguishable downstream.
+  // They should be: each of them means the same thing to a request in flight.
+  const { signal } = controller;
+
+  /**
+   * Files the reason a run is stopping, when there is still anyone to tell.
+   *
+   * Two guards, and each closes a way this could lie. The first is `isCurrentRun`: a
+   * superseded run outlives the run that replaced it — its request only rejects once the
+   * abort lands — and without the check it would write its own ending over a live attempt's.
+   * The second is the abort: a caller who left the screen made a decision, not a fault, and
+   * a notice about it would be raised on a screen nobody is on. A budget that expired is
+   * reported, and is the reason the two are told apart at all.
+   */
+  const noteStop = (reason: AIFailureReason, message: string): void => {
+    if (inFlightSuggestions.get(caseId) !== controller) return;
+    if (signal.aborted && !budgetExpired) return;
+    recordAiRunFailure(
+      caseId,
+      budgetExpired ? 'timed-out' : reason,
+      budgetExpired ? RAN_OUT_OF_TIME : message,
+    );
+  };
+
   try {
     const provider = await preferredChatProvider();
 
@@ -430,7 +550,7 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
       buildDeterministicReconciliation,
       buildDeterministicTimelineCoherence,
     } = await import('./semantic-assistant');
-    const { aiSuggestionRecord, ON_DEVICE_ENGINE, ON_DEVICE_ENGINE_VERSION } = await import('./provenance');
+    const { aiSuggestionRecord, decidedSuggestionIds, ON_DEVICE_ENGINE, ON_DEVICE_ENGINE_VERSION } = await import('./provenance');
     const changes: Change[] = [];
 
     const claimStatements = new Map(claims.map((claim) => [claim.id, claim.statement]));
@@ -450,13 +570,14 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
       // Unreachable — the list above is empty without a provider — but it is what narrows
       // `provider` to non-null for the call below, and it costs one comparison per document.
       if (!provider) break;
-      const result = await suggestCaseRelationshipsWithAI(item, claims, events, { provider });
+      const result = await suggestCaseRelationshipsWithAI(item, claims, events, { provider, signal });
       if (!result.ok) {
         // A failure about the account or the connection will not heal between documents;
         // stop rather than spend the user's quota hammering a dead radio. A
         // document-scoped failure (a reply that failed its schema) says nothing about
         // the next document, so the pass continues.
         if (result.reason === 'unavailable' || result.reason === 'rate_limited' || result.reason === 'network') {
+          noteStop(result.reason, result.error);
           break;
         }
         continue;
@@ -489,6 +610,16 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
               payload: { ...suggestion },
               sourceEvidenceIds: [item.id],
               confidence: suggestion.confidence,
+              // The proposal, not the wording of it: this document, that claim or event,
+              // that relationship type. A second run proposing the same connection writes
+              // the same row rather than a second copy of it.
+              identity: [
+                caseId,
+                item.id,
+                suggestion.targetKind,
+                suggestion.targetId,
+                suggestion.relationshipType,
+              ],
               now: Date.now(),
             }),
           ),
@@ -518,9 +649,11 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
     ): Promise<'continue' | 'stop'> => {
       const result = await run();
       if (!result.ok) {
-        return result.reason === 'unavailable' || result.reason === 'rate_limited' || result.reason === 'network'
-          ? 'stop'
-          : 'continue';
+        if (result.reason === 'unavailable' || result.reason === 'rate_limited' || result.reason === 'network') {
+          noteStop(result.reason, result.error);
+          return 'stop';
+        }
+        return 'continue';
       }
 
       const described = describe(result.data);
@@ -541,6 +674,15 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
             summary: described.summary.slice(0, 600),
             payload: described.payload,
             sourceEvidenceIds: corpus.map((item) => item.id),
+            // One answer per question per case. "Where do these documents disagree" has a
+            // single current answer, and a re-run after the user fixes a misread should
+            // replace it rather than stack a second reconciliation above the first.
+            //
+            // The corpus is deliberately not part of the key. Adding a document changes what
+            // the answer says, not which question it answers, and keying on the document set
+            // would leave the pre-upload answer behind as a second card that still claims to
+            // describe the case.
+            identity: [caseId, kind],
             now: Date.now(),
           }),
         ),
@@ -585,37 +727,82 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
       'CROSS_DOCUMENT_RECONCILIATION',
       () =>
         provider
-          ? reconcileDocumentsWithAI(corpus, { provider })
+          ? reconcileDocumentsWithAI(corpus, { provider, signal })
           : Promise.resolve(onDevice(buildDeterministicReconciliation(corpus))),
       (data) => {
         if (data.facts.length === 0 && data.unreconciled.length === 0) return null;
-        const disagreements = data.unreconciled.length;
-        return {
-          summary:
-            (disagreements > 0
-              ? `${disagreements} value${disagreements === 1 ? '' : 's'} ${disagreements === 1 ? 'does' : 'do'} not ` +
-                `match across your documents, with each reading quoted from its own source.`
-              : `Cross-checked ${data.facts.length} value${data.facts.length === 1 ? '' : 's'} across ` +
-                `${corpus.length} documents; the readings agree.`) + dropped(data.audit),
-          payload: { ...data },
-        };
+
+        /*
+          The disagreement lives in `facts`, never in `unreconciled`.
+
+          This line read `const disagreements = data.unreconciled.length`, and that field is
+          the opposite of a disagreement under both producers: the prompt defines it as
+          "something this document records that no other document touches at all", and
+          `buildDeterministicReconciliation` fills it with documents that carry no amount,
+          date or reference to compare. So the one sentence a user ever reads about their
+          documents conflicting was wrong in both directions — an unreadable photograph was
+          announced as "1 value does not match", and a case where every fact came back
+          `DISAGREE` fell through to "the readings agree", which is this product reporting
+          the conflict it exists to find as its absence.
+
+          `NOTATION_ONLY` is deliberately not counted: "₹1,50,000" against "1.5 lakh" is the
+          same value written twice, and the prompt requires it to be reported instead of a
+          disagreement.
+        */
+        const disagreeing = data.facts.filter(
+          (fact) => fact.agreement === 'DISAGREE' || fact.agreement === 'PARTIAL',
+        );
+        const corroborated = data.facts.filter((fact) => fact.agreement === 'ALL_AGREE');
+
+        /*
+          Said separately, and never as agreement. A fact only one document records is
+          `SINGLE_SOURCE`, and counting it under "the readings agree" is the false
+          corroboration `reconcileDocumentsWithAI` collapses a fact to avoid — undone here
+          if this sentence claimed a cross-check that never happened.
+        */
+        const unmatched = data.unreconciled.length;
+        const alone =
+          unmatched > 0
+            ? ` ${unmatched} further observation${unmatched === 1 ? '' : 's'} could not be matched ` +
+              `to anything in the other documents.`
+            : '';
+
+        const headline =
+          disagreeing.length > 0
+            ? `${disagreeing.length} value${disagreeing.length === 1 ? '' : 's'} ` +
+              `${disagreeing.length === 1 ? 'does' : 'do'} not match across your documents, with each ` +
+              `reading quoted from its own source.`
+            : corroborated.length > 0
+              ? `Cross-checked ${corroborated.length} value${corroborated.length === 1 ? '' : 's'} across ` +
+                `${corpus.length} documents; the readings agree.`
+              : `Nothing in these ${corpus.length} documents could be checked against another document: ` +
+                `${data.facts.length} value${data.facts.length === 1 ? ' is' : 's are'} recorded, each by ` +
+                `one source only.`;
+
+        return { summary: headline + alone + dropped(data.audit), payload: { ...data } };
       },
     );
 
     if (outcome === 'continue' && claims.length > 0 && provider) {
       outcome = await filePass(
         'SUPPORT_STRENGTH',
-        () => assessSupportStrengthWithAI(claims, corpus, { provider }),
-        (data) =>
-          data.assessments.length === 0
-            ? null
-            : {
-                summary:
-                  `How well the documents carry your ${data.assessments.length} claim` +
-                  `${data.assessments.length === 1 ? '' : 's'}: ${data.overallReason}` +
-                  dropped(data.audit),
-                payload: { ...data },
-              },
+        () => assessSupportStrengthWithAI(claims, corpus, { provider, signal }),
+        (data) => {
+          if (data.assessments.length === 0) return null;
+          const reason = data.overallReason.trim();
+          return {
+            summary:
+              `How well the documents carry your ${data.assessments.length} claim` +
+              `${data.assessments.length === 1 ? '' : 's'}` +
+              // `overallReason` carries `.default('')` in the schema, so a model that omits
+              // the field left this line ending in a bare colon with nothing after it. Saying
+              // that the model said nothing is the same move the panel already makes for one
+              // that reports no confidence.
+              (reason ? `: ${reason}` : '. It returned no overall reason.') +
+              dropped(data.audit),
+            payload: { ...data },
+          };
+        },
       );
     }
 
@@ -624,7 +811,7 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
     if (outcome === 'continue' && claims.length > 0 && provider) {
       outcome = await filePass(
         'MISSING_INFORMATION',
-        () => analyzeMissingInformationWithAI(claims, corpus, { provider }),
+        () => analyzeMissingInformationWithAI(claims, corpus, { provider, signal }),
         (data) =>
           data.gaps.length === 0
             ? null
@@ -647,27 +834,83 @@ export async function runCaseAiSuggestions(context: ProcessingContext, caseId: s
         'TIMELINE_COHERENCE',
         () =>
           provider
-            ? assessTimelineCoherenceWithAI(corpus, events, { provider })
+            ? assessTimelineCoherenceWithAI(corpus, events, { provider, signal })
             : Promise.resolve(onDevice(buildDeterministicTimelineCoherence(corpus))),
-        (data) =>
-          data.sequence.length === 0
-            ? null
-            : {
-                summary:
-                  (data.problems.length > 0
-                    ? `${data.problems.length} problem${data.problems.length === 1 ? '' : 's'} in the order of ` +
-                      `events: ${data.coherenceReason}`
-                    : `Checked ${data.sequence.length} dated fact${data.sequence.length === 1 ? '' : 's'} ` +
-                      `against each other; the sequence holds.`) + dropped(data.audit),
-                payload: { ...data },
-              },
+        (data) => {
+          /*
+            A problem is a finding whether or not anything survived into the sequence.
+
+            The guard was `data.sequence.length === 0`, which threw away the whole pass when
+            the sequence was empty — and the two ways that happens are both cases the reader
+            most needs to hear about. On the device, documents that carry no resolvable date
+            produce `UNDATED_FACT` problems and no sequence at all, so a case whose dates are
+            entirely unreadable was told nothing. Through a model, an `IMPOSSIBLE_ORDER` can
+            outlive the sequence entries when those entries lose their citations, and
+            discarding a verified contradiction because the list it sat above came back empty
+            is exactly the wrong way round.
+          */
+          if (data.sequence.length === 0 && data.problems.length === 0) return null;
+
+          const dated = data.sequence.filter((entry) => entry.dateIso !== null).length;
+          const reason = data.coherenceReason.trim();
+          const headline =
+            data.problems.length > 0
+              ? `${data.problems.length} problem${data.problems.length === 1 ? '' : 's'} in the order of ` +
+                // `coherenceReason` carries `.default('')` like `overallReason` does, so a
+                // model that omits it left this ending in a bare colon. The deterministic
+                // builder always writes one, so this only ever bites on the model path.
+                `events${reason ? `: ${reason}` : '. It did not say which dates.'}`
+              : dated > 0
+                ? `Checked ${dated} dated fact${dated === 1 ? '' : 's'} against each other; the sequence holds.`
+                : // An entry the normalizer refused has no position, so a sequence made only of
+                  // those establishes no order at all. "The sequence holds" over nothing dated
+                  // would be the app reporting a check it never performed.
+                  `No date in these ${corpus.length} documents could be resolved, so the order of ` +
+                  `events could not be checked.`;
+
+          return { summary: headline + dropped(data.audit), payload: { ...data } };
+        },
       );
     }
 
-    if (changes.length > 0) await context.repository.commit(context.ownerId, changes);
-  } catch {
-    // Same rule as the evidence pass: an optional pass fails towards silence, and the
-    // deterministic assessment above is already complete and saved.
+    /*
+      A decision a person already made survives the run that would have undone it.
+
+      Every record above now carries a deterministic id, so a second analysis of the same case
+      reaches the same id for the same proposal instead of minting a new one — which is what
+      stops `aiSuggestions` growing by a full set on every run. The cost of that, unguarded, is
+      that a plain `put` overwrites: a proposal the user accepted comes back as `SUGGESTED`
+      with its acceptance gone, and one they rejected is pushed back to the top of the panel
+      after every single analysis, where the sort puts open proposals first. The user would
+      have to dismiss the same suggestion forever.
+
+      Filtered here rather than at each `put` because the reason is one reason, and because
+      `decidedSuggestionIds` is the same guard `runDirectCaseAnalysis` applies to its own pass.
+    */
+    const decided = decidedSuggestionIds(workspace.aiSuggestions);
+    const writable = changes.filter(
+      (change) =>
+        !(change.op === 'put' && change.collection === 'aiSuggestions' && decided.has(change.record.id)),
+    );
+
+    if (writable.length > 0) await context.repository.commit(context.ownerId, writable);
+  } catch (error) {
+    // The deterministic assessment above is already complete and saved, so this still fails
+    // towards silence in the only sense that matters — nothing that was written is
+    // withdrawn. What it must not do is fail *invisibly*. An unclassified throw here used to
+    // leave the panel showing "Nothing here yet" over a run that had died, with nothing
+    // anywhere saying that it had.
+    //
+    // An abort is excluded. It reaches the passes as a classified network failure, which has
+    // already filed the real reason, and filing it again here as a crash would report a
+    // decision this function made as a defect.
+    if (!signal.aborted) recordAiRunFailure(caseId, 'unexpected', safeFailureMessage(error));
+  } finally {
+    clearTimeout(deadline);
+    options?.signal?.removeEventListener('abort', onCallerAbort);
+    // Only if the entry is still this run's. A newer run has already replaced it, and
+    // deleting it here would leave that one uncancellable for the rest of its life.
+    if (inFlightSuggestions.get(caseId) === controller) inFlightSuggestions.delete(caseId);
   }
 }
 
@@ -1183,10 +1426,9 @@ export async function runDirectCaseAnalysis(
   caseId: string,
 ): Promise<CaseAnalysis> {
   const { put } = await import('@data/repository');
-  const { persistEvidenceExtraction } = await import('@data/mutations');
+  const { persistEvidenceExtraction, runCaseAnalysis } = await import('@data/mutations');
   const { newId } = await import('@domain/ids');
   const { caseAnalysisSchema } = await import('@domain/models');
-  const { runAnalysis } = await import('@domain/rules/engine');
 
   const workspace = await repository.loadWorkspace(ownerId, caseId);
   const caseRecord = workspace.cases.find((c) => c.id === caseId && !c.deletedAt);
@@ -1257,9 +1499,38 @@ export async function runDirectCaseAnalysis(
 
   // `requiredEventIds` is optional on older records and the engine indexes it directly.
   const safeClaims = claims.map((c) => ({ ...c, requiredEventIds: c.requiredEventIds ?? [] }));
-  const ruleRun = runAnalysis({ ...workspace, claims: safeClaims, evidence: readable }, caseId, now);
-  for (const result of ruleRun.results) changes.push(put('analysisResults', result));
-  const findings = ruleRun.results;
+
+  /*
+    Through the mutation, for the same reason the extraction loop above goes through one.
+
+    This used to call `runAnalysis` directly and then `changes.push(put('analysisResults', r))`
+    over `ruleRun.results` alone. `runAnalysis` returns two lists, and the second one —
+    `resolved`, the findings that were open and that no rule produced this time — was never
+    written. So a conflict could be raised but never lowered: a user who corrects the OCR
+    misread behind an amount mismatch, or deletes the document that disagreed, re-runs the
+    analysis and the stored finding keeps `status: 'OPEN'` forever. The freshly built report
+    below says there is no conflict while the `analysisResults` collection the case screen
+    reads still says there is one, and nothing in the app can reconcile them, because the only
+    code that clears a finding is the branch that never ran.
+
+    Two more things came with it, both absent from the hand-rolled version and both written by
+    `runCaseAnalysis`: claim states are re-evaluated against the findings (they were left
+    cached at whatever a previous run decided), and an `ANALYSIS_RUN` audit entry is recorded.
+    That second one matters beyond tidiness — `ANALYSIS_RUN` exists in the enum, the audit
+    screen has an icon for it, and no production path had ever written one, so the audit trail
+    the seal signs was silent about the single most consequential thing the app does.
+
+    `runCaseAnalysis` is handed the same narrowed workspace the engine was given before —
+    only this case's claims, only the sources with text. Its returned `workspace` is
+    discarded: the repository commit below is the write, and that workspace is narrowed.
+  */
+  const analysis = runCaseAnalysis(
+    { ...workspace, claims: safeClaims, evidence: readable },
+    { ownerId, now },
+    caseId,
+  );
+  changes.push(...analysis.changes);
+  const findings = analysis.run.results;
 
   const claimAssessments: ClaimAssessment[] = [];
   for (const claim of claims) {
@@ -1459,9 +1730,27 @@ export async function runDirectCaseAnalysis(
   }
 
   if (claims.length === 0) {
-    const { aiSuggestionRecord } = await import('./provenance');
+    const { aiSuggestionRecord, ON_DEVICE_ENGINE } = await import('./provenance');
     const discovered = discoverCandidateAssertions(readable);
     for (const assertion of discovered.slice(0, 8)) {
+      /*
+        The same three words the live rendering of this pass already uses.
+
+        `discoverCandidateAssertions` reaches the reader twice: once as a `DiscoveredAssertion`
+        rendered directly by `case-analysis-panel`, which labels it "Corroborated across
+        sources" / "Contradicted by status" / "Single source", and once as the stored record
+        written here. The stored copy carried its corroboration nowhere except in a confidence
+        number, so the two renderings of one deterministic fact disagreed about what it was.
+        Reusing the wording rather than inventing a second vocabulary is the point: a reader
+        who scrolls from one card to the other is looking at the same finding.
+      */
+      const standing =
+        assertion.corroboration === 'CORROBORATED'
+          ? 'Corroborated across sources.'
+          : assertion.corroboration === 'CONTRADICTED'
+            ? 'Contradicted by status.'
+            : 'Single source.';
+
       changes.push(
         put(
           'aiSuggestions',
@@ -1470,18 +1759,48 @@ export async function runDirectCaseAnalysis(
             caseId,
             evidenceId: assertion.sourceEvidenceIds[0] ?? null,
             kind: 'FIELD_EXTRACTION',
-            model: 'evidence-intelligence',
+            /*
+              This pass is a deterministic read of extracted text — `evidence-intelligence`
+              matches transaction ids and invoice numbers across documents by string equality
+              and reads a status field. No model is asked anything.
+
+              It used to store `model: 'evidence-intelligence'`, which is not the value
+              `isOnDeviceSuggestion` looks for, so every record it wrote came out of the panel
+              wearing the violet `ai` chip and the AI reading stamp. The panel's own comment
+              says why that is not a cosmetic slip: violet means a model wrote this, and a
+              reader who has learnt that mark is entitled to rely on it.
+            */
+            model: ON_DEVICE_ENGINE,
+            // Kept distinct from `ON_DEVICE_ENGINE_VERSION`: this names which on-device pass
+            // produced the record, and the reconciliation builders are a different one.
             promptVersion: 'intelligence-v1',
-            summary: assertion.statement,
+            summary: `${assertion.statement} ${standing}`,
             payload: {
               kind: assertion.kind,
               statement: assertion.statement,
               detail: assertion.detail,
               citations: assertion.citations,
               groundingFact: assertion.groundingFact,
+              corroboration: assertion.corroboration,
             },
             sourceEvidenceIds: assertion.sourceEvidenceIds,
-            confidence: assertion.corroboration === 'CORROBORATED' ? 0.9 : 0.7,
+            // `groundingFact` is what the assertion rests on — "Transaction ID 40382881",
+            // "Invoice INV-9", "Status: FAILED" — and is the only part of an assertion that
+            // names the thing rather than describing it. This pass is deterministic, so the
+            // same documents produce the same grounding facts on every run, and keying on
+            // them is what stops each analysis adding another eight copies.
+            identity: [caseId, 'assertion', assertion.kind, assertion.groundingFact],
+            /*
+              No `confidence`, which `aiSuggestionRecord` stores as `null`.
+
+              It was `corroboration === 'CORROBORATED' ? 0.9 : 0.7` — two numbers no part of
+              this pass computes, rendered by the panel as "Its own confidence: High" beside a
+              speaker that was never asked. Worse than invented: `CONTRADICTED` and
+              `SINGLE_SOURCE` both mapped to 0.7 and therefore to one band, so the single most
+              important thing this pass can find — a document contradicted by another — was
+              displayed identically to a value only one document happens to mention. That
+              distinction now travels as itself, in `payload.corroboration` and in the summary.
+            */
             now,
           }),
         ),
@@ -1522,8 +1841,22 @@ export async function runDirectCaseAnalysis(
 
   caseAnalysisSchema.parse(report);
   changes.push(put('caseAnalyses', report));
-  changes.push(put('cases', { ...caseRecord, lastAnalyzedAt: now, updatedAt: now }));
+  // No `put('cases', …)` here. `runCaseAnalysis` already stamped `lastAnalyzedAt` from the
+  // same `now`; writing the case a second time from `caseRecord` would only re-send the
+  // pre-analysis copy of a record that has since had its claim states recomputed around it.
 
-  await repository.commit(ownerId, changes);
+  // The same guard `runCaseAiSuggestions` applies, for the same reason. The assertion pass
+  // above builds its records with deterministic ids so a re-run rewrites them in place rather
+  // than adding another eight — and the cost of that, unguarded, is that a `put` would
+  // overwrite a proposal this person already accepted or rejected with a fresh `SUGGESTED`
+  // copy. A rejected assertion would return to the top of the panel after every analysis.
+  const { decidedSuggestionIds } = await import('./provenance');
+  const decided = decidedSuggestionIds(workspace.aiSuggestions);
+  const writable = changes.filter(
+    (change) =>
+      !(change.op === 'put' && change.collection === 'aiSuggestions' && decided.has(change.record.id)),
+  );
+
+  await repository.commit(ownerId, writable);
   return report;
 }

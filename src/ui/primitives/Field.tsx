@@ -34,7 +34,7 @@ import {
 
 import { Icon, type IconName } from '../icon';
 import { useTheme } from '../theme';
-import { FONT_FAMILY, SPACING } from '../tokens';
+import { FONT_FAMILY, SPACING, TYPE_SCALE_CAP } from '../tokens';
 import { Row } from './Layout';
 import { Text } from './Text';
 
@@ -209,6 +209,12 @@ export const TextField = forwardRef<TextInput, TextFieldProps>(function TextFiel
           selectionColor={theme.colors.accent}
           // The cursor is hard to see against a dark field at the default Android colour.
           cursorColor={theme.colors.accent}
+          // `TextInput` is the one text path in the app that does not go through
+          // `primitives/Text`, so the scaling policy has to be restated here or a raised font
+          // scale would grow every label on the screen and leave what the user is *typing* at
+          // its nominal size. Matched to the rank the input is set in, so the field and the
+          // prose around it move together. The box already grows: `minHeight`, not `height`.
+          maxFontSizeMultiplier={mono ? TYPE_SCALE_CAP.mono : TYPE_SCALE_CAP.body}
           {...rest}
           accessibilityLabel={rest.accessibilityLabel ?? label}
           accessibilityHint={rest.accessibilityHint ?? error ?? hint}
@@ -337,7 +343,13 @@ function SelectRow<T extends string>({
       ) : null}
 
       <View style={styles.flex}>
-        <Text variant="bodySmall" colorToken={selected ? 'textAccent' : 'text'}>
+        {/*
+          Two lines. The one caller of this field offers a case's claims as the options, and a
+          claim is allowed two thousand characters — so an unclamped label set a radio row as a
+          page of prose with a radio button somewhere off the bottom of it. The full string stays
+          on `accessibilityLabel` above, so clamping costs a screen reader nothing.
+        */}
+        <Text variant="bodySmall" colorToken={selected ? 'textAccent' : 'text'} numberOfLines={2}>
           {option.label}
         </Text>
         {option.description ? (

@@ -27,7 +27,8 @@ export const relatedIdentifiersRule: Rule = {
     const findings: RuleFinding[] = [];
 
     // Documents quoting one reference are frequently exports of the same thing and so
-    // frequently share a title; the finding names each of them, so they must be distinct.
+    // frequently share a title; the `Documents` row names each of them, so they must be
+    // distinct there.
     const labelOf = distinctEvidenceLabels(context.evidence);
 
     for (const group of identifierGroups(context)) {
@@ -38,11 +39,17 @@ export const relatedIdentifiersRule: Rule = {
         // document to an existing thread updates this finding instead of replacing it.
         key: [group.field, group.value],
         title: `${group.items.length} documents share ${group.label} ${group.value}`,
+        // The names go in `inputs.Documents`. This sentence opened with all of them, which
+        // meant the observation's length was set by how many documents quote the reference —
+        // the cases where this finding is most useful produced the longest, most clipped
+        // sentence. What the reader needs from the prose is the consequence, not the roll call.
         explanation:
-          `${labels.map((label) => `"${label}"`).join(', ')} all reference ${group.value}. ` +
-          `They describe the same transaction, which is why they appear connected in the ` +
-          `graph. Note that a shared reference does not make them independent sources — ` +
-          `several may originate from the same party.`,
+          `These ${group.items.length} documents all quote ${group.label} ${group.value}, ` +
+          `so they are shown as connected in this case.`,
+        caveat:
+          'A shared reference does not make them independent sources — several may originate ' +
+          'from the same party, and a reference number can be copied from one document onto ' +
+          'another.',
         confidence: 'EXACT_MATCH',
         supportingEvidenceIds: group.items.map((item) => item.id),
         inputs: {

@@ -810,6 +810,100 @@ export const TYPE = {
 
 export type TypeToken = keyof typeof TYPE;
 
+/**
+ * How far each rank may grow when the reader has raised the system font size.
+ *
+ * ## Why there is a cap at all
+ *
+ * Font scaling is left *on* everywhere in this app — a user assembling evidence for a refund
+ * or a deposit dispute is reading closely, often on a phone they have already turned up, and
+ * text they cannot read is not a cosmetic failure. So the question is never whether to scale,
+ * only how far, and the honest answer differs by rank.
+ *
+ * ## Why the caps are not uniform
+ *
+ * A single multiplier applied to the whole scale magnifies the ranks that need it least. The
+ * reader who sets Android to 2× did so because `caption` at 12pt is unreadable to them; they
+ * did not ask for `display` at 72pt, which is a masthead consuming half the screen and pushing
+ * the content it labels below the fold. The caps below therefore *compress* the scale under
+ * magnification rather than multiplying it:
+ *
+ *     1×    36 · 28 · 22 · 17.5 · 15.5 · 14 · 13.5 · 12 · 11     (range 3.27×)
+ *     max   50 · 42 · 35 · 29.8 · 27.1 · 25 · 24.3 · 22.8 · 21   (range 2.41×)
+ *
+ * The small end nearly doubles, the large end grows by less than half, and the ordering
+ * survives with real gaps between adjacent ranks at every step — which matters, because the
+ * whole argument of the scale above is that hierarchy the reader cannot rank is texture. A
+ * flat 2× would have put `subheading` and `body` within a point of each other at the top of
+ * the range and undone that for exactly the users who are reading hardest.
+ *
+ * This mirrors what the platforms do with their own scales: iOS Dynamic Type grows its title
+ * ranks proportionally less than its body ranks for the same reason.
+ *
+ * ## The mono ranks are pinned to their sans partners
+ *
+ * `TYPE`'s docblock pairs each mono rank with a sans rank at an identical size, so a value
+ * that turns out to have been read from a document keeps the rhythm of the line it sits in.
+ * A cap is part of that size. Capping `monoValue` differently from `body` would hold the pair
+ * together at 1× and split it at 1.75×, reintroducing the baseline drift in every card that
+ * mixes machine and human text — which is most cards in this product. `type-scaling.test.ts`
+ * asserts each pair rather than trusting this paragraph.
+ */
+export const TYPE_SCALE_CAP = {
+  display: 1.4,
+  title: 1.5,
+  heading: 1.6,
+  subheading: 1.7,
+
+  body: 1.75,
+  bodyMedium: 1.75,
+  bodySmall: 1.8,
+  label: 1.8,
+  caption: 1.9,
+
+  overline: 1.9,
+
+  // Paired with `display` rather than with its own 32pt size: a stat figure is a headline
+  // made of digits, and it sits on a tile beside a `caption` that is scaling by 1.9.
+  statValue: 1.4,
+
+  // Pinned to body / label / caption / overline respectively. See the docblock.
+  monoValue: 1.75,
+  mono: 1.8,
+  monoSmall: 1.9,
+  monoOverline: 1.9,
+} as const satisfies Record<TypeToken, number>;
+
+/**
+ * The cap for a label inside a compact control — a chip, a count badge, a segment, a button.
+ *
+ * These are the elements the per-rank caps above are wrong for, because their box is sized
+ * from the label rather than from the page. A chip is a pill whose height was chosen so the
+ * caption sits *in* it (see `Chip`); a segmented control is a row that has to stay a row. Let
+ * their labels reach 1.9× and a status row stops fitting the screen width and a three-option
+ * control becomes a column — the layout does not degrade, it stops being the control.
+ *
+ * 1.5 is a derived figure rather than a comfortable one. The binding control is the 26pt chip,
+ * whose height was chosen so a `caption` sits *in* the pill rather than pressed against both
+ * edges: a 16.5pt line box reaches 24.75pt at 1.5 and overflows the pill at 1.6. So 1.5 is the
+ * largest tenth-step at which the boxes with no vertical padding to give — the 26pt chip, the
+ * 40pt segment, the 44pt avatar — still hold their label at the geometry they were drawn with.
+ * `type-scaling.test.ts` derives that from the real tokens, so a future re-cut of the type
+ * scale or of a control's height fails the test instead of quietly clipping a label on a
+ * stranger's phone.
+ *
+ * A button is the exception that explains the rule. Its padding is derived from its own line
+ * box, so it grows to hold whatever it is handed and wants no height ceiling at all — it takes
+ * this cap for the *other* axis. A button cannot widen past the screen it is on, and until the
+ * label was allowed a second line the overflow went to an ellipsis: "Continue without an
+ * account" rendered as "Continue without an acco…" on a 375pt phone at 100% scale. See
+ * `Button.tsx`.
+ *
+ * It is also the scale the product is most often judged at: 150% is where a layout that was
+ * never tested above 100% visibly breaks.
+ */
+export const CONTROL_SCALE_CAP = 1.5;
+
 // ---------------------------------------------------------------------------
 // Motion
 // ---------------------------------------------------------------------------

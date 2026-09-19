@@ -123,8 +123,11 @@ export const amountMismatchRule: Rule = {
           explanation:
             `"${label(highest.item.id)}" states ${formatAmount(highest.amount)} while ` +
             `"${label(lowest.item.id)}" states ${formatAmount(lowest.amount)}, a difference ` +
-            `of ${formatAmount(gap)}. They were compared because ${group.reason} — so they may ` +
-            `describe the same transaction. ${classification.explanation} Open both sources and confirm which figure is correct.`,
+            `of ${formatAmount(gap)}.`,
+          caveat:
+            `These two figures were compared because ${group.reason} — which is a reason to ` +
+            `think they describe the same transaction, not proof that they do. ` +
+            `${classification.explanation} Open both sources and confirm which figure is correct.`,
           confidence: 'NEEDS_REVIEW',
           severity: classification.material ? 'HIGH' : 'MEDIUM',
           supportingEvidenceIds: involved,
@@ -197,7 +200,8 @@ export const amountMismatchRule: Rule = {
           explanation:
             `"${label(highest.item.id)}" states ${formatAmount(highest.amount)} while ` +
             `"${label(lowest.item.id)}" states ${formatAmount(lowest.amount)}, a difference ` +
-            `of ${formatAmount(gap)} linked to the same claim. ${classification.explanation} Review both sources to resolve the conflict.`,
+            `of ${formatAmount(gap)} linked to the same claim.`,
+          caveat: `${classification.explanation} Review both sources to resolve the conflict.`,
           confidence: 'NEEDS_REVIEW',
           severity: classification.material ? 'HIGH' : 'MEDIUM',
           supportingEvidenceIds: involved,

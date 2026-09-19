@@ -9,23 +9,55 @@
  * is deployed, used to be reported as `refused` with Firebase's raw status token, which told
  * the user their record had been read and declined. Nothing had read it. A product whose
  * entire claim is that it does not assert what it cannot establish cannot invent a refusal.
+ *
+ * ## The callable is now reached through a gate, and the gate is shut
+ *
+ * `FIREBASE_SEAL_CALLABLE_DEPLOYED` is `false` because the project is on the Spark plan, so
+ * `requestSeal` answers a Firebase workspace from `sealAvailability` without a request leaving
+ * the device. That makes the callable transport unreachable from `requestSeal` in this build,
+ * which is why the status mapping below is exercised through `interpretCallableError`
+ * directly: the mapping is what a deployer inherits, and shipping it untested until the day
+ * someone flips the constant would put its first run in production.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { requestSeal } from '@services/crucible/request-seal';
+import {
+  FIREBASE_SEAL_CALLABLE_DEPLOYED,
+  interpretCallableError,
+  requestSeal,
+  sealAvailability,
+} from '@services/crucible/request-seal';
 
-/** What the callable does on the next call. Swapped per test. */
-const behaviour: { throws: unknown; returns: unknown; app: unknown; api: unknown; apiThrows: unknown; apiCalls: Array<[string, RequestInit]> } = {
-  throws: null,
-  returns: null,
-  app: {},
+/** What the transports do on the next call. Swapped per test. */
+const behaviour: {
+  api: unknown;
+  apiThrows: unknown;
+  apiCalls: Array<[string, RequestInit]>;
+  /** Every payload the callable was handed. Empty is the assertion, not the setup. */
+  callableCalls: unknown[];
+  /** How many times the Firebase app was read, which is the first thing the callable path does. */
+  firebaseReads: number;
+} = {
   api: null,
   apiThrows: null,
   apiCalls: [],
+  callableCalls: [],
+  firebaseReads: 0,
 };
 
-vi.mock('../src/data/firebase/auth', () => ({ firebaseApp: () => behaviour.app }));
+// Hand-listed rather than spread from `importOriginal`, which is this repo's default and is
+// not available here: all three originals pull a native module into a Node process —
+// `@react-native-async-storage/async-storage` through `auth`, `expo-constants` through
+// `config` — and importing them in order to spread them is the thing the mock exists to
+// avoid. Kept as narrow as the code they stand in for, so the staleness that spreading
+// prevents stays visible.
+vi.mock('../src/data/firebase/auth', () => ({
+  firebaseApp: () => {
+    behaviour.firebaseReads += 1;
+    return {};
+  },
+}));
 vi.mock('../src/data/firebase/config', () => ({
   useFirebaseEmulator: () => false,
   firebaseEmulatorHost: () => '127.0.0.1',
@@ -33,9 +65,12 @@ vi.mock('../src/data/firebase/config', () => ({
 vi.mock('firebase/functions', () => ({
   getFunctions: () => ({}),
   connectFunctionsEmulator: () => undefined,
-  httpsCallable: () => async () => {
-    if (behaviour.throws) throw behaviour.throws;
-    return { data: behaviour.returns };
+  // Records the call and then refuses it. Nothing in this build reaches the callable, and a
+  // stub that answered it cheerfully would let a regression that re-opens the gate go green
+  // in whichever test happened to run it.
+  httpsCallable: () => async (payload: unknown) => {
+    behaviour.callableCalls.push(payload);
+    throw new Error('The sealing callable was called, and no path in this build should reach it.');
   },
 }));
 vi.mock('../src/services/api-client', () => ({
@@ -53,92 +88,130 @@ const callableError = (code: string, message: string) => Object.assign(new Error
 const apiError = (code: string, message: string) => Object.assign(new Error(message), { code, message });
 
 beforeEach(() => {
-  behaviour.throws = null;
-  behaviour.returns = null;
-  behaviour.app = {};
   behaviour.api = null;
   behaviour.apiThrows = null;
   behaviour.apiCalls = [];
+  behaviour.callableCalls = [];
+  behaviour.firebaseReads = 0;
 });
 
-const seal = (caseId = 'case_x') => requestSeal(caseId, { repositoryKind: 'firebase' });
+/** Nothing left this device: no HTTP, no callable, not even a read of the Firebase app. */
+const reachedNothing = () =>
+  behaviour.apiCalls.length + behaviour.callableCalls.length + behaviour.firebaseReads;
 
-describe('requestSeal outcomes', () => {
-  it('distinguishes a new signature from one that already covered the record', async () => {
-    const receipt = { sealId: 'seal_1', chainHead: 'a'.repeat(64), entryCount: 3, sealedAt: 1_757_000_000_000 };
-
-    behaviour.returns = { ...receipt, created: true };
-    expect(await seal()).toEqual({ kind: 'sealed', receipt });
-
-    // Same receipt, `created: false`. Reporting this as `sealed` would claim a signature was
-    // just made over a record whose seal is older than the tap that asked for it.
-    behaviour.returns = { ...receipt, created: false };
-    expect(await seal()).toEqual({ kind: 'unchanged', receipt });
+describe('sealAvailability', () => {
+  it('answers whether a signer can be reached, not where the case is stored', () => {
+    // The distinction the ribbon was missing. `firebase` and `remote` are both "on a server";
+    // only one of them has something in front of it that can sign.
+    expect(sealAvailability('local')).toBe('device-only');
+    expect(sealAvailability('remote')).toBe('available');
+    expect(sealAvailability('firebase')).toBe('no-service');
   });
 
-  it('will not call a missing deployment a refusal', async () => {
-    // The bare status token the SDK raises when no `sealCase` exists. No sentence, because
-    // no server wrote one.
-    behaviour.throws = callableError('functions/not-found', 'NOT_FOUND');
-    const outcome = await seal();
+  it('defaults to no deployed callable, because there is none', () => {
+    // Pinned as a value, not as a mood. The project is on the Spark plan, where Cloud
+    // Functions cannot be deployed at all, and a build that ships `true` here puts an enabled
+    // "Seal this record" button on every case that can do nothing but raise a toast.
+    expect(FIREBASE_SEAL_CALLABLE_DEPLOYED).toBe(false);
+  });
+});
 
+describe('requestSeal outcomes', () => {
+  it('never reaches the network for a device-only workspace', async () => {
+    const outcome = await requestSeal('case_x', { repositoryKind: 'local' });
     expect(outcome.kind).toBe('unavailable');
+    expect((outcome as { reason: string }).reason).toMatch(/stored only on this device/);
+    expect(reachedNothing()).toBe(0);
+  });
+
+  it('never reaches the network when it already knows no signer is deployed', async () => {
+    // The round trip this replaces always ended here anyway: `functions/not-found`, a bare
+    // `NOT_FOUND` from the SDK, and this same sentence as a warning toast. Spending a network
+    // call to learn a fact compiled into the binary is latency for nothing.
+    const outcome = await requestSeal('case_x', { repositoryKind: 'firebase' });
+    expect(outcome.kind).toBe('unavailable');
+    expect(reachedNothing()).toBe(0);
+  });
+
+  it('says what is known about a missing signer, and nothing else', async () => {
+    const outcome = await requestSeal('case_x', { repositoryKind: 'firebase' });
     const reason = (outcome as { reason: string }).reason;
     expect(reason).toMatch(/no sealing server to ask/);
     // The two things a reader on an integrity screen needs to know, and neither is a verdict.
     expect(reason).toMatch(/Nothing was read/);
     expect(reason).toMatch(/nothing in the case has changed/);
-    // Firebase's internal token is not shown to anyone.
+    // Firebase's internal token is not shown to anyone — and here there is not even one to
+    // show, because no call was made.
     expect(reason).not.toMatch(/NOT_FOUND/);
   });
 
-  it('passes a refusal through in the server own words', async () => {
+  it('keeps the two unreachable transports in separate words', async () => {
+    const local = (await requestSeal('c', { repositoryKind: 'local' })) as { reason: string };
+    const firebase = (await requestSeal('c', { repositoryKind: 'firebase' })) as { reason: string };
+    expect(local.reason).not.toBe(firebase.reason);
+    // Neither borrows the other's explanation: a Firebase case is not on this device only,
+    // and signing in does not summon a deployment.
+    expect(firebase.reason).not.toMatch(/stored only on this device/);
+    expect(local.reason).not.toMatch(/no sealing server to ask/);
+  });
+});
+
+/**
+ * The callable's status mapping.
+ *
+ * Unreachable from `requestSeal` while the gate is shut, and still the code a Blaze
+ * deployment would run on its first tap. Driven directly for exactly that reason.
+ *
+ * There is no test here for the "this build has no Firebase project configured" branch:
+ * `requestSeal` is the only thing that reads `firebaseApp()`, and it cannot get that far. The
+ * branch is kept because it is correct once the callable is deployed, not because anything
+ * exercises it today.
+ */
+describe('interpretCallableError', () => {
+  it('will not call a missing deployment a refusal', () => {
+    // The bare status token the SDK raises when no `sealCase` exists. No sentence, because
+    // no server wrote one.
+    const outcome = interpretCallableError(callableError('functions/not-found', 'NOT_FOUND'));
+
+    expect(outcome.kind).toBe('unavailable');
+    const reason = (outcome as { reason: string }).reason;
+    expect(reason).toMatch(/no sealing server to ask/);
+    expect(reason).toMatch(/Nothing was read/);
+    expect(reason).toMatch(/nothing in the case has changed/);
+    expect(reason).not.toMatch(/NOT_FOUND/);
+  });
+
+  it('passes a refusal through in the server own words', () => {
     // `functions/src/seal.js` raises `not-found` with prose when the case is not the
     // caller's. That is a real decision about a real record and belongs on the screen intact.
-    behaviour.throws = callableError('functions/not-found', 'This case is unavailable for your account.');
-    expect(await seal()).toEqual({
+    expect(interpretCallableError(callableError('functions/not-found', 'This case is unavailable for your account.'))).toEqual({
       kind: 'refused',
       reason: 'This case is unavailable for your account.',
     });
 
-    behaviour.throws = callableError(
-      'functions/failed-precondition',
-      'There is nothing recorded in this case to seal yet.',
-    );
-    expect(await seal()).toEqual({
+    expect(
+      interpretCallableError(
+        callableError('functions/failed-precondition', 'There is nothing recorded in this case to seal yet.'),
+      ),
+    ).toEqual({
       kind: 'refused',
       reason: 'There is nothing recorded in this case to seal yet.',
     });
   });
 
-  it('reports an unreachable server as unreachable, not as a decision', async () => {
+  it('reports an unreachable server as unreachable, not as a decision', () => {
     for (const code of ['functions/internal', 'functions/unavailable', 'functions/deadline-exceeded']) {
-      const outcome = await (async () => {
-        behaviour.throws = callableError(code, 'internal');
-        return seal();
-      })();
+      const outcome = interpretCallableError(callableError(code, 'internal'));
       expect(outcome.kind, code).toBe('unavailable');
       expect((outcome as { reason: string }).reason, code).toMatch(/Nothing in the case has changed/);
     }
   });
 
-  it('asks for a sign-in rather than reporting a fault with the record', async () => {
-    behaviour.throws = callableError('functions/unauthenticated', 'Sign in to seal a record.');
-    expect(await seal()).toEqual({ kind: 'unavailable', reason: 'Sign in again to seal this record.' });
-  });
-
-  it('never reaches the network for a device-only workspace', async () => {
-    const outcome = await requestSeal('case_x', { repositoryKind: 'local' });
-    expect(outcome.kind).toBe('unavailable');
-    expect((outcome as { reason: string }).reason).toMatch(/stored only on this device/);
-    expect(behaviour.apiCalls).toEqual([]);
-  });
-
-  it('says a build with no Firebase project has no server, not that sealing failed', async () => {
-    behaviour.app = null;
-    const outcome = await seal();
-    expect(outcome.kind).toBe('unavailable');
-    expect((outcome as { reason: string }).reason).toMatch(/configured Firebase project/);
+  it('asks for a sign-in rather than reporting a fault with the record', () => {
+    expect(interpretCallableError(callableError('functions/unauthenticated', 'Sign in to seal a record.'))).toEqual({
+      kind: 'unavailable',
+      reason: 'Sign in again to seal this record.',
+    });
   });
 });
 
@@ -241,17 +314,19 @@ describe('failure text vocabulary', () => {
 
   it('makes no claim §9 forbids, in any outcome', async () => {
     const reasons: string[] = [];
+    // The callable's sentences, reached directly: `requestSeal` cannot get to them while the
+    // gate is shut, and they still have to be swept, because the day it opens is not the day
+    // to discover what they say.
     for (const code of ['functions/not-found', 'functions/failed-precondition', 'functions/unauthenticated', 'functions/resource-exhausted', 'functions/internal']) {
-      behaviour.throws = callableError(code, code === 'functions/failed-precondition' ? 'Nothing to seal yet.' : 'NOT_FOUND');
-      const outcome = await seal();
+      const outcome = interpretCallableError(
+        callableError(code, code === 'functions/failed-precondition' ? 'Nothing to seal yet.' : 'NOT_FOUND'),
+      );
       reasons.push((outcome as { reason?: string }).reason ?? '');
     }
-    behaviour.app = null;
-    reasons.push(((await seal()) as { reason: string }).reason);
+    reasons.push(((await requestSeal('c', { repositoryKind: 'firebase' })) as { reason: string }).reason);
     reasons.push(((await requestSeal('c', { repositoryKind: 'local' })) as { reason: string }).reason);
 
     // The API transport's sentences reach the same toast and are swept with the rest.
-    behaviour.app = {};
     for (const code of ['not-found', 'failed-precondition', 'permission-denied', 'unauthenticated', 'unavailable']) {
       behaviour.apiThrows = apiError(code, code === 'failed-precondition' ? 'Nothing to seal yet.' : code);
       reasons.push(((await requestSeal('c', { repositoryKind: 'remote' })) as { reason?: string }).reason ?? '');

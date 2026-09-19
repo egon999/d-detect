@@ -147,6 +147,22 @@ export function ScreenHeaderBar({
         },
       ]}
     >
+      {/*
+        `height`, not `minHeight`, and deliberately the exception to the rule the rest of this
+        design system follows.
+
+        `LAYOUT.headerHeight` is a contract, not a measurement: the bar is absolutely
+        positioned, and three places pad their scroll content by `insets.top + headerHeight` so
+        content starts below it — two of them outside this file. A bar that grew with the font
+        scale would slide under none of that padding and sit on top of the first row of
+        content, which is a worse failure than the one growing would fix.
+
+        It stays safe by arithmetic instead: the compact title is a `subheading`, whose ceiling
+        in `TYPE_SCALE_CAP` puts its line box at 40.8pt inside this 52pt bar. `type-scaling.test.ts`
+        asserts that from the real tokens, so raising the cap or lowering the bar fails the test.
+        The title is also `accessibilityElementsHidden` below and repeated in the masthead at
+        `display` rank, which scales freely — nobody reads this bar to read the screen's name.
+      */}
       <Row style={[styles.barRow, { height: theme.layout.headerHeight }]} gap="xs">
         {back ? (
           <IconButton icon="chevron-left" accessibilityLabel="Go back" onPress={goBack} size={22} />

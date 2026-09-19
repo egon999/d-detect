@@ -24,6 +24,7 @@ import { Platform } from 'react-native';
 
 import { firebaseAuth } from '@data/firebase/auth';
 import { isFirebaseConfigured } from '@data/firebase/config';
+import type { Repository } from '@data/repository';
 import { newId } from '@domain/ids';
 import type { UserProfile } from '@domain/models';
 import { useRepository } from './repository-provider';
@@ -38,6 +39,8 @@ export interface SessionUser {
   email: string;
   displayName: string;
   photoURL?: string;
+  phone?: string;
+  address?: string;
   providerIds: string[];
   emailVerified?: boolean;
   createdAt?: number;
@@ -62,7 +65,11 @@ export interface SessionValue {
   /** Updates current user password */
   updateUserPassword: (newPassword: string, currentPassword: string) => Promise<void>;
   /** Updates current user profile details */
-  updateUserProfile: (displayName: string, photoURL?: string) => Promise<void>;
+  updateUserProfile: (
+    displayName: string,
+    photoURL?: string,
+    details?: { phone?: string; address?: string },
+  ) => Promise<void>;
   error: Error | null;
 }
 
@@ -73,6 +80,8 @@ interface LocalIdentity {
   email: string;
   displayName: string;
   photoURL?: string;
+  phone?: string;
+  address?: string;
   createdAt: number;
 }
 
@@ -112,6 +121,81 @@ async function loadOrCreateLocalIdentity(displayName?: string): Promise<LocalIde
   };
   await AsyncStorage.setItem(LOCAL_IDENTITY_KEY, JSON.stringify(identity));
   return identity;
+}
+
+/**
+ * Takes the session off this device, in the one order that is correct.
+ *
+ * Lifted out of the `signOut` callback below so that the order can be held in place by a
+ * test. Every step here is independently plausible in any position — only the sequence is
+ * load-bearing — and this repo has no component-render harness, so an ordering reachable
+ * only through React is an ordering nothing can defend. What the UI *becomes* stays with the
+ * caller; this is only what the device forgets.
+ *
+ * `cloudEnabled` is a parameter rather than a read, because the value that belongs here is
+ * `isFirebaseConfigured()` — whether a project exists at all, not whether this session used it.
+ */
+export async function runSignOutTeardown(
+  repository: Pick<Repository, 'dropLocalCache'>,
+  cloudEnabled: boolean,
+): Promise<void> {
+  // Clear the native Google session first. Signing out of Firebase alone leaves the Google
+  // account selected on the device, so the next "Continue with Google" skips the chooser and
+  // silently signs the same person back in — which reads as a broken sign-out button.
+  try {
+    const { signOutOfGoogle } = await import('./auth/google');
+    await signOutOfGoogle();
+  } catch {
+    // Non-fatal. A stale Google session must not block leaving the app.
+  }
+
+  await AsyncStorage.removeItem(OFFLINE_ACTIVE_KEY);
+  if (cloudEnabled) {
+      const auth = await firebaseAuth();
+      if (auth) {
+        const { signOut: firebaseSignOut } = await import('firebase/auth');
+        await firebaseSignOut(auth);
+      }
+  }
+  // Keep the device identity: deleting it would strand every locally owned case.
+
+  // Last, and only once every step above has been acknowledged.
+  //
+  // Firestore is initialised with `persistentLocalCache` (see `createFirebaseRepository`), so
+  // the adapter keeps an on-disk copy of every document it has ever read — `extraction.sourceText`,
+  // the full extracted text of a user's evidence, included. Signing out of Auth does not touch
+  // that copy. Without this call the cached evidence stays on the handset and stays readable,
+  // which on a shared or handed-on phone is one person's material left behind for the next.
+  //
+  // It is awaited *after* the steps above rather than started alongside them: dropping the
+  // cache discards whatever is still queued in it and terminates the client the Firebase
+  // sign-out is still talking to, so a concurrent start would race an acknowledgement that has
+  // not arrived and leave the store in a state neither operation describes.
+  //
+  // And it completes *before* the caller's state updates, because those are what replace this
+  // adapter — `setUser(null)` / `setStatus('signedOut')` drive the effect that flips
+  // `setCloudEnabled`, and `Repository.dropLocalCache` is explicit that the instance is
+  // unusable once dropped. The rebuild has to follow the drop, not precede it.
+  //
+  // Optional on the port, and called as one: the device adapter is the store of record and
+  // caches nothing behind itself, so it implements no `dropLocalCache`. An adapter with
+  // nothing to drop is not a failure.
+  try {
+    await repository.dropLocalCache?.();
+  } catch (error) {
+    // Caught, so the caller still reaches its state updates. Rethrowing would abandon the
+    // sign-out half-done — a session still reading `signedIn` against a credential that has
+    // already been revoked — and a cache that would not drop must not also cost the user the
+    // sign-out they asked for.
+    //
+    // But logged, because this is not the silent non-event the Google branch above is. A failed
+    // drop is precisely the remanence this call exists to prevent, and this line is the only
+    // signal that it happened. `[session]` matches the auth listener's prefix in this file.
+    console.warn(
+      '[session] cached documents could not be dropped on sign-out:',
+      error instanceof Error ? error.message : 'unknown',
+    );
+  }
 }
 
 export function SessionProvider({ children }: { children: React.ReactNode }) {
@@ -180,6 +264,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
             email: identity.email,
             displayName: identity.displayName,
             photoURL: identity.photoURL,
+            phone: identity.phone,
+            address: identity.address,
             providerIds: [],
             createdAt: identity.createdAt,
           });
@@ -308,6 +394,12 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
             // Restore saved photoURL back into current session
             setUser((prev) => (prev ? { ...prev, photoURL: existing.photoURL ?? undefined } : prev));
           }
+          if (existing.phone && !user!.phone) {
+            setUser((prev) => (prev ? { ...prev, phone: existing.phone } : prev));
+          }
+          if (existing.address && !user!.address) {
+            setUser((prev) => (prev ? { ...prev, address: existing.address } : prev));
+          }
           if (changed) {
             nextProfile.updatedAt = Date.now();
             await repository.saveProfile(nextProfile);
@@ -323,6 +415,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
           email: user!.email,
           displayName: user!.displayName,
           photoURL: user!.photoURL ?? null,
+          phone: user!.phone,
+          address: user!.address,
         };
         await repository.saveProfile(profile);
       } catch (err) {
@@ -554,23 +648,40 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   );
 
   const updateUserProfile = useCallback(
-    async (displayName: string, photoURL?: string) => {
+    async (
+      displayName: string,
+      photoURL?: string,
+      details?: { phone?: string; address?: string },
+    ) => {
       setError(null);
       if (!user) throw new Error('Sign in before updating your profile.');
       const name = displayName.trim();
       if (!name || name.length > 120) throw new Error('Use a display name between 1 and 120 characters.');
       if (!ready || (isLocal ? kind !== 'local' : kind === 'local')) throw new Error('Your account is still connecting. Try again shortly.');
+      const cleanPhone = details?.phone !== undefined ? details.phone.trim() : user.phone;
+      const cleanAddress = details?.address !== undefined ? details.address.trim() : user.address;
       const updatedUser: SessionUser = {
         ...user,
         displayName: name,
         photoURL: photoURL !== undefined ? photoURL : user.photoURL,
+        ...(cleanPhone !== undefined ? { phone: cleanPhone } : {}),
+        ...(cleanAddress !== undefined ? { address: cleanAddress } : {}),
       };
       try {
         if (isLocal) {
           const stored = await AsyncStorage.getItem(LOCAL_IDENTITY_KEY);
           if (!stored) throw new Error('Your device account could not be read.');
           const parsed = JSON.parse(stored) as LocalIdentity;
-          await AsyncStorage.setItem(LOCAL_IDENTITY_KEY, JSON.stringify({ ...parsed, displayName: name, photoURL: updatedUser.photoURL }));
+          await AsyncStorage.setItem(
+            LOCAL_IDENTITY_KEY,
+            JSON.stringify({
+              ...parsed,
+              displayName: name,
+              photoURL: updatedUser.photoURL,
+              phone: cleanPhone,
+              address: cleanAddress,
+            }),
+          );
         } else {
           const auth = await firebaseAuth();
           if (!auth?.currentUser || auth.currentUser.uid !== user.id) throw new Error('Your session expired. Sign in again.');
@@ -580,8 +691,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         setUser(updatedUser);
         const existing = await repository.loadProfile(user.id);
         await repository.saveProfile({
-          id: user.id, ownerId: user.id, createdAt: existing?.createdAt ?? Date.now(),
-          email: user.email, displayName: name, photoURL: updatedUser.photoURL ?? null, updatedAt: Date.now(),
+          id: user.id,
+          ownerId: user.id,
+          createdAt: existing?.createdAt ?? Date.now(),
+          email: user.email,
+          displayName: name,
+          photoURL: updatedUser.photoURL ?? null,
+          phone: cleanPhone,
+          address: cleanAddress,
+          updatedAt: Date.now(),
         });
       } catch (caught) {
         const wrapped = describeAuthError(caught);
@@ -593,31 +711,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   );
 
   const signOut = useCallback(async () => {
-    // Clear the native Google session first. Signing out of Firebase alone leaves the Google
-    // account selected on the device, so the next "Continue with Google" skips the chooser and
-    // silently signs the same person back in — which reads as a broken sign-out button.
-    try {
-      const { signOutOfGoogle } = await import('./auth/google');
-      await signOutOfGoogle();
-    } catch {
-      // Non-fatal. A stale Google session must not block leaving the app.
-    }
+    await runSignOutTeardown(repository, cloudEnabled);
 
-    await AsyncStorage.removeItem(OFFLINE_ACTIVE_KEY);
-    if (cloudEnabled) {
-        const auth = await firebaseAuth();
-        if (auth) {
-          const { signOut: firebaseSignOut } = await import('firebase/auth');
-          await firebaseSignOut(auth);
-        }
-    }
-    // Keep the device identity: deleting it would strand every locally owned case.
-
+    // Only now. These four are what rebuild the adapter — see the note at the foot of
+    // `runSignOutTeardown` on why the rebuild has to follow the drop rather than race it.
     setUser(null);
     setIsLocal(false);
     setStatus('signedOut');
     setError(null);
-  }, [cloudEnabled]);
+  }, [cloudEnabled, repository]);
 
   const value = useMemo<SessionValue>(
     () => ({

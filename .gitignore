@@ -37,8 +37,16 @@ yarn-error.*
 
 # Firebase native config. Not a secret (the values ship inside every APK anyway), but it is
 # per-project and does not belong to the source tree.
+#
+# The globs matter. `google-services.json` alone matched the exact filename and nothing else,
+# so `google-services.json.stale-com.diya.Ddetect.bak` — written beside it when the package
+# name changed — was tracked. This repository has one commit and nearly everything in it is
+# still uncommitted, so the next `git add .` would have published it. A per-project config
+# does not stop being a per-project config because something was appended to its name.
 google-services.json
+google-services.json.*
 GoogleService-Info.plist
+GoogleService-Info.plist.*
 .firebase/
 
 # typescript

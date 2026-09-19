@@ -3,16 +3,18 @@ import { Platform, StyleSheet, View } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { createNote, failEvidenceUpload, queueEvidence, recordEvidenceFile } from '@data/mutations';
+import { createNote, deleteEvidence, failEvidenceProcessing, failEvidenceUpload, queueEvidence, recordEvidenceFile } from '@data/mutations';
 import { newId } from '@domain/ids';
 import type { EvidenceKind } from '@domain/enums';
 import { MediaRecorder, type RecordedMemo } from '@features/evidence/media-recorder';
 import { findDuplicate, type DuplicateMatch } from '@features/evidence/upload-queue';
 import { uploadEvidenceFile, requestCaseAnalysis, requestEvidenceProcessing, useRepository, useSession } from '@services';
+import { checkDuplicateBeforeUpload } from '@services/ingestion/dedup';
 import { MAX_EVIDENCE_UPLOAD_BYTES } from '@services/storage/evidence-storage';
 import { useWorkspace, useCaseRecord, mutationContext } from '@services/use-case-store';
 import {
   Button,
+  Chip,
   ErrorState,
   IndeterminateBar,
   LAYOUT,
@@ -124,6 +126,63 @@ export default function EvidenceUploadScreen() {
     setErrorDetailText(errorDetail(caught) ?? null);
   }
 
+  async function addItemsAndCheckDuplicates(newItems: Item[]) {
+    setItems((all) => [...all, ...newItems]);
+
+    const caseEvidence = workspace?.evidence.filter((e) => e.caseId === caseId && !e.deletedAt) ?? [];
+
+    for (const item of newItems) {
+      if (item.status === 'failed') continue;
+      try {
+        const check = await checkDuplicateBeforeUpload(
+          { uri: item.uri, name: item.name, mimeType: item.mimeType, size: item.size },
+          caseEvidence,
+        );
+
+        setItems((all) => {
+          let duplicate: DuplicateMatch | null = null;
+          if (check.isDuplicate && check.matchedEvidence) {
+            duplicate = { scope: 'case', title: check.matchedEvidence.title };
+          } else {
+            const earlier = all.find((it) => it.id !== item.id && it.sha256 === check.sha256);
+            if (earlier) {
+              duplicate = { scope: 'batch', title: earlier.title || earlier.name };
+            }
+          }
+
+          return all.map((it) =>
+            it.id === item.id ? { ...it, sha256: check.sha256, duplicate } : it,
+          );
+        });
+      } catch {
+        // Hashing unreadable file falls back to normal upload handling
+      }
+    }
+  }
+
+  function removeItem(id: string) {
+    setItems((all) => {
+      const remaining = all.filter((entry) => entry.id !== id);
+      const caseEvidence = workspace?.evidence.filter((e) => e.caseId === caseId && !e.deletedAt) ?? [];
+      const seenHashes = new Map<string, string>();
+
+      return remaining.map((it) => {
+        if (!it.sha256) return it;
+        const caseMatch = caseEvidence.find(
+          (e) => !e.deletedAt && e.sha256 && e.sha256.toLowerCase() === it.sha256!.toLowerCase(),
+        );
+        if (caseMatch) {
+          return { ...it, duplicate: { scope: 'case', title: caseMatch.title } };
+        }
+        if (seenHashes.has(it.sha256)) {
+          return { ...it, duplicate: { scope: 'batch', title: seenHashes.get(it.sha256)! } };
+        }
+        seenHashes.set(it.sha256, it.title || it.name);
+        return { ...it, duplicate: null };
+      });
+    });
+  }
+
   async function pick(photos = false) {
     fail(null);
     try {
@@ -137,7 +196,7 @@ export default function EvidenceUploadScreen() {
         return itemFrom({ uri: asset.uri, name: document.name || photo.fileName || `evidence-${Date.now()}`,
           mimeType: asset.mimeType, size: document.size ?? photo.fileSize ?? null });
       });
-      setItems((all) => [...all, ...added]);
+      await addItemsAndCheckDuplicates(added);
     } catch (caught) { fail(caught, 'The file picker could not be opened. Nothing was added.'); }
   }
 
@@ -156,12 +215,12 @@ export default function EvidenceUploadScreen() {
       const added = result.assets.map((asset) => itemFrom({ uri: asset.uri,
         name: asset.fileName || `photo-${Date.now()}.${asset.mimeType?.split('/')[1] ?? 'jpg'}`,
         mimeType: asset.mimeType, size: asset.fileSize ?? null }));
-      setItems((all) => [...all, ...added]);
+      await addItemsAndCheckDuplicates(added);
     } catch (caught) { fail(caught, 'The camera could not be opened. No photo was taken.'); }
   }
 
   function keepMemo(memo: RecordedMemo) {
-    setItems((all) => [...all, itemFrom(memo)]);
+    void addItemsAndCheckDuplicates([itemFrom(memo)]);
   }
 
   /**
@@ -277,14 +336,26 @@ export default function EvidenceUploadScreen() {
           // it being a permanent spinner in the case — `patch` above writes only React state,
           // which is discarded the moment the user navigates away.
           //
-          // Swallowed on purpose. This is the error path; a case that cannot even record the
-          // failure must still show the sentence above rather than replacing it with a second,
-          // more confusing one.
           if (saved && !uploaded) {
             try {
-              const closed = failEvidenceUpload(current, context, item.id, message);
-              await repository.commit(user.id, closed.changes);
-              current = closed.workspace;
+              if (cancelled) {
+                const deleted = deleteEvidence(current, context, item.id);
+                await repository.commit(user.id, deleted.changes);
+                current = deleted.workspace;
+              } else {
+                const closed = failEvidenceUpload(current, context, item.id, message);
+                await repository.commit(user.id, closed.changes);
+                current = closed.workspace;
+              }
+            } catch { /* keep the message the user can act on */ }
+          } else if (saved && uploaded) {
+            try {
+              const ev = current.evidence.find((e) => e.id === item.id && !e.deletedAt);
+              if (ev && (ev.state === 'QUEUED' || ev.state === 'PROCESSING' || ev.state === 'UPLOADING')) {
+                const closed = failEvidenceProcessing(current, context, item.id, message);
+                await repository.commit(user.id, closed.changes);
+                current = closed.workspace;
+              }
             } catch { /* keep the message the user can act on */ }
           }
         }
@@ -411,30 +482,74 @@ export default function EvidenceUploadScreen() {
         <Notice title="Analysing the case" message="Comparing the new documents against everything already in this case." tone="info" />
         <IndeterminateBar accessibilityLabel="Analysing the case" />
       </View> : null}
-      <Text colorToken="textSecondary">Add original records from each perspective. Their content stays separate from what someone claims happened.</Text>
-      <TextField label="Who provided these" labelHint="optional" value={sourceLabel} onChangeText={setSourceLabel} maxLength={240} placeholder="Where did these records come from?" />
-      <TextField label="When was it captured?" labelHint="optional" value={capturedAt} onChangeText={setCapturedAt} maxLength={120} placeholder="Use the date on the record if you know it" />
-      <Row gap="md" style={styles.wrap}>
-        <Button label="Choose files" icon="file-upload-outline" disabled={busy || loading || !record} onPress={() => void pick()} />
-        {nativeDevice ? <Button label="Take photo" icon="camera-outline" variant="secondary" disabled={busy || loading || !record} onPress={() => void takePhoto()} /> : null}
-        <Button label="Photos or videos" variant="secondary" disabled={busy || loading || !record} onPress={() => void pick(true)} />
-        {nativeDevice && !recorderOpen ? <Button label="Record audio" icon="microphone-outline" variant="secondary" disabled={busy || loading || !record} onPress={() => setRecorderOpen(true)} /> : null}
-      </Row>
-      {/*
-        This paragraph named a model vendor and a Settings key, and described a limit as
-        something "this build" could not do. Neither is the reader's vocabulary: they are
-        being told what kinds of file work and what happens to one that does not, and the
-        answer to "why can't it read my voice note" is that transcription has to be
-        connected, not which company supplies it.
-      */}
-      <Text variant="caption" colorToken="textSecondary">
-        Images, PDFs, text, spreadsheets, email, audio and video can be added, up to 100 MB each.
-        Files are stored and read on this device: images by reading the text in the picture, PDFs
-        through their own text layer — or, when a PDF is a scan with no text, by reading its pages
-        as pictures — and audio or video by transcription, which has to be connected in Settings
-        first. A file whose contents cannot be read is kept exactly as it is and flagged for you to
-        look at — nothing is guessed.
-      </Text>
+      <Surface glass elevation="low" radius="lg" padding="lg" style={styles.panel}>
+        <Row between align="center">
+          <View style={styles.flex}>
+            <Text variant="subheading">Add Evidence Records</Text>
+            <Text variant="caption" colorToken="textSecondary">
+              On-device extraction · Cryptographic SHA-256 verification · Up to 100 MB
+            </Text>
+          </View>
+        </Row>
+
+        <Row gap="sm" style={styles.wrap}>
+          <Button
+            label="Documents & PDFs"
+            icon="file-document-outline"
+            variant="primary"
+            disabled={busy || loading || !record}
+            onPress={() => void pick()}
+          />
+          {nativeDevice ? (
+            <Button
+              label="Camera"
+              icon="camera-outline"
+              variant="secondary"
+              disabled={busy || loading || !record}
+              onPress={() => void takePhoto()}
+            />
+          ) : null}
+          <Button
+            label="Photos & Media"
+            icon="image-multiple-outline"
+            variant="secondary"
+            disabled={busy || loading || !record}
+            onPress={() => void pick(true)}
+          />
+          {nativeDevice && !recorderOpen ? (
+            <Button
+              label="Audio Memo"
+              icon="microphone-outline"
+              variant="secondary"
+              disabled={busy || loading || !record}
+              onPress={() => setRecorderOpen(true)}
+            />
+          ) : null}
+        </Row>
+
+        <Row gap="md">
+          <View style={styles.flex}>
+            <TextField
+              label="Source / Origin"
+              labelHint="optional"
+              value={sourceLabel}
+              onChangeText={setSourceLabel}
+              maxLength={240}
+              placeholder="e.g. Email from respondent, bank PDF"
+            />
+          </View>
+          <View style={styles.flex}>
+            <TextField
+              label="Record Date"
+              labelHint="optional"
+              value={capturedAt}
+              onChangeText={setCapturedAt}
+              maxLength={120}
+              placeholder="YYYY-MM-DD"
+            />
+          </View>
+        </Row>
+      </Surface>
       {recorderOpen ? <MediaRecorder busy={busy || loading || !record} onRecorded={keepMemo} onCancel={() => setRecorderOpen(false)} /> : null}
       {items.map((item) => {
         // The tone of the whole card follows the file's outcome, because a list of ten
@@ -470,6 +585,15 @@ export default function EvidenceUploadScreen() {
           : running
             ? <IndeterminateBar accessibilityLabel={item.status === 'processing' ? `Reading ${item.name}` : `Storing ${item.name}`} />
             : null}
+        {item.duplicate && item.sha256 ? (
+          <Row gap="sm" align="center">
+            <Chip
+              label={`Duplicate of: ${item.duplicate.title} (SHA-256: ${item.sha256.slice(0, 8)})`}
+              tone="warn"
+              icon="alert-circle-outline"
+            />
+          </Row>
+        ) : null}
         {item.duplicate ? <Text colorToken="textSecondary">{item.duplicate.scope === 'case'
           ? `Same file as "${item.duplicate.title}", already saved in this case. Both are kept; the analysis treats identical files as one document.`
           : `Same file as "${item.duplicate.title}", picked earlier in this batch.`}</Text> : null}
@@ -490,7 +614,7 @@ export default function EvidenceUploadScreen() {
           */}
           {!busy && (item.status === 'failed' || (item.status === 'waiting' && (item.saved || item.uploaded)))
             ? <Button label={item.uploaded ? 'Read this file again' : 'Retry this file'} variant="secondary" size="sm" onPress={() => void upload(item.id)} /> : null}
-          {!busy && !item.saved ? <Button label="Remove from selection" variant="ghost" size="sm" onPress={() => setItems((all) => all.filter((entry) => entry.id !== item.id))} /> : null}
+          {!busy && !item.saved ? <Button label="Remove from selection" variant="ghost" size="sm" onPress={() => removeItem(item.id)} /> : null}
         </Row>
       </Surface>;
       })}
@@ -504,13 +628,14 @@ export default function EvidenceUploadScreen() {
             it, watches the work continue, and concludes the app ignores them.
           */}
           {busy && !analysing ? <Button label="Stop" variant="ghost" onPress={() => active.current?.abort()} /> : null}</Row> : null}
-      <Surface padding="lg" style={styles.panel}>
-        <Text variant="heading">Record a statement</Text><Text colorToken="textSecondary">A typed statement is your own account, attributed to you. It is not treated as an independent record the way a document from someone else is.</Text>
-        <TextField label="Statement title" value={noteTitle} onChangeText={setNoteTitle} maxLength={200} />
-        {/* Six lines of body text, derived from the type scale rather than the 140 that
-            was here — so the box still holds six lines if the scale ever moves. */}
-        <TextField label="Statement content" value={noteText} onChangeText={setNoteText} multiline minHeight={TYPE.body.lineHeight * 6} maxLength={4000} />
-        <Button label="Save statement" onPress={() => void saveNote()} disabled={busy || !record || !noteTitle.trim() || !noteText.trim()} />
+      <Surface padding="lg" radius="lg" glass elevation="low" style={styles.panel}>
+        <Text variant="subheading">Record Written Statement</Text>
+        <Text variant="caption" colorToken="textSecondary">
+          Preserve your own factual account with timestamp and integrity verification.
+        </Text>
+        <TextField label="Statement title" value={noteTitle} onChangeText={setNoteTitle} maxLength={200} placeholder="e.g. Summary of dispute conversation" />
+        <TextField label="Statement content" value={noteText} onChangeText={setNoteText} multiline minHeight={TYPE.body.lineHeight * 5} maxLength={4000} placeholder="Type the factual events as they transpired..." />
+        <Button label="Save statement" variant="secondary" onPress={() => void saveNote()} disabled={busy || !record || !noteTitle.trim() || !noteText.trim()} />
       </Surface>
       <Button label={caseId ? 'Return to case' : 'Back to cases'} variant="secondary" disabled={busy}
         onPress={() => caseId ? router.replace({ pathname: '/case/[caseId]', params: { caseId } }) : router.replace('/cases')} />

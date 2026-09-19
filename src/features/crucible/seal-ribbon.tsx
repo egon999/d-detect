@@ -27,6 +27,8 @@ import { StyleSheet, View } from 'react-native';
 import { shortDigest } from '@domain/analysis/audit-chain';
 import type { CaseSealState } from '@domain/crucible/case-seal-state';
 import { requestSeal, type RepositoryKind } from '@services';
+// Imported from the module rather than the `@services` barrel, which does not re-export it.
+import { sealAvailability } from '@services/crucible/request-seal';
 import {
   Button,
   Chip,
@@ -52,7 +54,11 @@ import {
 export interface SealRibbonProps {
   caseId: string;
   state: CaseSealState;
-  /** Which adapter is serving this session. A device-only case has no server to sign it. */
+  /**
+   * Which adapter is serving this session. The ribbon turns it into a sealing answer itself
+   * via `sealAvailability`, because the two are not the same question and the screen above
+   * has no reason to know the difference.
+   */
   repositoryKind: RepositoryKind;
   /** Called after the server writes a seal, so the screen can pick up the new records. */
   onSealed: () => void;
@@ -64,11 +70,17 @@ export function SealRibbon({ caseId, state, repositoryKind, onSealed }: SealRibb
   const [sealing, setSealing] = useState(false);
 
   const { latest } = state;
-  // `remote` counts as server-backed, and has to: the platform API holds the key and runs
-  // the same `sealCase` the callable does. Testing for `=== 'firebase'` told a perfectly
-  // sealable workspace it was stored only on this device.
-  const serverBacked = repositoryKind !== 'local';
-  const copy = { state, serverBacked };
+  // Derived here from the kind the screen already passes, so no call site has to learn about
+  // sealing. What this needs is not where the case is stored but whether a signer can be
+  // reached, and `sealAvailability` is the only place that difference is worked out —
+  // `requestSeal` reads the same function, so the button and the request cannot disagree.
+  //
+  // This was `repositoryKind !== 'local'`, which answered the storage question. It was right
+  // to stop testing for `=== 'firebase'` — the platform API holds the key and runs the same
+  // `sealCase` the callable does — but the replacement swung the other way and told every
+  // Firebase session it could seal, on a project where no callable is deployed.
+  const availability = sealAvailability(repositoryKind);
+  const copy = { state, availability };
   const headline = sealHeadline(copy);
   const notice = sealNotice(copy);
   const action = sealActionLabel(copy);

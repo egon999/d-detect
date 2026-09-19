@@ -192,6 +192,7 @@ export const AuditActionEnum = z.enum([
   'SUGGESTION_ACCEPTED',
   'SUGGESTION_REJECTED',
   'PROCESSING_RETRIED',
+  'EVIDENCE_CLOUD_SYNCED',
   /**
    * A server sealed the case's audit chain — the one action in this list a client cannot
    * write. The seal is produced by a Cloud Function holding a key the device does not have,
@@ -202,6 +203,9 @@ export const AuditActionEnum = z.enum([
   'SEAL_CREATED',
 ]);
 export type AuditAction = z.infer<typeof AuditActionEnum>;
+
+export const CloudStatusEnum = z.enum(['SYNCED', 'PENDING', 'FAILED', 'LOCAL_ONLY']);
+export type CloudStatus = z.infer<typeof CloudStatusEnum>;
 
 /** Human-facing labels. Kept beside the enums so a new member cannot be added without one. */
 
@@ -344,7 +348,15 @@ export const AUDIT_ACTION_LABELS: Record<AuditAction, string> = {
   SUGGESTION_ACCEPTED: 'Suggestion accepted',
   SUGGESTION_REJECTED: 'Suggestion dismissed',
   PROCESSING_RETRIED: 'Processing retried',
+  EVIDENCE_CLOUD_SYNCED: 'Cloud backup synced',
   SEAL_CREATED: 'Record sealed',
+};
+
+export const CLOUD_STATUS_LABELS: Record<CloudStatus, string> = {
+  SYNCED: 'Backed up to cloud',
+  PENDING: 'Pending backup',
+  FAILED: 'Cloud backup failed',
+  LOCAL_ONLY: 'Stored on this device only',
 };
 
 /**

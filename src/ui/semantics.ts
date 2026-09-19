@@ -112,9 +112,39 @@ export const PROCESSING_TONE: Record<ProcessingState, Tone> = {
   CONFIRMED: 'ok',
 };
 
-/** True while the state is transient, i.e. the UI should show a spinner rather than a chip. */
+/**
+ * True while work is actually running, in this process, right now — the only condition under
+ * which a spinner or a pulse is a true statement.
+ *
+ * `QUEUED` used to be in this list and is the reason the predicate needs a docblock. Nothing in
+ * this app processes evidence in the background: `requestEvidenceProcessing` runs inline, in the
+ * screen that started it, and `reconcileInterruptedEvidence` says so at length. So a `QUEUED`
+ * row is a stored document that will sit unread until a person opens it and presses Process —
+ * and every surface reading this predicate gave it an animation that could never stop, on a case
+ * where nothing whatever was happening. An in-flight animation on a state nothing advances is
+ * the app telling the user to wait for work that is not queued behind anything.
+ *
+ * The two that remain are honest. A stranded `UPLOADING` is moved to `FAILED` on a cold start and
+ * a stranded `PROCESSING` is demoted to `QUEUED` by the same pass, so either one that survives
+ * belongs to a run that is genuinely live in this process.
+ *
+ * "Waiting, and nothing is working on it" is {@link isAwaitingProcessing}. It is a different
+ * sentence with a different affordance, and the two must not share a spinner.
+ */
 export function isProcessingInFlight(state: ProcessingState): boolean {
-  return state === 'UPLOADING' || state === 'QUEUED' || state === 'PROCESSING';
+  return state === 'UPLOADING' || state === 'PROCESSING';
+}
+
+/**
+ * True when the record is waiting for a person to start the work.
+ *
+ * Deliberately not folded into `needsHumanAction`. That one means "what was read cannot be relied
+ * on until someone checks it" and carries a warn tone; nothing has gone wrong here. This document
+ * has simply never been read, which is a task nobody has done yet rather than a fault — the same
+ * reading `attention.ts` gives it when it files an unread document as `INFO`.
+ */
+export function isAwaitingProcessing(state: ProcessingState): boolean {
+  return state === 'QUEUED';
 }
 
 /** True when the state means a person still has to act before the item is trustworthy. */

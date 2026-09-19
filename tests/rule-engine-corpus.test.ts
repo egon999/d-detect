@@ -130,8 +130,14 @@ describe('findings the demonstration relies on', () => {
   it('notices the required event nothing evidences', () => {
     const missing = findings.find((result) => result.resultType === 'MISSING_EVIDENCE')!;
     expect(missing.relatedEventIds).toEqual(['evt_sample_due']);
-    // The finding suggests a concrete document rather than just reporting a gap.
-    expect(missing.explanation).toMatch(/bank statement|receipt|confirmation/i);
+    // The finding suggests a concrete document rather than just reporting a gap — and the
+    // suggestion belongs in the caveat, not the observation. `explanation` states what the
+    // records show; naming the document that would close the gap is advice about what to do
+    // next, which is what the split is for. Asserted on the field directly rather than on
+    // `caveat ?? explanation`, because a fallback would pass whichever field it landed in and
+    // so would stop pinning the thing this test exists to pin.
+    expect(missing.caveat).toMatch(/bank statement|receipt|confirmation/i);
+    expect(missing.explanation).not.toMatch(/bank statement|receipt|confirmation/i);
   });
 
   it('flags the verbal agreement nobody can produce a record of', () => {

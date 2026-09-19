@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyChanges } from '@data/repository';
+import { applyChanges, MAX_ATOMIC_CHANGES } from '@data/repository';
 import {
   aiSuggestionSchema,
   analysisResultSchema,
@@ -278,6 +278,141 @@ describe('planCaseHandover', () => {
   });
 });
 
+/**
+ * Pressing Move twice.
+ *
+ * `handOverDeviceCase` can fail after the batch has landed but before its acknowledgement
+ * arrives, and the screen's only offer is to press Move again with a fresh `Date.now()`. So a
+ * second attempt at the same handover is an ordinary path, not an edge case, and it has two
+ * separate ways to go wrong: a second entry in the trail saying the case was moved again, or —
+ * once the id is stable but the bytes are not — an update to an append-only document that
+ * `unchanged()` in `rules/firestore.rules` refuses, taking the whole atomic batch with it and
+ * stranding the case on the device for good.
+ *
+ * Both are tested against a *different clock*, because the clock is the only thing that differs
+ * between two attempts at one handover.
+ */
+describe('planCaseHandover on a retry', () => {
+  const source = deviceWorkspace();
+  const first = planCaseHandover(DEVICE, ACCOUNT, CASE_ID, source, 9_000);
+  const retry = planCaseHandover(DEVICE, ACCOUNT, CASE_ID, source, 4_000_000);
+
+  const handoverEntries = (space: Workspace) =>
+    space.auditLogs.filter((item) => item.metadata['source'] === 'device-storage');
+
+  const auditChange = (plan: ReturnType<typeof planCaseHandover>) =>
+    plan.changes.find(
+      (change) =>
+        change.op === 'put' &&
+        change.collection === 'auditLogs' &&
+        change.record.metadata['source'] === 'device-storage',
+    );
+
+  it('writes the same handover document byte for byte whatever the clock says', () => {
+    // Not merely the same id. `unchanged()` is deep equality of the whole document, and the
+    // rule's own comment rests on this function reproducing the same bytes rather than the
+    // same shape. A stable id with a moving `createdAt` is the unwritable-retry failure.
+    expect(auditChange(retry)).toEqual(auditChange(first));
+  });
+
+  it('lets the clock reach exactly one field of one row', () => {
+    // The case record is a mutable row whose collection permits an ordinary owner update, so
+    // its `updatedAt` should record the write. Nothing else may differ between two attempts.
+    expect(retry.caseRecord.updatedAt).toBe(4_000_000);
+    expect(first.caseRecord.updatedAt).toBe(9_000);
+    expect({ ...retry.caseRecord, updatedAt: 0 }).toEqual({ ...first.caseRecord, updatedAt: 0 });
+
+    const withoutCase = (plan: ReturnType<typeof planCaseHandover>) =>
+      plan.changes.filter((change) => change.collection !== 'cases');
+    expect(withoutCase(retry)).toEqual(withoutCase(first));
+  });
+
+  it('leaves one record of the move after both attempts are committed', () => {
+    // The end state a user sees. `buildAuditChain` hashes each entry over the one before it, so
+    // two entries here would not merely repeat themselves — the history would assert that the
+    // case was moved twice.
+    const committed = workspaceSchema.parse(
+      applyChanges(applyChanges(emptyWorkspace(), first.changes), retry.changes),
+    );
+    expect(handoverEntries(committed)).toHaveLength(1);
+    expect(committed.auditLogs).toHaveLength(2);
+  });
+
+  it('timestamps the entry from the records it moved rather than from the clock', () => {
+    const entry = handoverEntries(plannedWorkspace(first))[0]!;
+
+    // The latest stamp on any row crossing — here the case's own `updatedAt` of 5_000 — which
+    // is the tightest instant this function can prove the handover was at or after, and the
+    // only candidate that is a pure function of the plan. An honest lower bound, deliberately
+    // preferred over an exact time that makes the entry either duplicated or unwritable.
+    expect(entry.createdAt).toBe(5_000);
+    expect(entry.updatedAt).toBe(5_000);
+    expect(entry.createdAt).not.toBe(9_000);
+
+    // And it sorts last in the case's own history, because it is at or after everything that
+    // crossed with it. An entry about the move that reads as older than the records it moved
+    // would put the trail in an order that never happened.
+    for (const other of plannedWorkspace(first).auditLogs) {
+      if (other.id === entry.id) continue;
+      expect(entry.createdAt).toBeGreaterThanOrEqual(other.createdAt);
+    }
+  });
+
+  it('gives a handover that carries a different set of rows its own entry', () => {
+    // Two attempts that move the same rows are one handover. A later move that carries a row
+    // the first did not is a different event, and pretending otherwise would overwrite the
+    // record of the first with a claim about rows it never touched.
+    const withExtra = deviceWorkspace({
+      claims: [
+        claim('INR 45,000 is still owed', { id: 'clm_balance', ownerId: DEVICE }),
+        claim('Added after the first attempt', { id: 'clm_later', ownerId: DEVICE }),
+      ],
+    });
+    const later = planCaseHandover(DEVICE, ACCOUNT, CASE_ID, withExtra, 9_000);
+
+    expect(auditChange(later)).not.toEqual(auditChange(first));
+    const committed = workspaceSchema.parse(
+      applyChanges(applyChanges(emptyWorkspace(), first.changes), later.changes),
+    );
+    expect(handoverEntries(committed)).toHaveLength(2);
+  });
+
+  it('cannot confuse the owner it came from with the owner it went to', () => {
+    /*
+      `deterministicId` SORTS its parts before hashing, so the id is a function of the multiset
+      rather than of the tuple. Feeding it bare ids would make a move from A to B and a move
+      from B to A the same multiset and therefore the same document — one overwriting the
+      other's record of the opposite event.
+
+      Every part is prefixed with what it is, and `ID_PATTERN` forbids `:` inside an id, so
+      `from:x` can never be read as `to:x` and the sorted multiset still determines the tuple
+      it came from.
+    */
+    const onlyTheCase = (ownerId: string) =>
+      workspace({
+        cases: [testCase({ ownerId, updatedAt: 5_000 })],
+        evidence: [],
+        events: [],
+        claims: [],
+        relationships: [],
+        analysisResults: [],
+        auditLogs: [],
+        processingJobs: [],
+        aiSuggestions: [],
+        caseAnalyses: [],
+      });
+
+    const out = planCaseHandover(DEVICE, ACCOUNT, CASE_ID, onlyTheCase(DEVICE), NOW);
+    const back = planCaseHandover(ACCOUNT, DEVICE, CASE_ID, onlyTheCase(ACCOUNT), NOW);
+
+    const idOf = (plan: ReturnType<typeof planCaseHandover>) => {
+      const change = auditChange(plan)!;
+      return change.op === 'put' ? change.record.id : '';
+    };
+    expect(idOf(out)).not.toBe(idOf(back));
+  });
+});
+
 describe('planCaseHandover boundaries', () => {
   it('drops a storage path it cannot rewrite instead of pointing it into another account', () => {
     // A path from a different scheme cannot be rewritten safely — guessing could produce a
@@ -344,9 +479,12 @@ describe('planCaseHandover boundaries', () => {
     expect(moved.claims[0]).toMatchObject({ id: 'clm_removed', ownerId: ACCOUNT, deletedAt: 7_000 });
   });
 
-  it('refuses a case too large for one batch without emitting a partial plan', () => {
-    // Firestore caps a batch at 500 writes. Splitting the handover would leave a half-moved
-    // case on a failure, so an oversized case is refused outright and stays on the device.
+  it('caps a handover at exactly what one batch commits atomically', () => {
+    // The cap is asserted against `MAX_ATOMIC_CHANGES` rather than a literal on purpose. It
+    // was a literal — 450, chosen to sit under Firestore's 500-write batch limit — while the
+    // Firestore adapter sliced at 400, so a case between the two committed as two batches and
+    // a failure on the second left the half-moved case this test claims to rule out. Pinning a
+    // number here would have passed throughout. Pinning the relationship is what catches it.
     const many = (count: number) =>
       deviceWorkspace({
         cases: [testCase({ ownerId: DEVICE })],
@@ -363,14 +501,19 @@ describe('planCaseHandover boundaries', () => {
         caseAnalyses: [],
       });
 
-    // 448 claims + the case + the handover audit entry = 450, the cap exactly.
-    expect(planCaseHandover(DEVICE, ACCOUNT, CASE_ID, many(448), NOW).changes).toHaveLength(450);
+    // Each workspace above contributes the case and the handover audit entry on top of claims.
+    const atCap = MAX_ATOMIC_CHANGES - 2;
+    expect(planCaseHandover(DEVICE, ACCOUNT, CASE_ID, many(atCap), NOW).changes).toHaveLength(
+      MAX_ATOMIC_CHANGES,
+    );
 
-    const oversized = many(449);
+    const oversized = many(atCap + 1);
     const before = JSON.stringify(oversized);
     expect(() => planCaseHandover(DEVICE, ACCOUNT, CASE_ID, oversized, NOW)).toThrow(
       /too large to move in one step/,
     );
+    // The refusal has to leave the device copy exactly as it was: the error message promises
+    // the case is still there, and that promise is the reason refusing beats splitting.
     expect(JSON.stringify(oversized)).toBe(before);
   });
 });

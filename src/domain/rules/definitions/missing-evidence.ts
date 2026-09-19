@@ -57,9 +57,12 @@ export const missingEvidenceRule: Rule = {
           key: [claim.id, eventId],
           title: `"${event.title}" has nothing to show it happened`,
           explanation:
-            `The claim "${claim.statement}" depends on the event "${event.title}", but no evidence ` +
-            `is attached to that event. To close this gap, add ${suggestion}, then link it to the ` +
-            `event. Until then this part of the case rests on your account alone.`,
+            `The claim "${claim.statement}" depends on the event "${event.title}", but no ` +
+            `evidence is attached to that event.`,
+          caveat:
+            `Until something is attached, this part of the case rests on your account alone. ` +
+            `To close the gap, add ${suggestion}, then link it to the event. A gap here is not ` +
+            `a sign the account is wrong — only that nothing else has been filed that speaks to it.`,
           confidence: 'NEEDS_REVIEW',
           relatedClaimIds: [claim.id],
           relatedEventIds: [eventId],

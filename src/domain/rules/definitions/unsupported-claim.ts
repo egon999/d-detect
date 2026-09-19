@@ -38,10 +38,11 @@ export const unsupportedClaimRule: Rule = {
       findings.push({
         key: [claim.id],
         title: 'This claim has no supporting evidence',
-        explanation:
-          `"${claim.statement}" is not linked to any evidence. That does not mean it is wrong — ` +
-          `it means nothing in this case currently backs it up. Upload a document that shows it, ` +
-          `then link that document to this claim with a "Supports" relationship.`,
+        explanation: `"${claim.statement}" is not linked to any evidence.`,
+        caveat:
+          'That does not mean it is wrong — it means nothing in this case currently backs it ' +
+          'up. Upload a document that shows it, then link that document to this claim with a ' +
+          '"Supports" relationship.',
         confidence: 'NEEDS_REVIEW',
         relatedClaimIds: [claim.id],
         inputs: {

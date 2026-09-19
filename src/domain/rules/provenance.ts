@@ -205,6 +205,17 @@ export interface Quarantine {
   severity: Severity;
   confidence: MatchConfidence;
   explanation: string;
+  /**
+   * The rule's own caveat, with the quarantine's appended to it when one applies.
+   *
+   * This used to be glued onto `explanation` with a `\n\n`, which had two costs. The card
+   * clips `explanation`, so the hedge — the one part of a finding that tells a reader not to
+   * trust it — was the first thing truncation ate. And `ProvisionalPrompt` renders its own
+   * wording of the same warning immediately below, so on every provisional card the reader
+   * got the message twice: once cut off mid-sentence in grey body text, once again in the
+   * tinted box. Keeping it separate is what lets the card show each thing once.
+   */
+  caveat: string;
 }
 
 /** "the amount on Invoice.jpg (read as "₹7,500")" — names what to check, and what it currently says. */
@@ -233,6 +244,7 @@ export function quarantineFinding(rule: Rule, finding: RuleFinding, context: Rul
     severity,
     confidence: finding.confidence,
     explanation: finding.explanation,
+    caveat: finding.caveat ?? '',
   };
 
   if (!isContradictionType(rule.resultType)) return unchanged;
@@ -245,16 +257,22 @@ export function quarantineFinding(rule: Rule, finding: RuleFinding, context: Rul
   const named = joinWithAnd(reads.slice(0, 3).map((read) => describeRead(read, context)));
   const more = reads.length > 3 ? `, and ${reads.length - 3} more` : '';
 
+  // The rule's own caveat first, then the quarantine's — in that order because the rule knows
+  // something specific about *this* comparison and the quarantine only knows how the values
+  // got here. A reader who opens the caveat should meet the particular doubt before the
+  // general one.
+  const quarantineCaveat =
+    `This comparison used ${named}${more}, which was read from an image rather than from ` +
+    `text in the file. Image reading can mistake one digit for another, so this may not be ` +
+    `a real disagreement at all. Confirm the reading and this finding will either firm up or go away.`;
+
   return {
     provisional: true,
     unconfirmedReads: reads,
     severity: DEMOTED[severity],
     // Never EXACT or STRONG. Whatever the rule believed, it was comparing a guess.
     confidence: 'NEEDS_REVIEW',
-    explanation:
-      `${finding.explanation}\n\n` +
-      `This comparison used ${named}${more}, which was read from an image rather than from ` +
-      `text in the file. Image reading can mistake one digit for another, so this may not be ` +
-      `a real disagreement at all. Confirm the reading and this finding will either firm up or go away.`,
+    explanation: finding.explanation,
+    caveat: finding.caveat ? `${finding.caveat}\n\n${quarantineCaveat}` : quarantineCaveat,
   };
 }

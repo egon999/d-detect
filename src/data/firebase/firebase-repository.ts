@@ -50,31 +50,24 @@ import {
 
 import {
   COLLECTIONS,
-  aiSuggestionSchema,
-  analysisResultSchema,
-  auditLogSchema,
-  caseAnalysisSchema,
-  caseEventSchema,
   caseSchema,
-  claimSchema,
   emptyWorkspace,
-  evidenceSchema,
-  processingJobSchema,
-  relationshipSchema,
-  sealSchema,
   userProfileSchema,
-  workspaceSchema,
   type Case,
   type UserProfile,
   type Workspace,
 } from '../../domain/models';
 import {
   assertOwnership,
+  MAX_ATOMIC_CHANGES,
+  Skipped,
   WORKSPACE_COLLECTIONS,
   type Change,
   type CommitDurability,
   type CommitOutcome,
+  type Parseable,
   type Repository,
+  type SkipSource,
   type Unsubscribe,
   type WorkspaceCollection,
 } from '../repository';
@@ -86,11 +79,20 @@ import {
 } from './config';
 
 /**
- * Firestore's hard limit is 500 writes per batch. Staying well under it leaves room for
- * the audit entry a mutation appends, and a smaller batch is also a smaller retry on
- * failure — the pipeline is idempotent, so a partial commit is recoverable.
+ * How many writes go in one batch, and one page of a paged delete.
+ *
+ * Firestore's hard limit is 500. This is the port's `MAX_ATOMIC_CHANGES` rather than its own
+ * number so the two cannot drift — they did once, and the gap sat exactly under the handover
+ * planner's separate ceiling, which is how a case sized between them could be moved into an
+ * account as two non-atomic halves.
+ *
+ * A longer change set is still committed, in slices, because refusing it here would strand
+ * records the caller has already decided to write. It is not atomic, and it is not reliably
+ * retryable either: `rules/firestore.rules` gives `processingJobs`, `caseAnalyses` and
+ * `auditLogs` `allow update: if false`, so re-running a partly-applied batch is denied rather
+ * than absorbed. A caller that needs all-or-nothing keeps its change set inside the bound.
  */
-const MAX_BATCH_WRITES = 400;
+const MAX_BATCH_WRITES = MAX_ATOMIC_CHANGES;
 
 /**
  * How long a commit waits for the server before it reports the write as queued.
@@ -107,29 +109,6 @@ const MAX_BATCH_WRITES = 400;
  * data that is already safely on their phone.
  */
 export const COMMIT_ACK_TIMEOUT_MS = 10_000;
-
-/**
- * The schema each workspace collection's documents are read through.
- *
- * `workspaceSchema` validates the assembled object, which is all-or-nothing: one document
- * written by an older build fails the parse and takes the entire case — or, through
- * `loadAllWorkspace`, the entire account — with it. Reading a collection through its own
- * record schema is what lets a single bad row be skipped the way `listCases` and
- * `watchCases` already skip one.
- */
-const RECORD_SCHEMAS: Record<WorkspaceCollection, Parseable> = {
-  cases: caseSchema,
-  claims: claimSchema,
-  events: caseEventSchema,
-  evidence: evidenceSchema,
-  relationships: relationshipSchema,
-  analysisResults: analysisResultSchema,
-  auditLogs: auditLogSchema,
-  processingJobs: processingJobSchema,
-  aiSuggestions: aiSuggestionSchema,
-  caseAnalyses: caseAnalysisSchema,
-  seals: sealSchema,
-};
 
 export class FirebaseRepository implements Repository {
   readonly kind = 'firebase' as const;
@@ -205,7 +184,7 @@ export class FirebaseRepository implements Repository {
    * that is the difference that matters on a phone.
    */
   async loadWorkspace(ownerId: string, caseId: string): Promise<Workspace> {
-    const skipped = new Skipped();
+    const skipped = new Skipped(FIRESTORE_SKIPS);
 
     const [caseDocument, scoped] = await Promise.all([
       getDoc(doc(this.db, COLLECTIONS.cases, caseId)),
@@ -262,7 +241,7 @@ export class FirebaseRepository implements Repository {
    * can match.
    */
   async loadAllWorkspace(ownerId: string): Promise<Workspace> {
-    const skipped = new Skipped();
+    const skipped = new Skipped(FIRESTORE_SKIPS);
 
     const owned = await Promise.all(
       WORKSPACE_COLLECTIONS.map(async (name) => {
@@ -299,7 +278,9 @@ export class FirebaseRepository implements Repository {
   // -------------------------------------------------------------------------
 
   /**
-   * Applies changes as one unit.
+   * Applies changes as one unit, up to `MAX_BATCH_WRITES`. Past that the loop below issues
+   * one batch per slice, which is no longer all-or-nothing — see that constant for what a
+   * caller needing atomicity has to do about it.
    *
    * Ownership is asserted before anything is sent. Security Rules are the real boundary
    * and will reject a foreign write regardless — this exists so the failure is a clear
@@ -422,6 +403,49 @@ export class FirebaseRepository implements Repository {
     await deleteDoc(doc(this.db, COLLECTIONS.users, ownerId));
   }
 
+  /**
+   * Terminates this client and drops the on-disk cache behind it.
+   *
+   * `clear` above empties the account. It does not empty the device: Firestore's persistent
+   * cache holds a copy of every document this client has read, `extraction.sourceText`
+   * included, and `eraseEverything`'s own docblock names "the full extracted text of every
+   * document that was ever read" as exactly the material a user is asking to be rid of. The
+   * AsyncStorage sweep and the file shred in that function cannot reach this store; nothing
+   * could, until this method existed.
+   *
+   * Ordering is a correctness requirement, not a preference. `clearIndexedDbPersistence`
+   * drops pending writes along with cached documents, so running it before the deletions in
+   * `clear` were acknowledged would discard them and leave the account populated while the
+   * user was told it had been emptied. `clear` awaits `batch.commit()` per page (see the loop
+   * above), which resolves on *server* acknowledgement — so by the time this runs there is
+   * nothing outstanding to throw away. A future change that stops awaiting those commits
+   * would silently break this.
+   *
+   * Both steps are best-effort. A cache that will not clear is worth reporting nowhere and
+   * failing nothing: the account is already empty, the files are already shredded, and an
+   * exception here would tell a user whose erase succeeded that it had not.
+   */
+  async dropLocalCache(): Promise<void> {
+    // `cached` is released first and unconditionally. Everything below leaves the client
+    // unusable whether it throws or not, and a terminated instance left in the module
+    // singleton would be handed to the next caller of `createFirebaseRepository` — turning a
+    // best-effort cleanup into every subsequent read failing.
+    if (cached === this) cached = null;
+
+    try {
+      const { terminate, clearIndexedDbPersistence } = await import('firebase/firestore');
+      // Required, not merely tidy: clearing rejects with `failed-precondition` while the
+      // instance is still running.
+      await terminate(this.db);
+      await clearIndexedDbPersistence(this.db);
+    } catch (error) {
+      console.warn(
+        '[firestore] cached copies could not be dropped:',
+        error instanceof Error ? error.message : 'unknown',
+      );
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Subscriptions
   // -------------------------------------------------------------------------
@@ -443,6 +467,24 @@ export class FirebaseRepository implements Repository {
    * settle below the first emission never happens no matter how many of the other ten
    * collections are fine. `settled` is the latch over that: the load ends exactly once,
    * either because every slice arrived or because one collection said it never would.
+   *
+   * ## A drifted row is not a failed subscription
+   *
+   * Each slice is validated document by document in `receive`, the way `loadWorkspace`
+   * validates a query. Handing the assembled object to `workspaceSchema` is what this did
+   * before, and it made every snapshot all-or-nothing against a case that `loadWorkspace`
+   * had just opened by skipping the same rows: the case appeared, then the first snapshot
+   * after it replaced the screen with an error, permanently, over one document an older
+   * build had written — and no screen can reach a document the app refuses to read, so
+   * there was nothing the user could delete to get back in.
+   *
+   * `onError` therefore reports only what a listener can actually report: that it is gone
+   * (permission denied, no network, a token that expired). That path is untouched.
+   *
+   * Validating per snapshot rather than per emission is also what keeps the re-render cheap.
+   * An emission covers eleven slices; a snapshot covers one. Evidence carries the full source
+   * text of every document in the case, so re-parsing the whole workspace each time any one
+   * collection changed is the cost this method is built to avoid.
    */
   watchWorkspace(
     ownerId: string,
@@ -470,21 +512,31 @@ export class FirebaseRepository implements Repository {
 
     const emit = () => {
       if (!active || !settled) return;
-      const shape: Record<string, unknown> = {};
-      for (const [name, records] of slices) shape[name] = records;
-
-      const parsed = workspaceSchema.safeParse(shape);
-      if (!parsed.success) {
-        onError?.(new Error('A change arrived that does not match the expected shape'));
-        return;
-      }
-      onChange(parsed.data);
+      // Assembled directly, as in `loadWorkspace`: every row held in `slices` has already been
+      // through its own schema, so there is nothing left for a second parse to learn.
+      //
+      // The slices are copied rather than handed out. `slices` outlives the emission — a
+      // snapshot on one collection re-emits the other ten as they stand — and the other two
+      // adapters both re-read their store per emission, so a consumer that sorts an array in
+      // place would find the three behaving differently and only here.
+      const workspace = emptyWorkspace();
+      const slots = workspace as Record<WorkspaceCollection, unknown[]>;
+      for (const [name, records] of slices) slots[name] = [...records];
+      onChange(workspace);
     };
 
-    /** Records one collection's slice, then emits once every collection has reported. */
+    /**
+     * Records one collection's slice, then emits once every collection has reported.
+     *
+     * The tally is per snapshot rather than kept across the subscription. Firestore re-sends a
+     * whole query result whenever anything in it changes, so a running total would re-count the
+     * same stale row on every edit and report a case losing records it had already lost once.
+     */
     const receive = (name: WorkspaceCollection, records: unknown[]) => {
       if (!active) return;
-      slices.set(name, records);
+      const skipped = new Skipped(FIRESTORE_SKIPS);
+      slices.set(name, skipped.keep(name, records));
+      skipped.report('a case update');
       if (!settled) {
         pending -= 1;
         if (pending === 0) settled = true;
@@ -702,40 +754,20 @@ function parseOrNull<T>(schema: Parseable<T>, data: unknown, path: string): T | 
   return null;
 }
 
-/** What a boundary parse needs of a zod schema, and nothing more. */
-interface Parseable<T = unknown> {
-  safeParse: (value: unknown) => { success: true; data: T } | { success: false };
-}
-
 /**
  * Reads a collection's documents, dropping the ones that will not parse, and keeps a tally.
  *
- * `parseOrNull` already warns per document, which names the collection but says nothing
- * about scale — one skipped row and four hundred read the same in a log. The tally is the
- * number that tells those apart, and it is the number worth acting on.
+ * The class is `Skipped`, on the port beside `RECORD_SCHEMAS`, because this adapter and the two
+ * others face the same drift for the same reason — Firestore is schemaless and the device keys
+ * are versioned with nothing behind the version — and the copies of it had begun to differ in
+ * ways nobody had decided on. What is adapter-specific is the wording, and only that: Firestore
+ * stores documents where the other two store records, and `[firestore]` is what tells a
+ * developer reading a log which store lost the row.
+ *
+ * `parseOrNull` stays for the three reads that are not a collection sweep — a profile, the case
+ * list, a single document — and emits the identical per-document line.
  */
-class Skipped {
-  count = 0;
-
-  keep(name: WorkspaceCollection, records: readonly unknown[]): unknown[] {
-    const kept: unknown[] = [];
-    for (const record of records) {
-      const parsed = parseOrNull(RECORD_SCHEMAS[name], record, name);
-      if (parsed === null) this.count += 1;
-      else kept.push(parsed);
-    }
-    return kept;
-  }
-
-  /** `scope` names what was being read, never which case or whose. */
-  report(scope: string): void {
-    if (this.count === 0) return;
-    console.warn(
-      `[firestore] read ${scope} with ${this.count} unreadable document(s) skipped; ` +
-        'those records are not visible in the app',
-    );
-  }
-}
+const FIRESTORE_SKIPS: SkipSource = { adapter: 'firestore', noun: 'document' };
 
 /**
  * Waits for a batch's server acknowledgement, giving up after `COMMIT_ACK_TIMEOUT_MS`.

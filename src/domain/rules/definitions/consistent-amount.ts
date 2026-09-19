@@ -112,11 +112,12 @@ export const consistentAmountRule: Rule = {
           key: [group.key, 'amount-agreement', amountKey],
           title: `${entries.length} documents agree on ${formatted}`,
           explanation:
-            `${labels.map((label) => `"${label}"`).join(' and ')} each record ${formatted}. ` +
-            `They were compared because ${group.reason}. These are separate documents rather ` +
-            `than copies of one file, so the figure is supported from more than one source. ` +
-            `That the amounts agree does not establish that the payment took place — only that ` +
-            `these documents do not disagree about it.`,
+            `${labels.map((label) => `"${label}"`).join(' and ')} each record ${formatted}, and ` +
+            `they are separate documents rather than copies of one file.`,
+          caveat:
+            `They were compared because ${group.reason}. That the amounts agree does not ` +
+            `establish that the payment took place — only that these documents do not ` +
+            `disagree about it.`,
           confidence: group.confidence,
           severity: 'INFO',
           supportingEvidenceIds: ids,

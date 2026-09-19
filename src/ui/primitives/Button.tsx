@@ -24,7 +24,7 @@ import React from 'react';
 import { ActivityIndicator, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 
 import { Icon, type IconName } from '../icon';
-import { BORDER_WIDTH, HIT_TARGET, SPACING, type Tone } from '../tokens';
+import { BORDER_WIDTH, CONTROL_SCALE_CAP, HIT_TARGET, SPACING, type Tone } from '../tokens';
 import { useTheme } from '../theme';
 import { Pressable } from './Layout';
 import { Text } from './Text';
@@ -63,11 +63,36 @@ interface VariantSkin {
  * cramped rather than as a control. The padding steps are now the scale's real 16/20/24,
  * which is the same geometry as before the re-cut — they only *look* larger because `xl`
  * and `xxl` moved up a step with `sm` and `md`.
+ *
+ * `paddingVertical` is derived from `height` rather than chosen beside it: `md` is 12 because
+ * `subheading`'s 24pt line box with 12 above and below is exactly the 48 this button was drawn
+ * at, and `lg` is 16 for the same reason at 56. `sm` lands half a point short of 40 and
+ * `minHeight` rounds it back. Deriving it is what makes the box grow *correctly* — a second
+ * line, or a line magnified by the OS font scale, keeps the air the designer drew instead of
+ * pressing the text against the pill's edge, which is all a fixed height could offer.
  */
 const DIMENSIONS = {
-  sm: { height: 40, paddingHorizontal: SPACING.lg, gap: SPACING.sm, icon: 16 },
-  md: { height: 48, paddingHorizontal: SPACING.xl, gap: SPACING.sm, icon: 18 },
-  lg: { height: 56, paddingHorizontal: SPACING.xxl, gap: SPACING.md, icon: 20 },
+  sm: {
+    height: 40,
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: SPACING.sm,
+    gap: SPACING.sm,
+    icon: 16,
+  },
+  md: {
+    height: 48,
+    paddingHorizontal: SPACING.xl,
+    paddingVertical: SPACING.md,
+    gap: SPACING.sm,
+    icon: 18,
+  },
+  lg: {
+    height: 56,
+    paddingHorizontal: SPACING.xxl,
+    paddingVertical: SPACING.lg,
+    gap: SPACING.md,
+    icon: 20,
+  },
 };
 
 export function Button({
@@ -105,7 +130,24 @@ export function Button({
         <Icon name={icon} size={dimensions.icon} color={skin.icon} />
       ) : null}
 
-      <Text variant={textVariant} style={[styles.label, { color: skin.label }]} numberOfLines={1}>
+      <Text
+        variant={textVariant}
+        style={[styles.label, { color: skin.label }]}
+        // Two lines, not one. At 375pt — the most common phone width — a `fullWidth` md button
+        // leaves its label 227pt, and "Continue without an account" wants 238 at the *default*
+        // font size, so the sign-in screen's own escape hatch rendered as "Continue without an
+        // acco…" for everybody. Truncation is the worst of the failures available here: it is
+        // silent, it takes the end of the sentence rather than the middle, and the user taps
+        // the button anyway. With `minHeight` and derived padding below, a second line costs a
+        // taller button and nothing else.
+        numberOfLines={2}
+        // Width is the one axis a button cannot grow in, which is what this ceiling is for
+        // rather than the height. Two lines at 1.5 holds every label this product ships even
+        // on a 320pt screen; `subheading`'s own 1.7 does not. A label that defeats both is a
+        // copy problem, and it now surfaces as an ellipsis on the second line rather than the
+        // first.
+        maxFontSizeMultiplier={CONTROL_SCALE_CAP}
+      >
         {label}
       </Text>
 
@@ -119,8 +161,12 @@ export function Button({
     // `minHeight`, not `height`: `allowFontScaling` is on across the app, and a fixed 40/48/56
     // box clips its own label the moment the OS font scale goes up. A button that grows is
     // ugly on one screen; a button whose label is cut in half is unusable.
+    //
+    // The padding is what actually defines the box now — at rest it reproduces these heights
+    // exactly (see `DIMENSIONS`), so `minHeight` is a floor rather than the mechanism.
     minHeight: dimensions.height,
     paddingHorizontal: dimensions.paddingHorizontal,
+    paddingVertical: dimensions.paddingVertical,
     gap: dimensions.gap,
     borderRadius,
   };
@@ -326,6 +372,10 @@ export function SegmentedControl<T extends string>({
               variant="label"
               style={{ color: selected ? theme.colors.text : theme.colors.textTertiary }}
               numberOfLines={1}
+              // A segmented control has to stay a row of segments. Three labels at `label`'s
+              // own 1.8 ceiling do not fit one line on a phone, and the control degrades into
+              // three stacked pills that no longer read as a choice between alternatives.
+              maxFontSizeMultiplier={CONTROL_SCALE_CAP}
             >
               {option.label}
             </Text>
@@ -345,7 +395,10 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   fullWidth: { alignSelf: 'stretch' },
-  label: { flexShrink: 1 },
+  // `textAlign` matters only once the label wraps. A single line is shrink-to-fit inside a
+  // row that already centres it, so this is invisible at rest; on two lines it is the
+  // difference between a centred button and one with a ragged right edge.
+  label: { flexShrink: 1, textAlign: 'center' },
   iconButton: {
     width: HIT_TARGET,
     height: HIT_TARGET,
@@ -366,9 +419,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: SPACING.sm,
-    height: 40,
+    // `minHeight`, like the button above. A segment carries a label and no vertical padding,
+    // so a fixed 40 is the label's own box with nothing to spare.
+    minHeight: 40,
     paddingHorizontal: SPACING.lg,
-    minHeight: 0,
   },
   segmentFill: { flex: 1 },
 });

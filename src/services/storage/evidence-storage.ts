@@ -51,8 +51,12 @@
 
 import { Platform } from 'react-native';
 
-import { idSchema } from '@domain/models';
+import { idSchema, type CloudStatus, type Evidence, type EvidenceKind } from '@domain/models';
+import { newId } from '@domain/ids';
+import type { PickedFile } from '../ingestion/types';
 
+import { getCloudinaryConfig, mirrorToCloud } from './cloudinary';
+import { enqueueCloudSync } from './cloud-sync-queue';
 import { COPY_CHUNK_BYTES, copyWithDigest } from './stream-copy';
 
 /**
@@ -113,14 +117,31 @@ export function isEvidenceFileError(error: unknown): error is EvidenceFileError 
  */
 const WRITE_CHUNK_BYTES = COPY_CHUNK_BYTES;
 
+function resolveEvidenceKind(mimeType: string, name: string): EvidenceKind {
+  const extension = name.split('.').pop()?.toLowerCase() ?? '';
+  if (mimeType.startsWith('image/') || /^(png|jpe?g|webp|heic|gif)$/.test(extension)) return 'IMAGE';
+  if (extension === 'pdf') return 'PDF';
+  if (mimeType.startsWith('audio/') || /^(mp3|wav|m4a|ogg|flac)$/.test(extension)) return 'AUDIO';
+  if (mimeType.startsWith('video/') || /^(mp4|mov|webm|mkv)$/.test(extension)) return 'VIDEO';
+  if (/^(docx|doc|odt|rtf)$/.test(extension)) return 'DOCUMENT';
+  if (/^(csv|tsv|xlsx|xls)$/.test(extension)) return 'SPREADSHEET';
+  if (extension === 'eml') return 'EMAIL';
+  if (mimeType.startsWith('text/') || /^(txt|md|json|log)$/.test(extension)) return 'TEXT';
+  return 'OTHER';
+}
+
 export interface EvidenceUploadOptions {
   ownerId: string;
   caseId: string;
-  evidenceId: string;
-  uri: string;
-  name: string;
-  mimeType: string;
+  evidenceId?: string;
+  /** Pass either PickedFile or individual file attributes */
+  file?: PickedFile;
+  uri?: string;
+  name?: string;
+  mimeType?: string;
   sizeBytes?: number | null;
+  /** Whether to mirror to Cloud Storage / Cloudinary. Defaults to true if configured. */
+  mirrorToCloud?: boolean;
   /** 0..1, on real byte progress. A stalled write visibly stalls. */
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
@@ -132,6 +153,18 @@ export interface EvidenceUploadResult {
   sizeBytes: number;
   /** SHA-256 of the stored bytes, computed here and re-checkable later. See `verifyEvidenceFile`. */
   sha256: string;
+  /** Remote delivery / backup URL when mirrored to cloud */
+  cloudUrl?: string;
+  /** Remote public ID when mirrored to cloud */
+  cloudPublicId?: string;
+  /** Mirroring status */
+  cloudStatus: CloudStatus;
+  /** Human-readable explanation if cloud backup could not run */
+  cloudError?: string;
+  /** Evidence identifier */
+  evidenceId: string;
+  /** Domain Evidence entity for contract compliance */
+  evidence: Evidence;
 }
 
 export function evidenceStoragePath(ownerId: string, caseId: string, evidenceId: string, fileName: string): string {
@@ -222,21 +255,33 @@ async function nativeFile(storagePath: string, create: boolean) {
 export async function uploadEvidenceFile(options: EvidenceUploadOptions): Promise<EvidenceUploadResult> {
   if (options.signal?.aborted) throw new EvidenceFileError('Upload cancelled.');
 
-  const storagePath = evidenceStoragePath(options.ownerId, options.caseId, options.evidenceId, options.name);
+  const uri = options.file?.uri ?? options.uri;
+  const name = options.file?.name ?? options.name ?? 'evidence.bin';
+  const mimeType = options.file?.mimeType ?? options.mimeType ?? 'application/octet-stream';
+  const sizeBytes = options.file?.size ?? options.sizeBytes ?? null;
+  const evidenceId = options.evidenceId ?? newId('evd');
+
+  if (!uri) throw new EvidenceFileError('No file URI provided.');
+
+  const storagePath = evidenceStoragePath(options.ownerId, options.caseId, evidenceId, name);
 
   // Checked twice on purpose. The picker's reported size lets an oversized file be refused
   // before a single byte is moved; the check against the file's own size below catches a
   // picker that lied or reported nothing, which Android document providers do routinely.
-  if ((options.sizeBytes ?? 0) > MAX_EVIDENCE_UPLOAD_BYTES) {
+  if ((sizeBytes ?? 0) > MAX_EVIDENCE_UPLOAD_BYTES) {
     throw new EvidenceFileError('This file is over the 100 MB limit. Split it into smaller source files.');
   }
+
+  let storedSizeBytes: number;
+  let storedSha256: string;
+  let localUri: string;
 
   if (Platform.OS === 'web') {
     // Deliberately still whole-buffer. The browser store is IndexedDB, which takes a Blob —
     // the bytes have to be materialised to be stored at all, so streaming them would add a
     // pass without lowering the peak. The 100 MB ceiling is enforced the same way.
     const { readBytes, sha256Hex } = await import('../ingestion/read-file');
-    const bytes = await readBytes(options.uri);
+    const bytes = await readBytes(uri);
     if (bytes.length === 0) throw new EvidenceFileError('This file is empty, so there is nothing to store or read.');
     if (bytes.length > MAX_EVIDENCE_UPLOAD_BYTES) {
       throw new EvidenceFileError('This file is over the 100 MB limit. Split it into smaller source files.');
@@ -246,84 +291,189 @@ export async function uploadEvidenceFile(options: EvidenceUploadOptions): Promis
 
     const { putWebBlob } = await import('./web-blob-store');
     options.onProgress?.(0);
-    await putWebBlob(storagePath, bytes, options.mimeType);
+    await putWebBlob(storagePath, bytes, mimeType);
     options.onProgress?.(1);
-    return { storagePath, sizeBytes: bytes.length, sha256 };
-  }
 
-  const fs: FileSystem = await import('expo-file-system');
-  const source = new fs.File(options.uri);
+    storedSizeBytes = bytes.length;
+    storedSha256 = sha256;
+    localUri = uri;
+  } else {
+    const fs: FileSystem = await import('expo-file-system');
+    const source = new fs.File(uri);
 
-  // The source's own size, which is the figure every later check is made against. The
-  // picker's number is a hint; this is what is actually there.
-  if (!source.exists) {
-    throw new EvidenceFileError('The selected file is no longer available on this device. Select it again.');
-  }
-  const totalBytes = source.size;
-  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
-    throw new EvidenceFileError('This file is empty, so there is nothing to store or read.');
-  }
-  if (totalBytes > MAX_EVIDENCE_UPLOAD_BYTES) {
-    throw new EvidenceFileError('This file is over the 100 MB limit. Split it into smaller source files.');
-  }
-
-  const { file } = await nativeFile(storagePath, true);
-
-  // Overwrite rather than refuse. Reaching here twice for one evidence id means a retry after
-  // a failed or cancelled write, and the half-written file from that attempt has to go.
-  file.create({ overwrite: true, intermediates: true });
-
-  const reader = source.open();
-  let writer: import('expo-file-system').FileHandle | null = null;
-  let copied: { bytesCopied: number; sha256: string };
-  try {
-    writer = file.open();
-    copied = await copyWithDigest({
-      source: reader,
-      destination: writer,
-      totalBytes,
-      chunkBytes: WRITE_CHUNK_BYTES,
-      ...(options.signal ? { signal: options.signal } : {}),
-      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
-    });
-  } catch (error) {
-    // A partial file is worse than none: it would hash differently, extract as garbage, and
-    // look like a stored source. Remove it and let the queue retry. This is also the
-    // cancellation path — a stopped upload must leave nothing behind that later reads as
-    // stored evidence.
-    try {
-      if (file.exists) file.delete();
-    } catch {
-      // Nothing further to do — the copy already failed and this is cleanup.
+    // The source's own size, which is the figure every later check is made against. The
+    // picker's number is a hint; this is what is actually there.
+    if (!source.exists) {
+      throw new EvidenceFileError('The selected file is no longer available on this device. Select it again.');
     }
-    throw error instanceof Error ? error : new EvidenceFileError('The file could not be saved to this device.');
-  } finally {
-    // Both handles, in every outcome. A leaked handle on Android holds an open file
-    // descriptor for the lifetime of the process, and a few hundred of them across a long
-    // session is a hard failure with no diagnostic attached to it.
-    try {
-      writer?.close();
-    } catch {
-      // Closing a handle whose write already failed can itself throw; the copy's error is
-      // the one worth reporting.
+    const totalBytes = source.size;
+    if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+      throw new EvidenceFileError('This file is empty, so there is nothing to store or read.');
     }
+    if (totalBytes > MAX_EVIDENCE_UPLOAD_BYTES) {
+      throw new EvidenceFileError('This file is over the 100 MB limit. Split it into smaller source files.');
+    }
+
+    const { file } = await nativeFile(storagePath, true);
+
+    // Overwrite rather than refuse. Reaching here twice for one evidence id means a retry after
+    // a failed or cancelled write, and the half-written file from that attempt has to go.
+    file.create({ overwrite: true, intermediates: true });
+
+    const reader = source.open();
+    let writer: import('expo-file-system').FileHandle | null = null;
+    let copied: { bytesCopied: number; sha256: string };
     try {
-      reader.close();
-    } catch {
-      // As above.
+      writer = file.open();
+      copied = await copyWithDigest({
+        source: reader,
+        destination: writer,
+        totalBytes,
+        chunkBytes: WRITE_CHUNK_BYTES,
+        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+      });
+    } catch (error) {
+      // A partial file is worse than none: it would hash differently, extract as garbage, and
+      // look like a stored source. Remove it and let the queue retry. This is also the
+      // cancellation path — a stopped upload must leave nothing behind that later reads as
+      // stored evidence.
+      try {
+        if (file.exists) file.delete();
+      } catch {
+        // Nothing further to do — the copy already failed and this is cleanup.
+      }
+      throw error instanceof Error ? error : new EvidenceFileError('The file could not be saved to this device.');
+    } finally {
+      // Both handles, in every outcome. A leaked handle on Android holds an open file
+      // descriptor for the lifetime of the process, and a few hundred of them across a long
+      // session is a hard failure with no diagnostic attached to it.
+      try {
+        writer?.close();
+      } catch {
+        // Closing a handle whose write already failed can itself throw; the copy's error is
+        // the one worth reporting.
+      }
+      try {
+        reader.close();
+      } catch {
+        // As above.
+      }
+    }
+
+    if (file.size !== copied.bytesCopied) {
+      try {
+        file.delete();
+      } catch {
+        // Cleanup only.
+      }
+      throw new EvidenceFileError('The file was not saved completely. Check available storage and try again.');
+    }
+
+    storedSizeBytes = copied.bytesCopied;
+    storedSha256 = copied.sha256;
+    localUri = file.uri;
+  }
+
+  // 2. Cloud Storage / Cloudinary Mirroring
+  let cloudUrl: string | undefined;
+  let cloudPublicId: string | undefined;
+  let cloudStatus: CloudStatus = 'LOCAL_ONLY';
+  let cloudError: string | undefined;
+
+  const shouldMirror = options.mirrorToCloud ?? getCloudinaryConfig().isConfigured;
+
+  if (shouldMirror) {
+    const config = getCloudinaryConfig();
+    if (!config.isConfigured) {
+      cloudStatus = 'LOCAL_ONLY';
+      cloudError = 'Cloud backup is not set up for this build. Files are stored on this device only.';
+    } else {
+      try {
+        const cloudRes = await mirrorToCloud({
+          uri: localUri,
+          name,
+          mimeType,
+          sizeBytes: storedSizeBytes,
+          folder: `users/${options.ownerId}/cases/${options.caseId}`,
+          signal: options.signal,
+        });
+
+        if (cloudRes.ok) {
+          cloudStatus = 'SYNCED';
+          cloudUrl = cloudRes.url;
+          cloudPublicId = cloudRes.publicId;
+        } else {
+          cloudStatus = cloudRes.retryable ? 'PENDING' : 'FAILED';
+          cloudError = cloudRes.message;
+          if (cloudRes.retryable) {
+            await enqueueCloudSync({
+              ownerId: options.ownerId,
+              caseId: options.caseId,
+              evidenceId,
+              storagePath,
+              name,
+              mimeType,
+              sizeBytes: storedSizeBytes,
+              sha256: storedSha256,
+            });
+          }
+        }
+      } catch (err) {
+        cloudStatus = 'PENDING';
+        cloudError = err instanceof Error ? err.message : 'Network failure during cloud backup.';
+        await enqueueCloudSync({
+          ownerId: options.ownerId,
+          caseId: options.caseId,
+          evidenceId,
+          storagePath,
+          name,
+          mimeType,
+          sizeBytes: storedSizeBytes,
+          sha256: storedSha256,
+        });
+      }
     }
   }
 
-  if (file.size !== copied.bytesCopied) {
-    try {
-      file.delete();
-    } catch {
-      // Cleanup only.
-    }
-    throw new EvidenceFileError('The file was not saved completely. Check available storage and try again.');
-  }
+  // 3. Complete Domain Evidence Record
+  const evidence: Evidence = {
+    id: evidenceId,
+    ownerId: options.ownerId,
+    caseId: options.caseId,
+    title: options.name ?? options.file?.name ?? (name.replace(/\.[^/.]+$/, '').trim() || name),
+    kind: resolveEvidenceKind(mimeType, name),
+    state: 'QUEUED',
+    note: '',
+    fileName: name,
+    mimeType,
+    sizeBytes: storedSizeBytes,
+    storagePath,
+    sha256: storedSha256,
+    cloudUrl: cloudUrl ?? null,
+    cloudPublicId: cloudPublicId ?? null,
+    cloudStatus,
+    cloudSyncedAt: cloudStatus === 'SYNCED' ? Date.now() : null,
+    extraction: null,
+    confirmedFields: {},
+    confirmedAt: null,
+    failureReason: null,
+    deletedAt: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
 
-  return { storagePath, sizeBytes: copied.bytesCopied, sha256: copied.sha256 };
+  return {
+    storagePath,
+    sizeBytes: storedSizeBytes,
+    sha256: storedSha256,
+    cloudUrl,
+    cloudPublicId,
+    cloudStatus,
+    cloudError,
+    evidenceId,
+    evidence,
+  };
 }
 
 export interface PrivateEvidenceFile {

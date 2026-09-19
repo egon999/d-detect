@@ -183,6 +183,7 @@ function toAnalysisResult(
     severity: quarantine.severity,
     title: finding.title,
     explanation: quarantine.explanation,
+    caveat: quarantine.caveat,
     supportingEvidenceIds: [...(finding.supportingEvidenceIds ?? [])],
     relatedClaimIds: [...(finding.relatedClaimIds ?? [])],
     relatedEventIds: [...(finding.relatedEventIds ?? [])],

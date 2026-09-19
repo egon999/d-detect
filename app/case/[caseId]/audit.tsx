@@ -139,6 +139,7 @@ const ACTION_META: Record<AuditAction, { icon: IconName; tone: Tone }> = {
   SUGGESTION_ACCEPTED: { icon: 'check-circle', tone: 'ok' },
   SUGGESTION_REJECTED: { icon: 'close-circle', tone: 'danger' },
   PROCESSING_RETRIED: { icon: 'refresh', tone: 'warn' },
+  EVIDENCE_CLOUD_SYNCED: { icon: 'cloud-check-outline', tone: 'ok' },
 
   // `ok` because a seal is a confirmation, and the only one on this screen the user did not
   // make themselves — a server signed the history up to this point. The wax-seal glyph is

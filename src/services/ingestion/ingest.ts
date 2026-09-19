@@ -5,6 +5,10 @@ import { transcribeMedia } from './transcribe';
 import { mergeMediaText, orderRecognisedLines, readVideoFrameText } from './video-frames';
 import type { RecognitionOutcome } from './ocr';
 import type { IngestResult, IngestSourceKind, PickedFile } from './types';
+// Statically importable: `../storage/stream-copy` is the chunked read/hash loop and nothing
+// else — no `expo-file-system`, no React Native — so unlike `./read-file` it can be imported
+// here without making this module unloadable in a plain Node process.
+import { COPY_CHUNK_BYTES, digestStream } from '../storage/stream-copy';
 
 /**
  * File ingestion: a picked file in, plain text plus metadata out, so the
@@ -30,9 +34,19 @@ import type { IngestResult, IngestSourceKind, PickedFile } from './types';
  * With no key configured a recording is still stored and hashed, and the note explains
  * that nothing was transcribed.
  *
- * The parsers below (`parseCsv`, `flattenCsvRows`, `parseEml`, `looksBinary`,
- * `decodeUtf8`, `formatMediaDuration`) are pure and exported so they can be unit-tested
- * in plain Node with no filesystem and no React Native.
+ * ## How much of each file is read
+ *
+ * Three different answers, for three different reasons. A recording is never read into memory
+ * at all — it is handed on as a URI. A PDF, a ZIP-container office file or an image is read
+ * whole, because a prefix of one is not a readable document: a PDF's cross-reference table and
+ * a ZIP's central directory both live at the *end* of the file. Everything that is decoded as
+ * text is read up to `TEXT_PREFIX_BYTES` and no further, which is what keeps a 100 MB log off
+ * the heap; when that bites, the note says the file was read only in part. In every case the
+ * `sha256` is taken over the whole file, because it is the stored original's fingerprint.
+ *
+ * The parsers below (`parseCsv`, `flattenCsvRows`, `parseEml`, `stripRtf`, `looksBinary`,
+ * `decodeUtf8`, `trimPartialUtf8`, `formatMediaDuration`) are pure and exported so they can be
+ * unit-tested in plain Node with no filesystem and no React Native.
  */
 
 /** Images we recognise. Read locally by ML Kit; see the IMAGE branch of `ingestFile`. */
@@ -56,6 +70,10 @@ const TEXT_EXTENSIONS = new Set([
   '.markdown',
   '.json',
   '.log',
+  // Read by `stripRtf` in the RTF branch of `ingestFile`, which runs ahead of this set. It is
+  // listed here as well so that a `.rtf` which turns out not to be RTF at all — a plain text
+  // file someone saved with the wrong name — still gets the plain-text read rather than falling
+  // through to the "unsupported type" branch at the bottom.
   '.rtf',
   '.xml',
   '.html',
@@ -64,6 +82,7 @@ const TEXT_EXTENSIONS = new Set([
   '.yaml',
   '.ini',
   '.vcf',
+  '.note',
 ]);
 
 /** Audio recording formats. */
@@ -103,6 +122,31 @@ const BINARY_RATIO = 0.1;
 
 /** Cap on flattened CSV output, so a huge sheet cannot balloon memory. */
 const MAX_CSV_ROWS = 5000;
+
+/**
+ * How much of a file the text branches read when the file is longer than this.
+ *
+ * The store accepts an original up to `MAX_EVIDENCE_UPLOAD_BYTES` (100 MB), so a bank export
+ * or a call-detail log of that size reaches this file legitimately. Reading all of it was
+ * three allocations, not one: the buffer, the string `decodeUtf8` makes of it, and the two
+ * further copies `parseCsv`/`parseEml` make with their line-ending `replace` calls — over
+ * 300 MB peak for a 100 MB file, on a handset whose per-process limit is commonly 192 MB.
+ *
+ * All of it to keep a fraction of a percent. `@domain/extraction/deterministic` clamps what it
+ * reads to `MAX_SOURCE_TEXT` — 40,000 characters — and `flattenCsvRows` stops at
+ * `MAX_CSV_ROWS`. Two megabytes is far above both: 40,000 characters is at most 160 KB even
+ * if every one of them is a four-byte sequence, and 5,000 rows of a bank statement (date,
+ * description, reference, debit, credit, balance — 120 to 200 bytes each) is 0.6 to 1 MB, so
+ * the full row budget fits with room to spare. It is also small enough that the worst case
+ * above becomes about 14 MB rather than 300.
+ *
+ * Deliberately not a refusal. A file longer than this is still stored, still hashed over every
+ * byte, and still read — just not past here, and the note says so.
+ *
+ * Exported so `tests/ingestion.test.ts` can build its fixtures around the real boundary rather
+ * than a number copied out of here that would quietly stop meaning the same thing.
+ */
+export const TEXT_PREFIX_BYTES = 2 * 1024 * 1024;
 
 /**
  * Decodes UTF-8 bytes to a string.
@@ -177,6 +221,39 @@ export function decodeUtf8(bytes: Uint8Array): string {
   }
   flush();
   return out;
+}
+
+/**
+ * Drops a UTF-8 sequence left dangling at the end of a prefix read.
+ *
+ * A read that stops at a byte count stops wherever that lands, which for any non-ASCII
+ * document is regularly in the middle of a character. `decodeUtf8` turns the orphaned lead
+ * byte into U+FFFD, and `looksBinary` counts U+FFFD towards its binary verdict — so on a short
+ * prefix of a heavily accented or Devanagari file, a boundary artefact this function costs
+ * three bytes to avoid can tip the whole file into "not readable text, nothing was extracted".
+ *
+ * Only the tail is considered: a lead byte can be at most three bytes from the end and still
+ * be incomplete, so anything earlier is either whole or was already invalid in the file
+ * itself, and a reading is not entitled to tidy that away.
+ */
+export function trimPartialUtf8(bytes: Uint8Array): Uint8Array {
+  const from = Math.max(0, bytes.length - 4);
+  for (let i = bytes.length - 1; i >= from; i -= 1) {
+    const lead = bytes[i] as number;
+    let size = 0;
+    if (lead < 0x80) size = 1;
+    else if (lead >= 0xc2 && lead <= 0xdf) size = 2;
+    else if (lead >= 0xe0 && lead <= 0xef) size = 3;
+    else if (lead >= 0xf0 && lead <= 0xf4) size = 4;
+    // A continuation byte (or a byte that leads nothing valid): keep walking back for the lead
+    // it belongs to. Running off the end of the window without finding one means the tail is
+    // malformed on its own account, and it is left exactly as the file has it.
+    if (size === 0) continue;
+    // The sequence this lead starts either finishes inside the buffer — nothing dangles — or
+    // needs bytes that were never read, in which case it goes.
+    return i + size <= bytes.length ? bytes : bytes.subarray(0, i);
+  }
+  return bytes;
 }
 
 /**
@@ -490,12 +567,338 @@ export function parseEml(input: string): ParsedEmail {
   return { headers, body, text };
 }
 
+/*
+  ---------------------------------------------------------------------------------------------
+  RTF
+  ---------------------------------------------------------------------------------------------
+*/
+
+/**
+ * Where a `\'hh` byte escape lands in the document's character set.
+ *
+ * The 0x80–0x9F block is the entire reason this table exists: everywhere else a byte is simply
+ * its own code point, and only in that range does Windows-1252 differ from Latin-1. `\ansi` is
+ * RTF's default character set, and CP1252 is what it means in practice — the curly quotes and
+ * dashes Word substitutes for every apostrophe and hyphen. The four positions Windows leaves
+ * undefined are mapped to their own code points rather than dropped, so no byte can silently
+ * disappear out of the middle of a document.
+ */
+const RTF_CP1252_HIGH: Record<number, number> = {
+  0x80: 0x20ac,
+  0x82: 0x201a,
+  0x83: 0x0192,
+  0x84: 0x201e,
+  0x85: 0x2026,
+  0x86: 0x2020,
+  0x87: 0x2021,
+  0x88: 0x02c6,
+  0x89: 0x2030,
+  0x8a: 0x0160,
+  0x8b: 0x2039,
+  0x8c: 0x0152,
+  0x8e: 0x017d,
+  0x91: 0x2018,
+  0x92: 0x2019,
+  0x93: 0x201c,
+  0x94: 0x201d,
+  0x95: 0x2022,
+  0x96: 0x2013,
+  0x97: 0x2014,
+  0x98: 0x02dc,
+  0x99: 0x2122,
+  0x9a: 0x0161,
+  0x9b: 0x203a,
+  0x9c: 0x0153,
+  0x9e: 0x017e,
+  0x9f: 0x0178,
+};
+
+/**
+ * Groups whose contents are settings rather than the document's text.
+ *
+ * Skipped wholesale, because their bodies are machine noise that would otherwise land in the
+ * middle of a letter: a font table is `\f0\fnil\fcharset0 Calibri;`, a colour table is a list of
+ * `\red0\green0\blue0;`, and a `\pict` is a megabyte of hex. `\*` marks the same thing for any
+ * destination a writer invents, and the group scanner handles that form without this list.
+ *
+ * `\fldinst` is here and `\fldrslt` is deliberately not: a field is `{\fldinst HYPERLINK "…"}
+ * {\fldrslt Click here}`, and it is the instruction that is machinery while the result is the
+ * sentence the author saw.
+ */
+const RTF_SKIP_DESTINATIONS = new Set([
+  'fonttbl',
+  'colortbl',
+  'stylesheet',
+  'info',
+  'pict',
+  'object',
+  'shppict',
+  'nonshppict',
+  'listtable',
+  'listoverridetable',
+  'listpicture',
+  'latentstyles',
+  'datastore',
+  'themedata',
+  'colorschememapping',
+  'rsidtbl',
+  'generator',
+  'filetbl',
+  'revtbl',
+  'xmlnstbl',
+  'pgptbl',
+  'mmathPr',
+  'fldinst',
+]);
+
+/** Control words that stand for a character rather than describing how one is drawn. */
+const RTF_WORD_SYMBOLS: Record<string, string> = {
+  emdash: '\u2014',
+  endash: '\u2013',
+  bullet: '\u2022',
+  lquote: '\u2018',
+  rquote: '\u2019',
+  ldblquote: '\u201c',
+  rdblquote: '\u201d',
+  emspace: ' ',
+  enspace: ' ',
+  qmspace: ' ',
+};
+
+/** An RTF control word is one or more ASCII letters; anything else after the backslash is a symbol. */
+const RTF_WORD_LETTER = /[A-Za-z]/;
+
+/** A file is RTF when it opens with `{\rtf`, give or take a byte-order mark and leading blank space. */
+const RTF_HEADER = /^\s*\{\\rtf/;
+
+/** Hard ceiling on accumulated text, matching the Office reader's, so no one file can exhaust the heap. */
+const RTF_MAX_TEXT_CHARS = 1_000_000;
+
+/**
+ * Reads the plain text out of an RTF file, or `null` when the file is not RTF.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * `.rtf` was listed as a plain-text extension, so a letter written in Word arrived at the
+ * plain-text branch and its *markup* was stored as the document's text. The first line of the
+ * evidence became `{\rtf1\ansi\deff0{\fonttbl{\f0\fnil\fcharset0 Calibri;}}`, and every font,
+ * colour, style and language instruction after it flowed into the rule engine, the entity
+ * pass and every citation drawn from the file. The figures were never wrong so much as
+ * buried: a reader — and a citation — had to find `INV-4471` inside `\f0\fs22 INV-4471\par`,
+ * and a conflict finding could quote `\sa200\sl276\slmult1` as if it were the sentence.
+ *
+ * WHAT THIS DOES
+ * --------------
+ * Walks the file once, emitting the characters a reader would see and dropping the control
+ * words that say how to draw them. Paragraph and line breaks become newlines, `\tab` and
+ * `\cell` become tabs, the `\'hh` byte escapes are decoded through Windows-1252, `\uN`
+ * characters are taken as Unicode with their ASCII fallback skipped, and font/colour/style
+ * tables, embedded images and `{\*\…}` destinations are left out entirely.
+ *
+ * **Nothing here is inferred.** Every character in the output was already in the file; this
+ * removes instructions, it does not read pixels or guess. That is why the caller records the
+ * result as `plain-text` and not as OCR — the reading is as trustworthy as decoding a `.txt`,
+ * and the downstream provenance mapping already says so.
+ *
+ * WHAT THIS DOES NOT DO
+ * ---------------------
+ * - No formatting, so bold and italics leave no trace. The extractor reads values, not styles.
+ * - No `\ansicpg` support: byte escapes are decoded as CP1252 whatever code page the header
+ *   names. RTF writers emit CP1252 in the overwhelming majority of files, and a wrong guess at
+ *   an exotic page would corrupt characters that the default reads correctly.
+ * - No table geometry. Cell boundaries become tabs, which is what the CSV-shaped readers in
+ *   `@domain/extraction` already understand.
+ *
+ * Returns `null` rather than `''` when the header is absent, so the caller can tell "not an
+ * RTF file at all" from "an RTF file with no text in it" — the first falls through to the
+ * plain-text branch, the second gets an honest note. Never throws: it is handed untrusted
+ * bytes on the UI thread, so every position is bounds-checked and both the input walk and the
+ * output are capped.
+ */
+export function stripRtf(input: string): string | null {
+  if (!RTF_HEADER.test(input.slice(0, 64))) return null;
+
+  const out: string[] = [];
+  let length = 0;
+  /** Brace depth, used to know where a skipped destination's group ends. */
+  let depth = 0;
+  /** Depth of the group whose contents are being dropped, or -1 when nothing is being dropped. */
+  let skipToDepth = -1;
+  /** How many fallback characters follow a `\uN`; `\uc0` means none, and is set by the file. */
+  let unicodeFallback = 1;
+  /** True right after a control word, so a raw newline there reads as source wrapping. */
+  let afterControlWord = false;
+
+  const push = (text: string): void => {
+    if (text.length === 0 || skipToDepth >= 0 || length >= RTF_MAX_TEXT_CHARS) return;
+    out.push(text);
+    length += text.length;
+  };
+
+  let i = 0;
+  while (i < input.length && length < RTF_MAX_TEXT_CHARS) {
+    const ch = input[i]!;
+
+    if (ch === '{') {
+      depth += 1;
+      // `{\*` marks an ignorable destination: everything up to its closing brace is not text.
+      if (input[i + 1] === '\\' && input[i + 2] === '*') {
+        if (skipToDepth < 0) skipToDepth = depth;
+        i += 3;
+        continue;
+      }
+      afterControlWord = false;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '}') {
+      if (skipToDepth >= 0 && depth <= skipToDepth) skipToDepth = -1;
+      depth -= 1;
+      if (depth < 0) break;
+      afterControlWord = false;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '\r' || ch === '\n') {
+      /*
+        A newline in an RTF file is almost always how the *source* is laid out, not a break in
+        the document — Word hard-wraps its own output at 255 columns, and those wraps land in
+        the middle of words. So a newline immediately after a control word is source formatting
+        and vanishes; one sitting between plain characters is a writer that meant a space, and
+        gets one. Turning the first kind into a space would split `INV-4471` in half.
+      */
+      if (!afterControlWord) push(' ');
+      i += 1;
+      continue;
+    }
+
+    if (ch === '\\') {
+      const next = input[i + 1];
+      if (next === undefined) break;
+
+      // An escaped brace or backslash is that character, and is not a group boundary.
+      if (next === '{' || next === '}' || next === '\\') {
+        push(next);
+        afterControlWord = false;
+        i += 2;
+        continue;
+      }
+
+      // `\'hh` — one byte of the document, in its character set.
+      if (next === "'") {
+        const byte = Number.parseInt(input.slice(i + 2, i + 4), 16);
+        if (Number.isFinite(byte)) push(rtfCodePageChar(byte));
+        afterControlWord = false;
+        i += 4;
+        continue;
+      }
+
+      // Any non-letter after the backslash is a control symbol: `\~`, `\-`, `\_`, `\*`, `\:`.
+      if (!RTF_WORD_LETTER.test(next)) {
+        // `\~` is the one that stands for a character — a non-breaking space the file wants kept.
+        if (next === '~') push('\u00a0');
+        afterControlWord = true;
+        i += 2;
+        continue;
+      }
+
+      // A control word: letters, then an optional signed number, then an optional single space
+      // that belongs to the word and never to the document.
+      let cursor = i + 1;
+      while (cursor < input.length && RTF_WORD_LETTER.test(input[cursor]!)) cursor += 1;
+      const word = input.slice(i + 1, cursor).toLowerCase();
+
+      const numberStart = cursor;
+      if (input[cursor] === '-') cursor += 1;
+      const digitsStart = cursor;
+      while (cursor < input.length) {
+        const code = input.charCodeAt(cursor);
+        if (code < 48 || code > 57) break;
+        cursor += 1;
+      }
+      const param = cursor > digitsStart ? Number(input.slice(numberStart, cursor)) : null;
+      if (input[cursor] === ' ') cursor += 1;
+
+      if (RTF_SKIP_DESTINATIONS.has(word)) {
+        if (depth > 0 && skipToDepth < 0) skipToDepth = depth;
+      } else if (word === 'par' || word === 'line' || word === 'sect' || word === 'row' || word === 'nestrow') {
+        push('\n');
+      } else if (word === 'tab' || word === 'cell' || word === 'nestcell') {
+        push('\t');
+      } else if (word === 'uc' && param !== null) {
+        unicodeFallback = Math.min(Math.max(param, 0), 2);
+      } else if (word === 'u' && param !== null) {
+        push(String.fromCharCode(((param % 0x10000) + 0x10000) % 0x10000));
+        // The writer put an ASCII stand-in here for readers without Unicode; it is not the text.
+        for (let skipped = 0; skipped < unicodeFallback; skipped += 1) {
+          cursor = rtfFallbackEnd(input, cursor);
+        }
+      } else if (word === 'bin' && param !== null && param > 0) {
+        // Raw binary follows (`\binN`), used by embedded objects; step over it rather than read it.
+        cursor += param;
+      } else {
+        const symbol = RTF_WORD_SYMBOLS[word];
+        if (symbol !== undefined) push(symbol);
+      }
+
+      afterControlWord = true;
+      i = cursor;
+      continue;
+    }
+
+    push(ch);
+    afterControlWord = false;
+    i += 1;
+  }
+
+  return out
+    .join('')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** One byte of an RTF document as a character, through Windows-1252. */
+function rtfCodePageChar(byte: number): string {
+  if (byte < 0 || byte > 0xff) return '';
+  return String.fromCharCode(RTF_CP1252_HIGH[byte] ?? byte);
+}
+
+/**
+ * Where the ASCII fallback written after a `\uN` character ends.
+ *
+ * The stand-in is either one byte escape (`\'e9`, four characters) or a single character, and
+ * its whole purpose is to be discarded by a reader that understood the `\uN` beside it. Left
+ * where it is when the character after is another control word, because then there is no
+ * fallback to skip and consuming one would eat real text.
+ */
+function rtfFallbackEnd(input: string, pos: number): number {
+  if (input[pos] === '\\' && input[pos + 1] === "'") return pos + 4;
+  const ch = input[pos];
+  if (ch === undefined || ch === '\\' || ch === '{' || ch === '}') return pos;
+  return pos + 1;
+}
+
 /** Lowercase extension including the dot, or '' when the name has none. */
 export function fileExtension(name: string): string {
   const clean = name.split('?')[0] ?? name;
   const dot = clean.lastIndexOf('.');
   if (dot <= 0 || dot === clean.length - 1) return '';
   return clean.slice(dot).toLowerCase();
+}
+
+/**
+ * A byte count as a short "97 MB", for a note the user reads.
+ *
+ * Coarse for the same reason `formatMediaDuration` is: this only ever describes a file past
+ * `TEXT_PREFIX_BYTES`, and what the sentence has to convey is whether a little or a great deal
+ * went unread — not a figure to the byte.
+ */
+function formatMegabytes(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
 }
 
 /**
@@ -689,6 +1092,31 @@ async function readScannedPdf(
 }
 
 /**
+ * SHA-256 of a buffer that is already in memory, folded a megabyte at a time.
+ *
+ * The same argument `sha256File` makes for recordings, for the branches that genuinely do need
+ * the whole buffer: one synchronous `sha256Hex` over the 100 MB the store accepts occupies the
+ * JS thread for about a second, and that thread is the one drawing the progress the user is
+ * watching. `digestStream` does the identical total work in chunks and yields between them.
+ *
+ * The source is a cursor over the buffer we are already holding, so this adds no second read of
+ * the file and no second copy of it — each chunk is a view.
+ */
+async function sha256Buffer(bytes: Uint8Array): Promise<string> {
+  let offset = 0;
+  return await digestStream({
+    source: {
+      readBytes: (length: number) => {
+        const chunk = bytes.subarray(offset, offset + length);
+        offset += chunk.length;
+        return chunk;
+      },
+    },
+    totalBytes: bytes.length,
+  });
+}
+
+/**
  * Reads a picked file and returns its text plus metadata.
  *
  * Never rejects for an unreadable or unsupported file: the failure is reported in
@@ -712,6 +1140,37 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
   // time instead.
   const isRecording = kind === 'AUDIO' || kind === 'VIDEO';
 
+  /*
+    Which files have to be read whole.
+
+    A PDF cannot be read from a prefix: its cross-reference table and trailer are at the *end*
+    of the file, and `extractPdfImages` walks the objects the trailer points at. A ZIP-container
+    office file is the same shape — the central directory `office-docs` walks is the last thing
+    in the archive. Bounding either would turn a document that reads perfectly today into one
+    that reads as empty, which is a worse failure than the memory it saves.
+
+    An image is here for a different reason: `recogniseText` takes a URI and never looks at this
+    buffer, so the whole read is already waste — but removing it means routing the size and the
+    digest the way the recordings do, which is a change to a path this fix has no business
+    touching. It stays whole and is noted as the next thing to do.
+  */
+  const needsWholeFile = ext === '.pdf' || IMAGE_EXTENSIONS.has(ext) || ZIP_OFFICE_EXTENSIONS.has(ext);
+
+  /*
+    Everything else is decoded as text, and that is the path a 100 MB file dies on: the buffer,
+    plus the string `decodeUtf8` makes of it, plus the two further copies `parseCsv` and
+    `parseEml` make when they normalise line endings. `TEXT_PREFIX_BYTES` explains what is kept
+    downstream and why two megabytes is far more than enough of it.
+
+    `file.size` decides whether to bother, and it is trustworthy here: the only caller is
+    `requestEvidenceProcessing`, which passes the length the store recorded for this exact file
+    — `copyWithDigest`'s own byte count, cross-checked against the written file's size, so a
+    short copy is already impossible. A record old enough to have no size at all falls through
+    to the bounded read, which measures the file itself. And if the figure were ever wrong and
+    low, the cost is that the file is read whole: today's behaviour, not a new failure.
+  */
+  const readsPrefix = !isRecording && !needsWholeFile && (file.size === null || file.size > TEXT_PREFIX_BYTES);
+
   // Empty on the recording paths, which return before anything reads it. Every branch that
   // decodes this buffer — PDF, image, Office, CSV, email, text — is unreachable for an
   // extension that classified as AUDIO or VIDEO, because `kindForExtension` maps each
@@ -719,6 +1178,8 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
   let bytes: Uint8Array = new Uint8Array();
   let size: number;
   let sha256: string;
+  /** True when `bytes` is the start of the file rather than all of it. */
+  let partial = false;
   try {
     // Read through the namespace rather than destructuring every binding up front: the
     // recording path and the buffer path need different functions, and pulling in the ones
@@ -733,9 +1194,35 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
       // whole-buffer path produced for an empty file.
       sha256 = await readFile.sha256File(file.uri, size);
     } else {
-      bytes = await readFile.readBytes(file.uri);
-      size = bytes.length;
-      sha256 = readFile.sha256Hex(bytes);
+      if (readsPrefix) {
+        const prefix = await readFile.readPrefix(file.uri, TEXT_PREFIX_BYTES);
+        size = prefix.totalBytes;
+        // Only a file that really is longer counts as partly read. A record with no recorded
+        // size takes this path too, and for a short file `readPrefix` hands back every byte of
+        // it — which is the whole file, hashed and decoded exactly as below.
+        partial = prefix.bytes.length < size;
+        // Trimmed only when cut. A file that genuinely ends mid-sequence is entitled to its
+        // U+FFFD; a read that stopped mid-sequence is not entitled to invent one.
+        bytes = partial ? trimPartialUtf8(prefix.bytes) : prefix.bytes;
+      } else {
+        bytes = await readFile.readBytes(file.uri);
+        size = bytes.length;
+      }
+
+      if (partial) {
+        // Over the whole file, never over the prefix. This digest is the stored original's
+        // fingerprint: `requestEvidenceProcessing` checks it against the one recorded at store
+        // time, and `verifyEvidenceFile` re-reads the stored file against it later. A hash of
+        // the first two megabytes is a perfectly valid hash of the wrong bytes, and it would
+        // verify as correct forever after.
+        sha256 = await readFile.sha256File(file.uri, size);
+      } else {
+        // Synchronous below a chunk, where `digestStream` would do the identical single update
+        // and yield nowhere, and chunked above it — a whole-file hash of the 100 MB a PDF or a
+        // spreadsheet may legitimately be is around a second of uninterrupted work on the only
+        // thread React Native has to draw with, which is the freeze the user reads as a hang.
+        sha256 = size <= COPY_CHUNK_BYTES ? readFile.sha256Hex(bytes) : await sha256Buffer(bytes);
+      }
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown error';
@@ -768,38 +1255,52 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
 
   // --- PDF -----------------------------------------------------------------
   if (ext === '.pdf') {
-    const { text, pages, hadTextLayer } = extractPdfText(bytes);
-    if (!hadTextLayer) {
-      // No characters in the file. Before giving up, try the pages as pictures: a scan is
-      // one JPEG per page and ML Kit reads JPEGs, so the document that used to be
-      // unreadable here is often entirely readable. See `./pdf-images` for why this needs
-      // no PDF renderer, and what it deliberately does not attempt.
-      const scanned = await readScannedPdf(bytes, pages);
-      if (scanned) return { ...scanned, bytes: size, sha256 };
+    try {
+      const { text, pages, hadTextLayer } = extractPdfText(bytes);
+      if (!hadTextLayer) {
+        // No characters in the file. Before giving up, try the pages as pictures: a scan is
+        // one JPEG per page and ML Kit reads JPEGs, so the document that used to be
+        // unreadable here is often entirely readable. See `./pdf-images` for why this needs
+        // no PDF renderer, and what it deliberately does not attempt.
+        const scanned = await readScannedPdf(bytes, pages);
+        if (scanned) return { ...scanned, bytes: size, sha256 };
 
+        return {
+          kind: 'PDF',
+          text: '',
+          method: 'none',
+          units: pages > 0 ? pages : null,
+          needsOcr: true,
+          note:
+            'This PDF appears to be scanned images with no text layer, so no text could be read from it on this ' +
+            'device. The original file is stored unchanged; someone needs to read it and add what it says as a statement.',
+          bytes: size,
+          sha256,
+        };
+      }
+      return {
+        kind: 'PDF',
+        text,
+        method: 'pdf-text-layer',
+        units: pages > 0 ? pages : null,
+        needsOcr: false,
+        note: `Read the text layer of this PDF (${pages} ${pages === 1 ? 'page' : 'pages'}).`,
+        bytes: size,
+        sha256,
+      };
+    } catch (pdfErr) {
+      const reason = pdfErr instanceof Error ? pdfErr.message : 'unreadable format';
       return {
         kind: 'PDF',
         text: '',
         method: 'none',
-        units: pages > 0 ? pages : null,
-        needsOcr: true,
-        note:
-          'This PDF appears to be scanned images with no text layer, so no text could be read from it on this ' +
-          'device. The original file is stored unchanged; someone needs to read it and add what it says as a statement.',
+        units: null,
+        needsOcr: false,
+        note: `This PDF could not be read (${reason}). The file is stored unchanged.`,
         bytes: size,
         sha256,
       };
     }
-    return {
-      kind: 'PDF',
-      text,
-      method: 'pdf-text-layer',
-      units: pages > 0 ? pages : null,
-      needsOcr: false,
-      note: `Read the text layer of this PDF (${pages} ${pages === 1 ? 'page' : 'pages'}).`,
-      bytes: size,
-      sha256,
-    };
   }
 
   // --- Images --------------------------------------------------------------
@@ -880,188 +1381,234 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
 
   // --- Audio recordings ---------------------------------------------------
   if (AUDIO_EXTENSIONS.has(ext)) {
-    const transcript = await transcribeMedia({
-      uri: file.uri,
-      name: file.name,
-      mimeType: file.mimeType,
-      // The byte count read above, not `file.size`: the picker's figure is sometimes null and
-      // occasionally wrong, and this one is what was actually on disk.
-      sizeBytes: size,
-    });
+    try {
+      const transcript = await transcribeMedia({
+        uri: file.uri,
+        name: file.name,
+        mimeType: file.mimeType,
+        // The byte count read above, not `file.size`: the picker's figure is sometimes null and
+        // occasionally wrong, and this one is what was actually on disk.
+        sizeBytes: size,
+      });
 
-    if (!transcript.ok) {
+      if (!transcript.ok) {
+        return {
+          kind: 'AUDIO',
+          text: '',
+          method: 'none',
+          units: null,
+          needsOcr: false,
+          // `transcript.error` is one of `./transcribe`'s own fixed sentences, already run
+          // through `scrubKey`. A provider's own wording never reaches this note.
+          note: transcript.error,
+          bytes: size,
+          sha256,
+          // No `timedSegments` at all, deliberately. An absent list means the recording was
+          // never transcribed; an empty one below means it was transcribed and nothing was
+          // said. Collapsing the two would lose the difference between "add a key" and "this
+          // recording is silent".
+        };
+      }
+
+      const spans = transcript.segments.length;
+      const duration = transcript.durationMs === null ? null : formatMediaDuration(transcript.durationMs);
+
+      if (spans === 0) {
+        return {
+          kind: 'AUDIO',
+          text: '',
+          // Still `audio-transcript`: a transcription pass genuinely ran and this is its
+          // result. `method` records how the text was obtained, not whether it was long.
+          method: 'audio-transcript',
+          units: 0,
+          needsOcr: false,
+          note: duration
+            ? `Transcribed this recording (${duration}) and found no speech in it.`
+            : 'Transcribed this recording and found no speech in it.',
+          bytes: size,
+          sha256,
+          timedSegments: [],
+        };
+      }
+
+      return {
+        kind: 'AUDIO',
+        text: transcript.text,
+        method: 'audio-transcript',
+        // Timed spans rather than a duration, because `units` is a count everywhere else in
+        // this file and these are the pieces a citation can point at.
+        units: spans,
+        needsOcr: false,
+        note:
+          `Transcribed ${duration ? `${duration} of ` : ''}speech into ${spans} timed ${spans === 1 ? 'span' : 'spans'}` +
+          `${transcript.language ? ` (detected language: ${transcript.language})` : ''}. ` +
+          'This is a machine transcription of speech, with no confidence score and no speaker labels, ' +
+          'so check any figure or name against the recording before relying on it.',
+        bytes: size,
+        sha256,
+        timedSegments: transcript.segments,
+      };
+    } catch (audioErr) {
+      const reason = audioErr instanceof Error ? audioErr.message : 'transcription failure';
       return {
         kind: 'AUDIO',
         text: '',
         method: 'none',
         units: null,
         needsOcr: false,
-        // `transcript.error` is one of `./transcribe`'s own fixed sentences, already run
-        // through `scrubKey`. A provider's own wording never reaches this note.
-        note: transcript.error,
+        note: `Audio could not be transcribed (${reason}). The file is stored unchanged.`,
         bytes: size,
         sha256,
-        // No `timedSegments` at all, deliberately. An absent list means the recording was
-        // never transcribed; an empty one below means it was transcribed and nothing was
-        // said. Collapsing the two would lose the difference between "add a key" and "this
-        // recording is silent".
       };
     }
-
-    const spans = transcript.segments.length;
-    const duration = transcript.durationMs === null ? null : formatMediaDuration(transcript.durationMs);
-
-    if (spans === 0) {
-      return {
-        kind: 'AUDIO',
-        text: '',
-        // Still `audio-transcript`: a transcription pass genuinely ran and this is its
-        // result. `method` records how the text was obtained, not whether it was long.
-        method: 'audio-transcript',
-        units: 0,
-        needsOcr: false,
-        note: duration
-          ? `Transcribed this recording (${duration}) and found no speech in it.`
-          : 'Transcribed this recording and found no speech in it.',
-        bytes: size,
-        sha256,
-        timedSegments: [],
-      };
-    }
-
-    return {
-      kind: 'AUDIO',
-      text: transcript.text,
-      method: 'audio-transcript',
-      // Timed spans rather than a duration, because `units` is a count everywhere else in
-      // this file and these are the pieces a citation can point at.
-      units: spans,
-      needsOcr: false,
-      note:
-        `Transcribed ${duration ? `${duration} of ` : ''}speech into ${spans} timed ${spans === 1 ? 'span' : 'spans'}` +
-        `${transcript.language ? ` (detected language: ${transcript.language})` : ''}. ` +
-        'This is a machine transcription of speech, with no confidence score and no speaker labels, ' +
-        'so check any figure or name against the recording before relying on it.',
-      bytes: size,
-      sha256,
-      timedSegments: transcript.segments,
-    };
   }
 
   // --- Video recordings ---------------------------------------------------
   if (VIDEO_EXTENSIONS.has(ext)) {
-    // Two independent readings, both attempted, neither sufficient on its own: a screen
-    // recording of a payment confirmation has no speech, and a recorded call has no
-    // on-screen text. See the argument in `./video-frames`.
-    const transcript = await transcribeMedia({
-      uri: file.uri,
-      name: file.name,
-      mimeType: file.mimeType,
-      sizeBytes: size,
-    });
+    try {
+      // Two independent readings, both attempted, neither sufficient on its own: a screen
+      // recording of a payment confirmation has no speech, and a recorded call has no
+      // on-screen text. See the argument in `./video-frames`.
+      const transcript = await transcribeMedia({
+        uri: file.uri,
+        name: file.name,
+        mimeType: file.mimeType,
+        sizeBytes: size,
+      });
 
-    // Whisper reports the container's real duration, and it is the only source of one
-    // available here — `expo-video-thumbnails` exposes no metadata and this build has no
-    // other media probe. Without it the sampler falls back to a fixed ladder and stops at the
-    // first frame the decoder refuses; see `planFrameTimes`.
-    const frames = await readVideoFrameText(file.uri, transcript.ok ? transcript.durationMs : null);
-    const merged = mergeMediaText({
-      speech: transcript.ok ? transcript.segments : [],
-      frames: frames.frames,
-    });
+      // Whisper reports the container's real duration, and it is the only source of one
+      // available here — `expo-video-thumbnails` exposes no metadata and this build has no
+      // other media probe. Without it the sampler falls back to a fixed ladder and stops at the
+      // first frame the decoder refuses; see `planFrameTimes`.
+      const frames = await readVideoFrameText(file.uri, transcript.ok ? transcript.durationMs : null);
+      const merged = mergeMediaText({
+        speech: transcript.ok ? transcript.segments : [],
+        frames: frames.frames,
+      });
 
-    const duration = transcript.ok && transcript.durationMs !== null
-      ? formatMediaDuration(transcript.durationMs)
-      : null;
+      const duration = transcript.ok && transcript.durationMs !== null
+        ? formatMediaDuration(transcript.durationMs)
+        : null;
 
-    const sentences: string[] = [];
+      const sentences: string[] = [];
 
-    if (!transcript.ok) {
-      sentences.push(transcript.error);
-    } else if (transcript.segments.length === 0) {
-      sentences.push(
-        duration
-          ? `Transcribed the audio of this recording (${duration}) and found no speech in it.`
-          : 'Transcribed the audio of this recording and found no speech in it.',
-      );
-    } else {
-      const spans = transcript.segments.length;
-      sentences.push(
-        `Transcribed ${duration ? `${duration} of ` : ''}speech into ${spans} timed ${spans === 1 ? 'span' : 'spans'}.`,
-      );
-    }
-
-    if (frames.limitations.includes('ocr-unavailable')) {
-      sentences.push('Reading text from video frames is not available in this build.');
-    } else if (frames.decoded === 0) {
-      sentences.push('No frames could be decoded from this video, so no on-screen text was read.');
-    } else {
-      const kept = frames.frames.length;
-      sentences.push(
-        `Sampled ${frames.decoded} ${frames.decoded === 1 ? 'frame' : 'frames'} about every ` +
-          `${formatMediaDuration(frames.intervalMs)} and found readable text on ${kept === 0 ? 'none' : kept} of them.`,
-      );
-      if (kept > 0) {
+      if (!transcript.ok) {
+        sentences.push(transcript.error);
+      } else if (transcript.segments.length === 0) {
         sentences.push(
-          'Frame sampling cannot see text that appeared between samples, and text read from pixels is ' +
-            'a reading of the picture rather than the record itself — check it against the video.',
+          duration
+            ? `Transcribed the audio of this recording (${duration}) and found no speech in it.`
+            : 'Transcribed the audio of this recording and found no speech in it.',
+        );
+      } else {
+        const spans = transcript.segments.length;
+        sentences.push(
+          `Transcribed ${duration ? `${duration} of ` : ''}speech into ${spans} timed ${spans === 1 ? 'span' : 'spans'}.`,
         );
       }
-    }
 
-    const hasText = merged.text.trim().length > 0;
-    return {
-      kind: 'VIDEO',
-      text: merged.text,
-      // `video-transcript` covers both signals. There is no separate member for "frame text
-      // only" because the distinction the UI needs is already in the text itself, under the
-      // headings `mergeMediaText` writes, and a fourth media method would give the UI a
-      // difference it has no way to act on.
-      method: hasText ? 'video-transcript' : 'none',
-      units: hasText ? merged.timedSegments.length : null,
-      // A frame pass that could not run leaves the pixels genuinely unread.
-      needsOcr: frames.limitations.includes('ocr-unavailable'),
-      note: sentences.join(' '),
-      bytes: size,
-      sha256,
-      // Present whenever something with a clock was actually reached, empty or not, and
-      // absent when neither pass ran at all — the same distinction as the audio branch.
-      ...(transcript.ok || merged.timedSegments.length > 0
-        ? { timedSegments: merged.timedSegments }
-        : {}),
-    };
+      if (frames.limitations.includes('ocr-unavailable')) {
+        sentences.push('Reading text from video frames is not available in this build.');
+      } else if (frames.decoded === 0) {
+        sentences.push('No frames could be decoded from this video, so no on-screen text was read.');
+      } else {
+        const kept = frames.frames.length;
+        sentences.push(
+          `Sampled ${frames.decoded} ${frames.decoded === 1 ? 'frame' : 'frames'} about every ` +
+            `${formatMediaDuration(frames.intervalMs)} and found readable text on ${kept === 0 ? 'none' : kept} of them.`,
+        );
+        if (kept > 0) {
+          sentences.push(
+            'Frame sampling cannot see text that appeared between samples, and text read from pixels is ' +
+              'a reading of the picture rather than the record itself — check it against the video.',
+          );
+        }
+      }
+
+      const hasText = merged.text.trim().length > 0;
+      return {
+        kind: 'VIDEO',
+        text: merged.text,
+        // `video-transcript` covers both signals. There is no separate member for "frame text
+        // only" because the distinction the UI needs is already in the text itself, under the
+        // headings `mergeMediaText` writes, and a fourth media method would give the UI a
+        // difference it has no way to act on.
+        method: hasText ? 'video-transcript' : 'none',
+        units: hasText ? merged.timedSegments.length : null,
+        // A frame pass that could not run leaves the pixels genuinely unread.
+        needsOcr: frames.limitations.includes('ocr-unavailable'),
+        note: sentences.join(' '),
+        bytes: size,
+        sha256,
+        // Present whenever something with a clock was actually reached, empty or not, and
+        // absent when neither pass ran at all — the same distinction as the audio branch.
+        ...(transcript.ok || merged.timedSegments.length > 0
+          ? { timedSegments: merged.timedSegments }
+          : {}),
+      };
+    } catch (videoErr) {
+      const reason = videoErr instanceof Error ? videoErr.message : 'video processing failure';
+      return {
+        kind: 'VIDEO',
+        text: '',
+        method: 'none',
+        units: null,
+        needsOcr: false,
+        note: `Video could not be processed (${reason}). The recording is stored unchanged.`,
+        bytes: size,
+        sha256,
+      };
+    }
   }
 
   // --- ZIP-container office formats ---------------------------------------
   if (ZIP_OFFICE_EXTENSIONS.has(ext)) {
-    /*
-      DOCX, XLSX and PPTX are read here. These used to be stored and never parsed, so a
-      Word invoice contributed no text and every rule silently skipped it — the file was
-      present in the case and invisible to the analysis, which is the worst of both.
-      `office-docs` walks the ZIP directory and inflates the text parts with pako, which
-      is already in the bundle for the PDF text layer. No native module, no new package.
+    try {
+      /*
+        DOCX, XLSX and PPTX are read here. These used to be stored and never parsed, so a
+        Word invoice contributed no text and every rule silently skipped it — the file was
+        present in the case and invisible to the analysis, which is the worst of both.
+        `office-docs` walks the ZIP directory and inflates the text parts with pako, which
+        is already in the bundle for the PDF text layer. No native module, no new package.
 
-      The legacy binaries (.doc, .xls, .ppt, .odt, .ods) are a different format
-      altogether — OLE compound files, not ZIP — and still fall through to the honest
-      "not extracted" note below.
-    */
-    const officeKind = officeKindFor(ext);
+        The legacy binaries (.doc, .xls, .ppt, .odt, .ods) are a different format
+        altogether — OLE compound files, not ZIP — and still fall through to the honest
+        "not extracted" note below.
+      */
+      const officeKind = officeKindFor(ext);
 
-    if (officeKind) {
-      const office = extractOfficeText(bytes, officeKind);
-      const label = ext.replace('.', '').toUpperCase();
+      if (officeKind) {
+        const office = extractOfficeText(bytes, officeKind);
+        const label = ext.replace('.', '').toUpperCase();
 
-      if (office.hadText) {
+        if (office.hadText) {
+          return {
+            kind,
+            text: office.text,
+            method: 'office-xml',
+            units: office.partsRead > 0 ? office.partsRead : null,
+            needsOcr: false,
+            note: office.truncated
+              ? `Text was read from this ${label} file. It is long, so only the first part was ` +
+                'kept — the rest is stored but not analysed.'
+              : '',
+            bytes: size,
+            sha256,
+          };
+        }
+
         return {
           kind,
-          text: office.text,
-          method: 'office-xml',
-          units: office.partsRead > 0 ? office.partsRead : null,
+          text: '',
+          method: 'none',
+          units: null,
+          // An Office file holds no pixels to re-read, so another pass would find nothing.
           needsOcr: false,
-          note: office.truncated
-            ? `Text was read from this ${label} file. It is long, so only the first part was ` +
-              'kept — the rest is stored but not analysed.'
-            : '',
+          note:
+            office.error ??
+            `This ${label} file was read but contained no text — it may hold only images, ` +
+              'charts or an embedded scan. The file is stored unchanged and can be opened or ' +
+              'shared from the case. A photo or screenshot of the relevant page can be read.',
           bytes: size,
           sha256,
         };
@@ -1072,153 +1619,242 @@ export async function ingestFile(file: PickedFile): Promise<IngestResult> {
         text: '',
         method: 'none',
         units: null,
-        // An Office file holds no pixels to re-read, so another pass would find nothing.
         needsOcr: false,
         note:
-          office.error ??
-          `This ${label} file was read but contained no text — it may hold only images, ` +
-            'charts or an embedded scan. The file is stored unchanged and can be opened or ' +
-            'shared from the case. A photo or screenshot of the relevant page can be read.',
+          `This ${ext.replace('.', '').toUpperCase()} file is an older binary format that cannot ` +
+          'be read on the device, so no text was extracted from it. The file has been stored ' +
+          'unchanged and can be opened or shared from the case. Saving it as DOCX, XLSX or PDF ' +
+          'and re-uploading will let it be analysed.',
+        bytes: size,
+        sha256,
+      };
+    } catch (officeErr) {
+      const reason = officeErr instanceof Error ? officeErr.message : 'unreadable office document';
+      return {
+        kind,
+        text: '',
+        method: 'none',
+        units: null,
+        needsOcr: false,
+        note: `This office document could not be read (${reason}). The file is stored unchanged.`,
         bytes: size,
         sha256,
       };
     }
-
-    return {
-      kind,
-      text: '',
-      method: 'none',
-      units: null,
-      needsOcr: false,
-      note:
-        `This ${ext.replace('.', '').toUpperCase()} file is an older binary format that cannot ` +
-        'be read on the device, so no text was extracted from it. The file has been stored ' +
-        'unchanged and can be opened or shared from the case. Saving it as DOCX, XLSX or PDF ' +
-        'and re-uploading will let it be analysed.',
-      bytes: size,
-      sha256,
-    };
   }
 
   // Everything below needs the bytes as text.
-  const decoded = decodeUtf8(bytes);
+  try {
+    const decoded = decodeUtf8(bytes);
 
-  // --- CSV / TSV -----------------------------------------------------------
-  if (ext === '.csv' || ext === '.tsv') {
-    const rows = parseCsv(decoded, ext === '.tsv' ? '\t' : ',');
-    const dataRows = Math.max(0, rows.length - 1);
-    const text = flattenCsvRows(rows);
-    if (text.length === 0) {
+    /**
+     * Adds the fact of a partial reading to whatever the branch has to say about it.
+     *
+     * Added to the branch's own sentence rather than replacing it, because both are true and the
+     * user needs both: "read 4,000 rows" is what happened, "this is the first 2 MB of a 97 MB
+     * file" is what it is worth. Said in plain terms and without a new `method` member — the
+     * reading itself is the same reading, there was simply less of the file behind it.
+     */
+    const notingPartialRead = (sentence: string): string =>
+      partial
+        ? `${sentence} This file is large (${formatMegabytes(size)}), so only its first ` +
+          `${formatMegabytes(TEXT_PREFIX_BYTES)} were read — anything after that was not looked at and ` +
+          'is not part of this reading. The whole file is stored unchanged and can be opened or ' +
+          'shared from the case.'
+        : sentence;
+
+    // --- CSV / TSV -----------------------------------------------------------
+    if (ext === '.csv' || ext === '.tsv') {
+      const parsed = parseCsv(decoded, ext === '.tsv' ? '\t' : ',');
+      // A prefix lands mid-row far more often than on a row boundary, and `parseCsv` flushes
+      // whatever field it ended on — so the last row of a cut file is a row whose final cell is
+      // however much of an amount or a reference happened to fit, sitting in the output beside
+      // complete rows and indistinguishable from them. A half-written figure presented as a whole
+      // one is the class of error this product exists to prevent, so the row goes: one row out of
+      // thousands, and the only way to be sure. Dropped whenever the read was cut, including when
+      // the text happens to end at a newline, because a cut inside a quoted field ends at one too.
+      const rows = partial && parsed.length > 0 ? parsed.slice(0, -1) : parsed;
+      const dataRows = Math.max(0, rows.length - 1);
+      const text = flattenCsvRows(rows);
+      if (text.length === 0) {
+        return {
+          kind: 'SPREADSHEET',
+          text: '',
+          method: 'none',
+          units: 0,
+          needsOcr: false,
+          note: notingPartialRead('This spreadsheet file contains no readable rows.'),
+          bytes: size,
+          sha256,
+        };
+      }
+      const truncated = dataRows > MAX_CSV_ROWS;
       return {
         kind: 'SPREADSHEET',
-        text: '',
-        method: 'none',
-        units: 0,
+        text,
+        method: 'csv-flatten',
+        units: dataRows,
         needsOcr: false,
-        note: 'This spreadsheet file contains no readable rows.',
+        note: notingPartialRead(
+          truncated
+            ? `Read ${MAX_CSV_ROWS} of ${dataRows} rows from this file; the rest were skipped to keep the app responsive.`
+            : `Read ${dataRows} ${dataRows === 1 ? 'row' : 'rows'} from this file, with each value labelled by its column.`,
+        ),
         bytes: size,
         sha256,
       };
     }
-    const truncated = dataRows > MAX_CSV_ROWS;
-    return {
-      kind: 'SPREADSHEET',
-      text,
-      method: 'csv-flatten',
-      units: dataRows,
-      needsOcr: false,
-      note: truncated
-        ? `Read ${MAX_CSV_ROWS} of ${dataRows} rows from this file; the rest were skipped to keep the app responsive.`
-        : `Read ${dataRows} ${dataRows === 1 ? 'row' : 'rows'} from this file, with each value labelled by its column.`,
-      bytes: size,
-      sha256,
-    };
-  }
 
-  // --- Email ---------------------------------------------------------------
-  if (ext === '.eml') {
-    const parsed = parseEml(decoded);
-    if (parsed.text.trim().length === 0) {
+    // --- Email ---------------------------------------------------------------
+    if (ext === '.eml') {
+      const parsed = parseEml(decoded);
+      if (parsed.text.trim().length === 0) {
+        return {
+          kind: 'EMAIL',
+          text: '',
+          method: 'none',
+          units: null,
+          needsOcr: false,
+          note: notingPartialRead('This email could not be parsed into readable text.'),
+          bytes: size,
+          sha256,
+        };
+      }
+      const subject = parsed.headers['subject'];
       return {
         kind: 'EMAIL',
-        text: '',
-        method: 'none',
+        text: parsed.text,
+        method: 'eml-parse',
         units: null,
         needsOcr: false,
-        note: 'This email could not be parsed into readable text.',
+        note: notingPartialRead(
+          subject
+            ? `Read this email, including its headers and message body ("${decodeEncodedWords(subject)}").`
+            : 'Read this email, including its headers and message body.',
+        ),
         bytes: size,
         sha256,
       };
     }
-    const subject = parsed.headers['subject'];
-    return {
-      kind: 'EMAIL',
-      text: parsed.text,
-      method: 'eml-parse',
-      units: null,
-      needsOcr: false,
-      note: subject
-        ? `Read this email, including its headers and message body ("${decodeEncodedWords(subject)}").`
-        : 'Read this email, including its headers and message body.',
-      bytes: size,
-      sha256,
-    };
-  }
 
-  // --- Plain text ----------------------------------------------------------
-  if (TEXT_EXTENSIONS.has(ext)) {
-    // A `.txt` that is actually binary is still binary; say so rather than
-    // handing the extractor a page of mojibake.
-    if (looksBinary(decoded)) {
+    // --- RTF (rich text) -----------------------------------------------------
+    if (ext === '.rtf') {
+      /*
+        Ahead of the plain-text branch below, because `.rtf` is a member of `TEXT_EXTENSIONS` too —
+        it is listed there so that a file merely *named* `.rtf` still gets a plain read. Without
+        this branch the file's markup was taken as its text: `{\rtf1\ansi\deff0` became the first
+        line of the evidence and every font, colour and style instruction after it reached the rule
+        engine and the citations drawn from it.
+
+        `stripRtf` returns `null` when there is no `{\rtf` header, which is the "merely named" case
+        — it falls through and is read as plain text exactly as before.
+      */
+      const rtfText = stripRtf(decoded);
+
+      if (rtfText !== null) {
+        if (rtfText.length === 0) {
+          return {
+            kind,
+            text: '',
+            method: 'none',
+            units: null,
+            // An RTF file holds no pixels to re-read, so another pass would find nothing.
+            needsOcr: false,
+            note: notingPartialRead(
+              'This RTF file holds no text of its own — it may contain only images or drawings. ' +
+                'The file has been stored unchanged and can be opened or shared from the case.',
+            ),
+            bytes: size,
+            sha256,
+          };
+        }
+
+        return {
+          kind,
+          text: rtfText,
+          // The document's own characters, with only its instructions removed — the same trust as
+          // decoding a `.txt`, and deliberately not `ocr`: nothing here was read off pixels.
+          method: 'plain-text',
+          units: null,
+          needsOcr: false,
+          note: notingPartialRead('Read this file as text, with its formatting instructions removed.'),
+          bytes: size,
+          sha256,
+        };
+      }
+    }
+
+    // --- Plain text ----------------------------------------------------------
+    if (TEXT_EXTENSIONS.has(ext)) {
+      // A `.txt` that is actually binary is still binary; say so rather than
+      // handing the extractor a page of mojibake.
+      if (looksBinary(decoded)) {
+        return {
+          kind: 'TEXT',
+          text: '',
+          method: 'none',
+          units: null,
+          needsOcr: false,
+          note: notingPartialRead(
+            'This file has a text extension but its contents are not readable text, so nothing was extracted. ' +
+              'The file has been stored unchanged.',
+          ),
+          bytes: size,
+          sha256,
+        };
+      }
       return {
         kind: 'TEXT',
-        text: '',
-        method: 'none',
+        text: decoded,
+        method: 'plain-text',
         units: null,
         needsOcr: false,
-        note:
-          'This file has a text extension but its contents are not readable text, so nothing was extracted. ' +
-          'The file has been stored unchanged.',
+        note: notingPartialRead('Read this file as plain text.'),
         bytes: size,
         sha256,
       };
     }
+
+    // --- Unknown: try text, detect binary -----------------------------------
+    if (looksBinary(decoded)) {
+      return {
+        kind: 'OTHER',
+        text: '',
+        method: 'none',
+        units: null,
+        needsOcr: false,
+        note: notingPartialRead(
+          `This file type (${ext.length > 0 ? ext : 'no extension'}) is not readable in this build, ` +
+            'so no text was extracted. The file has been stored and can be shared or exported.',
+        ),
+        bytes: size,
+        sha256,
+      };
+    }
+
     return {
       kind: 'TEXT',
       text: decoded,
       method: 'plain-text',
       units: null,
       needsOcr: false,
-      note: 'Read this file as plain text.',
+      note: notingPartialRead(
+        'This file type is not formally supported, but its contents were readable as plain text.',
+      ),
       bytes: size,
       sha256,
     };
-  }
-
-  // --- Unknown: try text, detect binary -----------------------------------
-  if (looksBinary(decoded)) {
+  } catch (textErr) {
+    const reason = textErr instanceof Error ? textErr.message : 'unreadable text';
     return {
-      kind: 'OTHER',
+      kind: 'TEXT',
       text: '',
       method: 'none',
       units: null,
       needsOcr: false,
-      note:
-        `This file type (${ext.length > 0 ? ext : 'no extension'}) is not readable in this build, ` +
-        'so no text was extracted. The file has been stored and can be shared or exported.',
+      note: `This file could not be parsed as text (${reason}). The file is stored unchanged.`,
       bytes: size,
       sha256,
     };
   }
-
-  return {
-    kind: 'TEXT',
-    text: decoded,
-    method: 'plain-text',
-    units: null,
-    needsOcr: false,
-    note: 'This file type is not formally supported, but its contents were readable as plain text.',
-    bytes: size,
-    sha256,
-  };
 }

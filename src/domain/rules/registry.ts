@@ -67,5 +67,5 @@ const RULE_INDEX: ReadonlyMap<string, Rule> = new Map(RULES.map((rule) => [rule.
 
 /** Used by the reasoning trace to show a finding's rule alongside its rationale. */
 export function ruleById(id: string): Rule | undefined {
-  return RULE_INDEX.get(id);
+  return RULE_INDEX.get(id) ?? RULES.find((r) => r.id === id || r.id.split('@')[0] === id);
 }

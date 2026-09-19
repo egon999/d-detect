@@ -1,5 +1,10 @@
 import type { Rule, RuleFinding } from '../types';
-import { distinctEvidenceLabels, evidenceLinkedTo, independentSources } from '../support';
+import {
+  distinctEvidenceLabels,
+  evidenceLinkedTo,
+  independentSources,
+  quoteShort,
+} from '../support';
 
 /**
  * An event attested by more than one independent source.
@@ -37,12 +42,17 @@ export const corroboratedEventRule: Rule = {
 
       findings.push({
         key: [event.id, ...independent.map((item) => item.id)],
-        title: `"${event.title}" is backed by ${independent.length} independent sources`,
+        title: `${quoteShort(event.title, 48)} is backed by ${independent.length} independent sources`,
+        // Named in `inputs.Sources`, not here. Spelling the titles out in the sentence as well
+        // printed the same list twice on one card and grew the observation with every extra
+        // document — see `corroborated-claim` for the same change and the reasoning behind it.
         explanation:
-          `${independent.map((item) => `"${labelOf.get(item.id) ?? item.id}"`).join(' and ')} each attest to ` +
-          `"${event.title}", and none is a copy or derivative of another. Multiple independent ` +
-          `records of the same event are harder to dispute than a single document. This remains ` +
-          `a description of your evidence, not confirmation that the event occurred.`,
+          `${independent.length} separate sources attest to ${quoteShort(event.title)}, ` +
+          `and none is a copy or derivative of another.`,
+        caveat:
+          'Several independent records of the same event are harder to dispute than a single ' +
+          'document. This remains a description of what has been filed here, not confirmation ' +
+          'that the event occurred.',
         confidence: 'STRONG_MATCH',
         relatedEventIds: [event.id],
         relatedClaimIds: event.claimIds,

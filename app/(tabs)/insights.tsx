@@ -1,18 +1,24 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useSession } from '@services';
-import { useCaseList, useWorkspace } from '@services/use-case-store';
+import { calculateRecoveryLedger } from '@domain/analysis/recovery-ledger';
+import { deriveDeadlineSentinel } from '@domain/analysis/deadline-sentinel';
 import { CaseAnalysisPanel } from '@features/analysis/case-analysis-panel';
 import { useTabBarInset } from '@features/navigation/tab-bar';
+import { useSession } from '@services';
+import { useCaseList, useWorkspace } from '@services/use-case-store';
 import {
   BORDER_WIDTH,
+  Button,
   Chip,
+  Divider,
   EmptyState,
   ErrorState,
   FadeIn,
   HIT_TARGET,
+  IconTile,
   LAYOUT,
+  Notice,
   Pressable,
   routeParam,
   Row,
@@ -27,29 +33,6 @@ import {
   useTheme,
 } from '@ui';
 
-/**
- * The Analysis tab.
- *
- * ## Why this screen exists separately from the case screen
- *
- * A case screen answers "what is in this case". This one answers what the documents in it
- * actually support, across whichever case the user is currently thinking about. They are
- * different questions, and the second is the one the product exists to answer — so it gets
- * a tab rather than living three taps deep inside a case.
- *
- * ## Which case is shown
- *
- * Three inputs, in priority order: an explicit tap on the case switcher, a `caseId` passed
- * in by whoever navigated here, then the most recent case. The fallback matters — arriving
- * at a tab that asks you to pick something before it shows you anything is a worse first
- * impression than arriving at a reasonable default you can change.
- *
- * ## What it deliberately does not do
- *
- * It does not run an analysis on mount. Analysis reads every source in the case, and doing
- * that because someone tapped a tab spends their time and battery on a question they may
- * not have asked. `CaseAnalysisPanel` owns that decision and requires an explicit action.
- */
 export default function InsightsScreen() {
   const theme = useTheme();
   const tabBarInset = useTabBarInset();
@@ -60,14 +43,10 @@ export default function InsightsScreen() {
 
   const { cases, loading, refreshing, error, reload } = useCaseList(user?.id ?? null);
 
-  // `null` means "nothing chosen yet", which is distinct from "chose the first case" —
-  // only the former should defer to the `caseId` parameter.
   const [picked, setPicked] = useState<string | null>(null);
 
   const activeCase = useMemo(() => {
     const wanted = picked ?? linkedCaseId;
-    // A stale id — a case opened from a link and since deleted — falls back rather than
-    // leaving the screen blank with no explanation.
     return cases.find((item) => item.id === wanted) ?? cases[0] ?? null;
   }, [cases, picked, linkedCaseId]);
 
@@ -80,33 +59,9 @@ export default function InsightsScreen() {
 
   const failure = error ?? state.error;
 
-  /**
-   * The case the workspace subscription was last seen loading.
-   *
-   * `useWorkspace` only begins loading from an effect, so the first render after the
-   * selection changes still carries the previous case's `loading: false` next to an already
-   * empty workspace. That frame is indistinguishable from "this case has nothing in it", and
-   * without this ref, switching between two perfectly good cases would flash an error
-   * between them. Written during render because it has to be right on the render it is read
-   * on, and a ref rather than state because correcting it must not schedule another pass.
-   */
   const loadingSeenFor = useRef<string | null>(null);
   if (activeCase && state.loading) loadingSeenFor.current = activeCase.id;
 
-  /**
-   * What belongs where the analysis panel goes.
-   *
-   * One value decides this, because the three outcomes are genuinely exclusive and the
-   * booleans this replaced were not. The workspace loads independently of the case list, so
-   * there is a window where the case is known but its evidence is not — rendering the panel
-   * then would flash an "insufficient evidence" reading of a case that had simply not
-   * finished loading, which is why the skeleton exists at all. But a case the list offers and
-   * the workspace never produces is a different thing, and a single `workspaceReady` boolean
-   * could not tell the two apart: it stayed false either way, so a case deleted on another
-   * device showed a skeleton that never resolved and never said why. `failure` comes first so
-   * the error above is the only thing on screen — an error with a skeleton still spinning
-   * underneath it reads as though something is still coming.
-   */
   const analysis: 'hidden' | 'ready' | 'missing' | 'loading' =
     failure || activeCase === null
       ? 'hidden'
@@ -116,21 +71,23 @@ export default function InsightsScreen() {
           ? 'missing'
           : 'loading';
 
+  // Compute Financial Portfolio & Deadlines for the active case workspace
+  const activeLedger = useMemo(() => {
+    if (!activeCase) return null;
+    return calculateRecoveryLedger(state.workspace, activeCase.id);
+  }, [state.workspace, activeCase]);
+
+  const activeSentinel = useMemo(() => {
+    if (!activeCase) return null;
+    return deriveDeadlineSentinel(state.workspace, activeCase.id);
+  }, [state.workspace, activeCase]);
+
   return (
     <ScreenScroll
       title="Analysis"
-      subtitle="What your documents agree on, and where they do not"
+      subtitle="Case overview, financial recovery, and contradiction findings"
       onRefresh={refresh}
-      /*
-        `refreshing`, not `loading`. Both hooks now raise a flag for the span of a reload and
-        leave `loading` for the first load only, so driving the spinner from `loading` meant
-        the pull gesture let go while its own request was still in flight.
-      */
       refreshing={refreshing || state.refreshing}
-      // The tab bar floats over the scroll view, and `contentStyle` replaces the container's
-      // own bottom padding rather than adding to it. `useTabBarInset` is the whole occluded
-      // height — the bar's float, its box and the compose disc's overhang — plus its own
-      // breathing room, so the safe area and a spacing token are not added again here.
       contentStyle={{
         paddingBottom: tabBarInset,
       }}
@@ -138,11 +95,8 @@ export default function InsightsScreen() {
       <View style={[styles.column, { gap: theme.spacing.xl }]}>
         {failure ? (
           <FadeIn>
-            {/* `readableError`, not `failure.message`. That put the storage layer's own
-                wording on screen — "Missing or insufficient permissions." and worse — where
-                a sentence about this screen belongs. The original stays one tap away. */}
             <ErrorState
-              title="Your analysis could not be loaded"
+              title="Your analysis data could not be loaded"
               message={readableError(
                 failure,
                 'This case could not be read just now. Check your connection and try again.',
@@ -153,26 +107,101 @@ export default function InsightsScreen() {
           </FadeIn>
         ) : null}
 
-        {/* `!failure` matters as much as the rest: the error above is a dead end until the
-            retry succeeds, and a placeholder below it promises content that is not coming. */}
         {loading && !failure && cases.length === 0 ? <SkeletonCard lines={4} /> : null}
 
         {!loading && !failure && cases.length === 0 ? (
           <FadeIn>
             <EmptyState
               icon="scale-balance"
-              title="Nothing to analyse yet"
-              message="Create a case, write the claim you want to check, and add the documents that bear on it. Analysis compares them and shows what each conclusion rests on."
+              title="No active cases to analyze"
+              message="Create a case and add relevant documents. Analysis will automatically detect contradictions and verify claims."
               action={{ label: 'Create a case', onPress: () => router.push('/new-case') }}
             />
           </FadeIn>
         ) : null}
 
+        {/* Global Financial Exposure & Sentinel Overview */}
+        {activeLedger && activeCase ? (
+          <SlideUpIn>
+            <Surface glass glassVariant="hero" elevation="medium" radius="xl" padding="lg">
+              <Row between align="center">
+                <Row align="center" gap="sm">
+                  <IconTile icon="finance" tone="accent" size="sm" />
+                  <View>
+                    <Text variant="subheading">Financial Recovery Status</Text>
+                    <Text variant="caption" colorToken="textTertiary">
+                      {activeCase.title}
+                    </Text>
+                  </View>
+                </Row>
+                <Chip label={activeLedger.formattedTotalClaimable} tone="accent" size="sm" />
+              </Row>
+
+              <Row gap="sm" style={{ marginTop: theme.spacing.md }}>
+                <View style={[styles.statBox, { backgroundColor: theme.colors.surfaceSunken }]}>
+                  <Text variant="caption" colorToken="textTertiary">
+                    Principal Owed
+                  </Text>
+                  <Text variant="subheading" style={{ marginTop: 2 }}>
+                    ${(activeLedger.totalPrincipalMinor / 100).toFixed(2)}
+                  </Text>
+                </View>
+
+                <View style={[styles.statBox, { backgroundColor: theme.colors.surfaceSunken }]}>
+                  <Text variant="caption" colorToken="textTertiary">
+                    Accrued Interest
+                  </Text>
+                  <Text variant="subheading" tone="accent" style={{ marginTop: 2 }}>
+                    +${(activeLedger.totalInterestMinor / 100).toFixed(2)}
+                  </Text>
+                </View>
+
+                <View style={[styles.statBox, { backgroundColor: theme.colors.surfaceSunken }]}>
+                  <Text variant="caption" colorToken="textTertiary">
+                    Statutory Penalties
+                  </Text>
+                  <Text variant="subheading" tone="accent" style={{ marginTop: 2 }}>
+                    +${(activeLedger.totalPenaltiesMinor / 100).toFixed(2)}
+                  </Text>
+                </View>
+              </Row>
+
+              {activeSentinel?.mostUrgentClock ? (
+                <View style={[styles.sentinelAlert, { backgroundColor: theme.colors.surfaceSunken, marginTop: theme.spacing.md }]}>
+                  <Row between align="center">
+                    <Row align="center" gap="xs">
+                      <IconTile
+                        icon="clock-alert-outline"
+                        tone={activeSentinel.mostUrgentClock.urgency === 'CRITICAL' || activeSentinel.mostUrgentClock.urgency === 'EXPIRED' ? 'danger' : 'warn'}
+                        size="sm"
+                      />
+                      <View style={styles.flex}>
+                        <Text variant="bodySmall" numberOfLines={1}>
+                          {activeSentinel.mostUrgentClock.title}
+                        </Text>
+                        <Text variant="caption" colorToken="textTertiary">
+                          {activeSentinel.mostUrgentClock.remedyAction}
+                        </Text>
+                      </View>
+                    </Row>
+                    <Chip
+                      label={activeSentinel.mostUrgentClock.daysRemaining <= 0 ? 'Due Now' : `${activeSentinel.mostUrgentClock.daysRemaining}d left`}
+                      tone={activeSentinel.mostUrgentClock.urgency === 'CRITICAL' || activeSentinel.mostUrgentClock.urgency === 'EXPIRED' ? 'danger' : 'warn'}
+                      size="sm"
+                    />
+                  </Row>
+                </View>
+              ) : null}
+            </Surface>
+          </SlideUpIn>
+        ) : null}
+
+        {/* Case Switcher Chips */}
         {cases.length > 1 ? (
           <SlideUpIn>
             <View style={{ gap: theme.spacing.sm }}>
-              <Text variant="caption" colorToken="textTertiary">
-                Case
+              <Text variant="label" colorToken="textSecondary">
+                Select Case
               </Text>
               <Row gap="sm" wrap>
                 {cases.map((item) => {
@@ -214,67 +243,47 @@ export default function InsightsScreen() {
           </SlideUpIn>
         ) : null}
 
+        {/* Case Detail Banner & Contradiction Analysis */}
         {activeCase ? (
           <FadeIn key={activeCase.id}>
             <Stagger gap="lg">
-              <Surface glass glassVariant="hero" elevation="medium" radius="xl" padding="xl">
-                <Row between align="flex-start" gap="md">
+              <Surface glass elevation="low" radius="lg" padding="lg">
+                <Row between align="center" gap="md">
                   <View style={styles.flex}>
-                    <Text variant="title" numberOfLines={2}>
+                    <Text variant="title" numberOfLines={1}>
                       {activeCase.title}
                     </Text>
                     {activeCase.category ? (
                       <Text
                         variant="caption"
                         colorToken="textSecondary"
-                        style={{ marginTop: theme.spacing.xs }}
+                        style={{ marginTop: 2 }}
                       >
                         {activeCase.category}
                       </Text>
                     ) : null}
                   </View>
-                  <Pressable
+                  <Button
+                    label="Open Case"
+                    icon="arrow-right"
+                    variant="secondary"
+                    size="sm"
                     onPress={() =>
                       router.push({
                         pathname: '/case/[caseId]',
                         params: { caseId: activeCase.id },
                       })
                     }
-                    dimOnPress
-                    pressScale={0}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Open ${activeCase.title}`}
-                    // `minHeight`, not a grown `hitSlop`. The control measured about 36pt and
-                    // padded the difference with invisible slop, so the thing the user aims
-                    // at and the thing that responds were two different rectangles. The
-                    // visible target is now the touchable one.
-                    style={styles.inlineAction}
-                  >
-                    {/* `textAccent`, not `accent`. `colors.accent` is the gold that paints
-                        structure — icon tints, focus rings, selection borders — and it is
-                        not verified as a text colour on this fill. */}
-                    <Text variant="label" colorToken="textAccent">
-                      Open case
-                    </Text>
-                  </Pressable>
-                </Row>
-
-                {activeCase.lastAnalyzedAt === null ? (
-                  <Chip
-                    label="Not analysed yet"
-                    tone="neutral"
-                    size="sm"
-                    style={{ marginTop: theme.spacing.md, alignSelf: 'flex-start' }}
                   />
-                ) : null}
+                </Row>
               </Surface>
 
               {analysis === 'ready' ? (
                 <CaseAnalysisPanel key={activeCase.id} workspace={state.workspace} caseId={activeCase.id} />
               ) : analysis === 'missing' ? (
                 <ErrorState
-                  title="This case would not open"
-                  message="It is still in your list, but none of its contents came back. It may have been deleted on another device, or the last update may not have finished."
+                  title="This case could not be opened"
+                  message="Case data could not be retrieved from local or remote store."
                   onRetry={refresh}
                   compact
                 />
@@ -290,16 +299,22 @@ export default function InsightsScreen() {
 }
 
 const styles = StyleSheet.create({
-  // `LAYOUT.maxContentWidth`, not a literal 960. Every other screen in the app caps its
-  // column at the token, so this one was 240pt wider than the rest on a tablet.
   column: { maxWidth: LAYOUT.maxContentWidth, width: '100%', alignSelf: 'center' },
-  // A pill of text is about 37pt tall on its own, which is under the minimum touch target.
   switch: {
     borderWidth: BORDER_WIDTH.hairline,
     maxWidth: LAYOUT.maxContentWidth / 3,
     minHeight: HIT_TARGET,
     justifyContent: 'center',
   },
-  inlineAction: { minHeight: HIT_TARGET, justifyContent: 'center' },
   flex: { flex: 1 },
+  statBox: {
+    flex: 1,
+    padding: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  sentinelAlert: {
+    padding: 10,
+    borderRadius: 8,
+  },
 });

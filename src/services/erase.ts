@@ -40,6 +40,16 @@
  * The sign-in itself also survives — this removes data, not the account. The screen that calls
  * this says so in those words, because a user who believed their login was gone and later
  * found it working would have been misled by us rather than by Firebase.
+ *
+ * One thing survives that nobody chose. Firestore's persistent cache is dropped at the end of
+ * the sweep, but Firestore's own documentation is explicit that doing so "does not attempt to
+ * securely overwrite or otherwise make cached data unrecoverable", and recommends not enabling
+ * persistence at all where that matters. So an erase ends the app's access to those copies; it
+ * is not a guarantee against someone holding the device and a forensic tool. The alternative is
+ * to turn persistence off, which costs every offline read — a case is most often wanted in a
+ * meeting or on a train — so it is a product decision rather than a bug to quietly fix here.
+ * It is written down so that the next reader does not assume a stronger promise than the one
+ * this file can keep.
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -142,6 +152,18 @@ export async function eraseEverything(repository: Repository, ownerId: string): 
 
   // Provider keys live in the platform keystore, which `getAllKeys` cannot see.
   for (const provider of AI_PROVIDER_IDS) await clearKey(provider);
+
+  // Last, and last for a reason. The Firestore adapter keeps an on-disk copy of every
+  // document it has read — the extracted text of every source included — which none of the
+  // sweeps above can reach: it is not a file this app wrote and not a key `getAllKeys`
+  // returns. Dropping it also drops any write still queued in it, which is why it cannot run
+  // before `clear` has been acknowledged; see `Repository.dropLocalCache`. Adapters that
+  // cache nothing do not implement it, so the call is optional rather than a no-op method
+  // on each of them.
+  //
+  // It also ends this repository instance. `eraseEverything` is only ever followed by a
+  // sign-out, which rebuilds one — see the caller in the profile screen.
+  await repository.dropLocalCache?.();
 }
 
 /**

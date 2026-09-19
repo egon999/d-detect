@@ -6,12 +6,13 @@ import { confirmEvidenceFields, deleteEvidence, linkEntities, reviewAiSuggestion
 import { put } from '@data/repository';
 import type { EntityRef, Extraction, Provenance } from '@domain/models';
 import { PROCESSING_STATE_LABELS, RELATIONSHIP_LABELS, type RelationshipType } from '@domain/enums';
+import { shortDigest } from '@domain/analysis/audit-chain';
 import { latestCaseAnalysis } from '@domain/analysis/case-report';
 import { CitationList } from '@features/analysis/case-analysis-panel';
 import { confidenceBand, readStoredEvidenceFile, requestEvidenceProcessing, useRepository, useSession, type PrivateEvidenceFile } from '@services';
 import { eraseOriginals } from '@services/erase';
 import { mutationContext, useCaseRecord, useWorkspace } from '@services/use-case-store';
-import { Button, Chip, CONFIDENCE_LABELS, IconButton, Notice, PaperSheet, ProvenanceValue, Row, routeParam, ScreenScroll, SlideUpIn, Surface, Text, TextField, formatBytes, readableError, useTheme } from '@ui';
+import { Button, Chip, CONFIDENCE_LABELS, Icon, IconButton, Notice, PaperSheet, ProvenanceValue, Row, routeParam, ScreenScroll, SlideUpIn, Surface, Text, TextField, formatBytes, readableError, useTheme } from '@ui';
 
 const LINK_TYPES: RelationshipType[] = ['RELEVANT_TO_CLAIM', 'SUPPORTS', 'CONTRADICTS', 'ATTACHED_TO_EVENT'];
 const timestamp = (milliseconds: number) => `${Math.floor(milliseconds / 60000)}:${Math.floor(milliseconds / 1000 % 60).toString().padStart(2, '0')}`;
@@ -97,7 +98,7 @@ export default function EvidenceDetailScreen() {
   const [correctionPath, setCorrectionPath] = useState('');
   const [correction, setCorrection] = useState('');
   const [showRemove, setShowRemove] = useState(false);
-  const [visibleSegments, setVisibleSegments] = useState(40);
+  const [visibleSegments, setVisibleSegments] = useState(10);
   const [showMetadata, setShowMetadata] = useState(false);
   const report = latestCaseAnalysis(workspace, caseId ?? '');
   const citations = useMemo(() => report?.claims.flatMap(assessment => assessment.citations).filter(citation => citation.evidenceId === evidenceId) ?? [], [report, evidenceId]);
@@ -139,12 +140,41 @@ export default function EvidenceDetailScreen() {
   const correctionFields: ReadonlyArray<{ path: string; label: string; value: string; provenance: Provenance | null; caveat: string | null }> = extraction && evidence ? [
     { path: 'documentType', label: 'Document type', value: extraction.documentType, provenance: { evidenceId: evidence.id, method: 'DETERMINISTIC' }, caveat: null },
     ...CORRECTION_FIELD_KEYS.flatMap(key => {
-      const fields = extraction[key];
+      /*
+        Sifted for holes before it is mapped, because this list is not guaranteed to be dense.
+
+        `effectiveExtraction` layers a person's corrections over the machine extraction by field
+        path, and a path is an index - `phones.3` means the fourth phone number the extractor
+        found on the run that produced it. Reprocessing replaces the extraction and deliberately
+        keeps the corrections (`mutations.ts` leaves `confirmedFields` untouched), so a second,
+        cleaner pass that finds fewer phone numbers leaves that correction pointing past the end
+        of the new list. `effectiveExtraction` handles it by assigning the carried-over value to
+        its original position, which is the right call - the position *is* the path, so moving
+        the value would silently re-key it to a field it is not about - but it builds that array
+        by writing to the position, and every position below it the new extraction did not fill
+        stays a hole. Spreading a sparse array yields `undefined` at each hole rather than
+        skipping it, so `field.original` below threw during render.
+
+        That crash was not recoverable from inside the app: the only control that can delete the
+        offending correction is on this screen, so the screen a person had to reach to fix it was
+        the screen that died on it. The root cause is a write-side one and is being fixed there.
+        This guard is what keeps a malformed map from taking the screen down in the meantime, and
+        it is worth keeping afterwards - a render pass has no business trusting a list to be
+        dense, and a field that no longer exists is a thing to omit rather than to throw on.
+
+        The paths keep coming from the original index, never from the position in the sifted
+        list, so nothing here can introduce the re-keying that skipping the hole avoids.
+      */
+      const present = extraction[key].flatMap((field, index) =>
+        (field as typeof field | undefined) === undefined ? [] : [{ field, index }],
+      );
       // Number only when there is more than one of a field, so a lone amount reads "Amount"
-      // rather than "Amount 1", which would imply a second the reader should look for.
-      return fields.map((field, index) => ({
+      // rather than "Amount 1", which would imply a second the reader should look for. Counted
+      // over what is actually shown: numbering by the raw index would print "Amount 1" beside
+      // "Amount 4" and send the reader looking for two that are not there.
+      return present.map(({ field, index }, ordinal) => ({
         path: `${key}.${index}`,
-        label: fields.length > 1 ? `${FIELD_LABELS[key]} ${index + 1}` : FIELD_LABELS[key],
+        label: present.length > 1 ? `${FIELD_LABELS[key]} ${ordinal + 1}` : FIELD_LABELS[key],
         value: field.original,
         // The entry *is* the provenance record — `textFieldSchema` and the rest extend it.
         provenance: field satisfies Provenance,
@@ -253,66 +283,87 @@ export default function EvidenceDetailScreen() {
           <Text variant="caption" colorToken="textSecondary">{selectedSegment.page ? `Page ${selectedSegment.page} | ` : ''}{selectedSegment.startMs !== undefined ? `${timestamp(selectedSegment.startMs)}${selectedSegment.endMs !== undefined ? ` to ${timestamp(selectedSegment.endMs)}` : ''} | ` : ''}{selectedSegment.method === 'MANUAL' ? 'User-provided statement' : 'Extracted content; check against the original'}</Text>
         </Surface> : segmentId ? <Notice title="The cited passage changed" message="This segment is no longer in the current extraction. Review the original and request an updated assessment." tone="warn" /> : null}
         <Surface padding="lg" style={panel}>
-          <Text variant="subheading">{PROCESSING_STATE_LABELS[evidence.state]}</Text>
-          <Text variant="bodySmall" colorToken="textSecondary">{evidence.fileName ?? 'Typed statement'}{evidence.sizeBytes !== null ? ` | ${formatBytes(evidence.sizeBytes)}` : ''}</Text>
-          {evidence.sourceLabel ? <Text colorToken="textSecondary">Source: {evidence.sourceLabel}</Text> : null}
-          {evidence.capturedAt ? <Text colorToken="textSecondary">Recorded time: {evidence.capturedAt}</Text> : null}
-          {evidence.note ? <Text>{evidence.note}</Text> : null}
-          {/* Suppressed when the file itself is missing: the notice below says that in the
-              words that fit, and two warnings about one record read as two problems. */}
-          {!missingOriginal && (evidence.failureReason || jobs[0]?.state === 'FAILED') ? <Notice tone="warn" title="Processing could not finish" message={readableError(evidence.failureReason || jobs[0]?.lastError, 'Check that the original file still opens, then process it again.')} /> : null}
-          {processing ? <Text colorToken="textSecondary">The original is being processed. You can leave this screen and return later.</Text> : null}
-          {missingOriginal ? <Notice tone="warn" title="The original file was never stored" message="This entry was created but its file did not finish uploading, so there is nothing here to read. Add the file to complete it — nothing has been analysed from it." /> : null}
-          <Row gap="sm" style={{ flexWrap: 'wrap' }}>
-            {evidence.storagePath ? <Button label="View original" variant="secondary" loading={busy} onPress={() => void openOriginal()} /> : null}
-            {/* The one button that can actually move this record forward. The Process button
-                below is correctly disabled without a stored original, and for a long time that
-                was the whole offer: a dead row, a disabled button, and a sentence telling the
-                user to go somewhere they could not get to from here. */}
-            {missingOriginal
-              ? <Button label="Add the original file" onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId: evidence.caseId } })} />
-              : <Button label={processing ? 'Processing...' : extraction ? 'Reprocess original' : 'Process evidence'} disabled={busy || processing} onPress={() => void retry()} />}
-            <Button label="Link to a claim or event" variant="ghost" onPress={() => setShowLink(true)} />
+          <Row justify="space-between" align="center" style={{ flexWrap: 'wrap', gap: 8 }}>
+            <Chip
+              label={PROCESSING_STATE_LABELS[evidence.state]}
+              tone={evidence.state === 'EXTRACTED' || evidence.state === 'ANALYZED' || evidence.state === 'CONFIRMED' ? 'ok' : evidence.state === 'FAILED' ? 'danger' : 'accent'}
+              size="sm"
+            />
+            {evidence.sha256 ? (
+              <Row align="center" gap="xs">
+                <Icon name="shield-check" size={14} color={theme.tone('ok').fg} />
+                <Text variant="monoSmall" selectable>
+                  SHA-256: {shortDigest(evidence.sha256, 6)}
+                </Text>
+              </Row>
+            ) : null}
+          </Row>
+
+          <Text variant="bodySmall" colorToken="textSecondary">
+            {evidence.fileName ?? 'Typed statement'}{evidence.sizeBytes !== null ? ` · ${formatBytes(evidence.sizeBytes)}` : ''}
+            {evidence.sourceLabel ? ` · Source: ${evidence.sourceLabel}` : ''}
+          </Text>
+          {evidence.capturedAt ? <Text variant="caption" colorToken="textTertiary">Recorded: {evidence.capturedAt}</Text> : null}
+          {evidence.note ? <Text style={{ marginTop: 2 }}>{evidence.note}</Text> : null}
+
+          {!missingOriginal && (evidence.failureReason || jobs[0]?.state === 'FAILED') ? (
+            <Notice tone="warn" title="Processing could not finish" message={readableError(evidence.failureReason || jobs[0]?.lastError, 'Check that the original file still opens, then process it again.')} />
+          ) : null}
+          {processing ? <Text colorToken="textSecondary">Processing on-device. Results will appear here once ready.</Text> : null}
+          {missingOriginal ? <Notice tone="warn" title="Original file not stored" message="This entry was created but its file did not finish uploading. Re-add the file to enable extraction." /> : null}
+
+          <Row gap="sm" style={{ flexWrap: 'wrap', marginTop: 4 }}>
+            {evidence.storagePath ? (
+              <Button label="View original" variant="primary" icon="eye-outline" loading={busy} onPress={() => void openOriginal()} />
+            ) : null}
+            {missingOriginal ? (
+              <Button label="Add original file" onPress={() => router.push({ pathname: '/case/[caseId]/upload', params: { caseId: evidence.caseId } })} />
+            ) : (
+              <Button label={processing ? 'Processing…' : extraction ? 'Reprocess' : 'Process'} variant="secondary" icon="refresh" disabled={busy || processing} onPress={() => void retry()} />
+            )}
+            <Button label="Connect" variant="ghost" icon="link-variant" onPress={() => setShowLink(true)} />
           </Row>
         </Surface>
         {extraction?.limitations.length ? <Notice tone="warn" title="Reading limitations" message={extraction.limitations.join('\n')} /> : null}
-        {aiReadings.length ? <Surface padding="lg" style={panel}>
-          <Text variant="subheading">AI reading</Text>
-          <Text variant="bodySmall" colorToken="textSecondary">A connected model's reading of this source, offered for review. It changes nothing here; confirm any value through the corrections below.</Text>
-          {aiReadings.map(item => {
-            const contestRisk = contestRiskLine(item.payload);
-            return <View key={item.id} style={{ gap: 8 }}>
-              {item.status !== 'SUGGESTED' ? <Chip label={item.status === 'ACCEPTED' ? 'Accepted' : 'Dismissed'} tone="neutral" size="sm" /> : null}
-              <Text variant="bodySmall">{item.summary}</Text>
-              {contestRisk ? <Text variant="bodySmall" colorToken="textSecondary">{contestRisk}</Text> : null}
-              <Text variant="caption" colorToken="textSecondary">{item.confidence === null ? 'The model reported no confidence for this reading' : `The model's own confidence: ${CONFIDENCE_LABELS[confidenceBand(item.confidence)]}`}</Text>
-              {item.status === 'SUGGESTED' ? <Row gap="sm" style={{ flexWrap: 'wrap' }}>
-                <Button label="Accept" size="sm" disabled={busy} onPress={() => void reviewReading(item.id, 'ACCEPTED')} />
-                <Button label="Dismiss" size="sm" variant="secondary" disabled={busy} onPress={() => void reviewReading(item.id, 'REJECTED')} />
-              </Row> : null}
-            </View>;
-          })}
-        </Surface> : null}
+        {aiReadings.length ? (
+          <Surface padding="lg" style={panel}>
+            <Row align="center" gap="sm">
+              <Icon name="brain" size={16} color={theme.colors.accent} />
+              <Text variant="subheading">Model Extraction Proposal</Text>
+            </Row>
+            <Text variant="caption" colorToken="textSecondary">
+              Field suggestions extracted by model analysis. Confirm or edit below.
+            </Text>
+            {aiReadings.map(item => {
+              const contestRisk = contestRiskLine(item.payload);
+              return (
+                <View key={item.id} style={{ gap: 8 }}>
+                  {item.status !== 'SUGGESTED' ? <Chip label={item.status === 'ACCEPTED' ? 'Accepted' : 'Dismissed'} tone="neutral" size="sm" /> : null}
+                  <Text variant="bodySmall">{item.summary}</Text>
+                  {contestRisk ? <Text variant="bodySmall" colorToken="textSecondary">{contestRisk}</Text> : null}
+                  <Text variant="caption" colorToken="textSecondary">
+                    {item.confidence === null ? 'No model confidence score reported' : `Confidence: ${CONFIDENCE_LABELS[confidenceBand(item.confidence)]}`}
+                  </Text>
+                  {item.status === 'SUGGESTED' ? (
+                    <Row gap="sm" style={{ flexWrap: 'wrap' }}>
+                      <Button label="Accept" size="sm" disabled={busy} onPress={() => void reviewReading(item.id, 'ACCEPTED')} />
+                      <Button label="Dismiss" size="sm" variant="secondary" disabled={busy} onPress={() => void reviewReading(item.id, 'REJECTED')} />
+                    </Row>
+                  ) : null}
+                </View>
+              );
+            })}
+          </Surface>
+        ) : null}
         <View style={panel}>
           <Text variant="heading">Extracted content</Text>
           {!extraction?.sourceText ? <Text colorToken="textSecondary">No readable content is available yet. Processing results and any limitations will appear here.</Text> : <>
             <Text variant="bodySmall" colorToken="textSecondary">The passages below preserve what was extracted. OCR and transcription can misread content; compare significant details with the original.</Text>
-            {/*
-              Paper, not glass. These are the document's own characters, and they were being
-              rendered in the same rounded surface the app uses for its own panels — so the
-              longest and most important verbatim text in the product looked like chrome, and a
-              reader had nothing to tell "what my evidence says" from "what the app says about
-              it". `PaperSheet` is the material that draws that line; see `PaperTokens`.
-
-              The folio is a locator and a real sequence, which is the one thing that earns a
-              number here, and it is set in `paper.meta` because the page count is the app's
-              mark on the page rather than something the document wrote.
-            */}
             {extraction.segments.length ? extraction.segments.slice(0, visibleSegments).map((segment, index) => <PaperSheet key={segment.id} emphasis={segment.id === segmentId ? 'accent' : null}>
               <Text variant="monoSmall" style={{ color: paper.meta }}>{segment.page ? `Page ${segment.page}` : `Passage ${index + 1}`}{segment.startMs !== undefined ? ` | ${timestamp(segment.startMs)}${segment.endMs !== undefined ? ` to ${timestamp(segment.endMs)}` : ''}` : ''}</Text>
               <Text variant="mono" selectable style={{ color: paper.text }}>{segment.text}</Text>
             </PaperSheet>) : <PaperSheet><Text variant="mono" selectable style={{ color: paper.text }}>{extraction.sourceText}</Text></PaperSheet>}
-            {extraction.segments.length > visibleSegments ? <Button variant="secondary" label="Show more passages" onPress={() => setVisibleSegments(value => value + 40)} /> : null}
+            {extraction.segments.length > visibleSegments ? <Button variant="secondary" label={`Show more passages (${visibleSegments} of ${extraction.segments.length})`} onPress={() => setVisibleSegments(value => value + 20)} /> : null}
           </>}
         </View>
         {citations.length ? <View style={panel}><Text variant="heading">Used in the saved assessment</Text><CitationList citations={citations} workspace={workspace} caseId={evidence.caseId} /></View> : null}

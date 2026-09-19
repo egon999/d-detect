@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const api = vi.hoisted(() => vi.fn());
-vi.mock('../src/services/api-client', () => ({ apiJson: api }));
+vi.mock('../src/services/api-client', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/services/api-client')>()), apiJson: api }));
 import { RemoteRepository } from '../src/data/remote/remote-repository';
 import { emptyWorkspace } from '../src/domain/models';
 import { testCase, evidence } from './helpers';

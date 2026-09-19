@@ -109,6 +109,35 @@ export function evidenceLabel(item: Evidence): string {
 }
 
 /**
+ * Quotes a piece of the user's own text at a length a finding can afford.
+ *
+ * A rule's `explanation` has a budget — see `docs/copy-doctrine.md` and `tests/rule-copy.test.ts`
+ * — and every rule that quotes a claim statement, an event title or a document name is quoting
+ * something the user typed, which has no length at all. One person's claim is eight words and
+ * the next person's is a paragraph, so a template that reads comfortably against the sample case
+ * can overrun the card against a real one. The rule cannot control that, and truncating at the
+ * point of use is the only place it can be controlled: by the time the string reaches the card
+ * it is one sentence with no seam to cut on.
+ *
+ * Cut on a word boundary rather than mid-word, because a quotation that stops inside a word
+ * reads as a rendering bug and invites the reader to distrust the rest of the card. The ellipsis
+ * is the real character, not three dots, so it is clear the text was shortened by the app rather
+ * than trailing off in the source.
+ *
+ * Returns the text already wrapped in quotation marks. Callers used to add their own, and a
+ * truncated string then closed its quote after the ellipsis or before it depending on who wrote
+ * the template.
+ */
+export function quoteShort(text: string, max = 64): string {
+  const clean = text.trim();
+  if (clean.length <= max) return `"${clean}"`;
+  // `\s+\S*$` drops the partial final word along with the space before it. If the cut lands
+  // inside a single very long token there is nothing to trim, so the slice stands as-is.
+  const cut = clean.slice(0, max).replace(/\s+\S*$/, '');
+  return `"${(cut || clean.slice(0, max)).trimEnd()}…"`;
+}
+
+/**
  * Reader-facing wording for a transaction status.
  *
  * The stored value is a screaming-snake enum because it is a machine field the extractor

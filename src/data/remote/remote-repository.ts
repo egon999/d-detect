@@ -1,6 +1,43 @@
-import { userProfileSchema, workspaceSchema, type Case, type UserProfile, type Workspace } from '@domain/models';
+import { emptyWorkspace, userProfileSchema, type Case, type UserProfile, type Workspace } from '@domain/models';
 import { apiJson } from '@services/api-client';
-import { assertOwnership, workspaceForCase, type Change, type CommitOutcome, type Repository, type Unsubscribe } from '../repository';
+import { assertOwnership, Skipped, WORKSPACE_COLLECTIONS, workspaceForCase, type Change, type CommitOutcome, type Repository, type SkipSource, type StoredRecord, type Unsubscribe, type WorkspaceCollection } from '../repository';
+
+/**
+ * How a skipped row is named in a log line from this adapter.
+ *
+ * The tallying is `Skipped`, on the port: this endpoint serves an app whose records outlive the
+ * build that wrote them, which is the same problem the device store and Firestore have, and
+ * three copies of the answer meant three places to fix the next thing learned about it. What
+ * stays here is the wording — `[remote]` is how a developer tells a row the platform server
+ * returned unreadable from one a phone had stored that way.
+ */
+const REMOTE_SKIPS: SkipSource = { adapter: 'remote', noun: 'record' };
+
+/**
+ * Turns one `/api/workspace` body into a workspace.
+ *
+ * Two failures survive as whole-account refusals, and only two. A body that is not an object
+ * is not a workspace with bad rows in it — it is the wrong response, and there is nothing in it
+ * to keep. A body carrying another owner's records is a server fault or a session crossed with
+ * someone else's, and this product cannot show a user another person's evidence to salvage a
+ * screen; that check runs over the kept rows, and a foreign row the schema dropped is already
+ * gone rather than merely unreported.
+ */
+function readWorkspace(data: unknown, ownerId: string): Workspace {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new Error('The case data could not be read. Please refresh or contact support.');
+  }
+  const body = data as Partial<Record<WorkspaceCollection, unknown>>;
+  const skipped = new Skipped(REMOTE_SKIPS);
+  const workspace = emptyWorkspace();
+  const slots = workspace as Record<WorkspaceCollection, StoredRecord[]>;
+  for (const name of WORKSPACE_COLLECTIONS) slots[name] = skipped.keep(name, body[name]);
+  skipped.report('an account');
+  for (const name of WORKSPACE_COLLECTIONS) {
+    if (slots[name].some(record => record.ownerId !== ownerId)) throw new Error('The workspace contains records from another account.');
+  }
+  return workspace;
+}
 
 /** Persistent platform data over authenticated HTTP. Polls observe durable worker updates. */
 export class RemoteRepository implements Repository {
@@ -22,14 +59,9 @@ export class RemoteRepository implements Repository {
   private async load(ownerId: string): Promise<Workspace> {
     const pending = this.pendingLoads.get(ownerId);
     if (pending) return pending;
-    const request = apiJson('/api/workspace', {}, ownerId).then(data => {
-      const parsed = workspaceSchema.safeParse(data);
-      if (!parsed.success) throw new Error('The case data could not be read. Please refresh or contact support.');
-      for (const records of Object.values(parsed.data)) {
-        if (records.some(record => record.ownerId !== ownerId)) throw new Error('The workspace contains records from another account.');
-      }
-      return parsed.data;
-    }).finally(() => { this.pendingLoads.delete(ownerId); });
+    const request = apiJson('/api/workspace', {}, ownerId)
+      .then(data => readWorkspace(data, ownerId))
+      .finally(() => { this.pendingLoads.delete(ownerId); });
     this.pendingLoads.set(ownerId, request);
     return request;
   }

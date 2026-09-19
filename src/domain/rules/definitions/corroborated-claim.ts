@@ -1,5 +1,10 @@
 import type { Rule, RuleFinding } from '../types';
-import { distinctEvidenceLabels, evidenceLinkedTo, independentSources } from '../support';
+import {
+  distinctEvidenceLabels,
+  evidenceLinkedTo,
+  independentSources,
+  quoteShort,
+} from '../support';
 
 /**
  * A claim backed by more than one independent source.
@@ -26,9 +31,9 @@ export const corroboratedClaimRule: Rule = {
   evaluate(context) {
     const findings: RuleFinding[] = [];
 
-    // This rule counts sources — "3 independent sources" — and then lists them. Two of them
-    // sharing a title would show a reader a shorter list than the number they were just
-    // given, which reads as a miscount rather than as a naming collision.
+    // This rule counts sources — "3 independent sources" — and the `Sources` row below names
+    // them. Two of them sharing a title would show a reader a shorter list than the number they
+    // were just given, which reads as a miscount rather than as a naming collision.
     const labelOf = distinctEvidenceLabels(context.evidence);
 
     for (const claim of context.claims) {
@@ -46,13 +51,16 @@ export const corroboratedClaimRule: Rule = {
       findings.push({
         key: [claim.id, ...independent.map((item) => item.id)],
         title: `${independent.length} independent sources support this claim`,
-        explanation:
-          `"${claim.statement}" is supported by ${independent.length} separate sources: ` +
-          `${independent.map((item) => `"${labelOf.get(item.id) ?? item.id}"`).join(', ')}. ` +
-          `They are counted as independent because they are not copies of one another and ` +
-          `no duplicate or derived-from link connects them. This is the strongest position a ` +
-          `claim can hold in this case; it is still a statement about your evidence, not a ` +
-          `verified fact.`,
+        // The sources are named in `inputs.Sources` and nowhere else. This sentence used to
+        // enumerate them too, which put the same list of filenames on the card twice — once in
+        // prose and once in the table directly beneath it — and made the observation as long as
+        // the case had documents. A sentence is a bad list; the table is a good one.
+        explanation: `${quoteShort(claim.statement)} is supported by ${independent.length} separate sources.`,
+        caveat:
+          'They are counted as independent because they are not copies of one another and no ' +
+          'duplicate or derived-from link connects them. This is the strongest position a claim ' +
+          'can hold in this case, and it is still a statement about your evidence rather than a ' +
+          'finding about what happened.',
         confidence: 'STRONG_MATCH',
         relatedClaimIds: [claim.id],
         supportingEvidenceIds: independent.map((item) => item.id),

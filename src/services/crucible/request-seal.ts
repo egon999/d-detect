@@ -17,6 +17,11 @@
  * drift into signing different things. The API path is the one that runs today: the Firebase
  * project is on the Spark plan, where Cloud Functions cannot be deployed at all.
  *
+ * That last sentence used to be documentation only, while the code carried on offering the
+ * callable to every signed-in user and turning each tap into a warning toast. It is now a
+ * value — `FIREBASE_SEAL_CALLABLE_DEPLOYED` — that `sealAvailability` reads, so the screen
+ * and the request agree with this comment instead of contradicting it.
+ *
  * ## What is sent, and why it is so little
  *
  * A case id. Nothing else. Not the chain head, not the entry count, not a key id — the
@@ -58,6 +63,65 @@ export type SealOutcome =
   /** The server declined, and said why in words meant to be read. */
   | { kind: 'refused'; reason: string };
 
+/**
+ * Whether a signer can be reached for a case — which is not the question of where the case
+ * is stored, and the whole reason this type exists.
+ *
+ * The ribbon used to ask the storage question (`repositoryKind !== 'local'`) and read the
+ * answer as the signing one. For the Firebase adapter the two answers differ: the records are
+ * on a server, so a "Seal this record" button appeared on every case in the default build,
+ * and no `sealCase` is deployed there, so every tap came back as a warning toast. Three
+ * states instead of a boolean, because the two unsealable ones are unsealable for unrelated
+ * reasons and the copy has to be able to tell a reader which one they are in.
+ */
+export type SealAvailability =
+  /** A signer answers: `POST /api/cases/{id}/seal` on the platform server, which holds a key. */
+  | 'available'
+  /** The case exists only in this device's storage, so no server has ever read it. */
+  | 'device-only'
+  /** The case is on a server, and no signer is deployed for this build to ask. */
+  | 'no-service';
+
+/**
+ * Whether a `sealCase` callable is deployed on the Firebase project this build talks to.
+ *
+ * `false`, and not as a placeholder awaiting wiring: the project is on the Spark plan, where
+ * Cloud Functions cannot be deployed at all. The callable transport below is complete and
+ * correct; there is simply nothing on the other end of it. So the honest answer for a Firebase
+ * workspace is that no signer exists to ask, rather than that a request might work.
+ *
+ * Compiled in rather than read from an `EXPO_PUBLIC_*` variable, in the same spirit as
+ * `ACTIVE_SEAL_KEY_ID`: it is a fact about what was deployed alongside this binary, and a
+ * build that learns it from the environment can be handed a `true` that no deployment backs —
+ * which puts the button back, and the button is the defect.
+ *
+ * Change to `true` only once `firebase deploy --only functions:sealCase` has actually
+ * succeeded against the project named in `app.json`, which means moving that project to the
+ * Blaze plan first. Nothing else needs changing: the callable path is still here, its status
+ * mapping is still `interpretCallableError`, and the copy for a reachable signer is the copy
+ * the `remote` transport already shows.
+ */
+export const FIREBASE_SEAL_CALLABLE_DEPLOYED: boolean = false;
+
+/**
+ * Whether anything can sign a case in this session.
+ *
+ * Takes the repository kind because that is what a screen has to hand, and deliberately
+ * answers a different question from the one it was asked. Kept here rather than in the copy
+ * layer so that the button and the request cannot disagree: `requestSeal` consults the same
+ * function, so a state that shows no button is also a state that opens no socket.
+ */
+export function sealAvailability(repositoryKind: RepositoryKind): SealAvailability {
+  switch (repositoryKind) {
+    case 'local':
+      return 'device-only';
+    case 'remote':
+      return 'available';
+    case 'firebase':
+      return FIREBASE_SEAL_CALLABLE_DEPLOYED ? 'available' : 'no-service';
+  }
+}
+
 const REGION = 'us-central1';
 
 const OFFLINE =
@@ -78,10 +142,15 @@ const LOCAL_ONLY =
 /**
  * No `sealCase` on the other end.
  *
- * Says what is actually known — the request reached Firebase and Firebase had no such
- * function — and what is not: nothing about this record was read, judged or rejected. It also
- * says the history is untouched, because "sealing failed" on an integrity screen reads as
- * though something happened to the records, and nothing did.
+ * Says what is actually known — this build has no signer to ask — and what is not: nothing
+ * about this record was read, judged or rejected. It also says the history is untouched,
+ * because "sealing failed" on an integrity screen reads as though something happened to the
+ * records, and nothing did.
+ *
+ * Reached two ways, and true of both. `FIREBASE_SEAL_CALLABLE_DEPLOYED` is false, so a
+ * Firebase workspace gets this sentence without a request leaving the device; a platform
+ * server with no sealing route answers 404 and gets it after one. The wording does not name a
+ * request either way, because in the first case there was none.
  */
 const NO_SEALING_SERVICE =
   'This build has no sealing server to ask, so no signature could be made. Nothing was read and nothing in the case has changed — the history and the chain above are exactly as they were.';
@@ -101,9 +170,17 @@ export async function requestSeal(
   caseId: string,
   options: { repositoryKind: RepositoryKind },
 ): Promise<SealOutcome> {
-  // The local adapter has no signer by construction: the case exists only in this device's
-  // storage, so there is nothing a server could have read.
-  if (options.repositoryKind === 'local') return { kind: 'unavailable', reason: LOCAL_ONLY };
+  // Both unsealable states are known before any work is done, and both end in a fixed
+  // sentence, so the request is not made. A round trip whose every outcome is the same
+  // outcome is latency spent to learn nothing — and on the Firebase path it is also a call
+  // this module already knows lands on no function at all.
+  //
+  // Decided here rather than trusted from the caller: the ribbon reads the same
+  // `sealAvailability`, but a screen that got it wrong should still not be able to get a
+  // request out of this module.
+  const availability = sealAvailability(options.repositoryKind);
+  if (availability === 'device-only') return { kind: 'unavailable', reason: LOCAL_ONLY };
+  if (availability === 'no-service') return { kind: 'unavailable', reason: NO_SEALING_SERVICE };
   if (options.repositoryKind === 'remote') return sealOverApi(caseId);
 
   try {
@@ -126,7 +203,7 @@ export async function requestSeal(
 
     return outcomeFrom(data);
   } catch (error) {
-    return interpret(error);
+    return interpretCallableError(error);
   }
 }
 
@@ -135,8 +212,20 @@ export async function requestSeal(
  *
  * `POST /api/cases/{id}/seal` reaches the same `sealCase` the Cloud Function wraps — one
  * implementation, two transports — so a seal made here is the same bytes over the same
- * payload, checked by the same `verifySealedHistory` on the way back in. What differs is who
- * ran it, and the ribbon says so: see `sealSignerNote` in `@features/crucible/seal-copy`.
+ * payload, checked by the same `verifySealedHistory` on the way back in.
+ *
+ * What differs is who ran it, and that difference is not carried by this function. It is
+ * carried by the `keyId` the signer stamps on the seal: a self-hosted `local-server.js` reads
+ * its key from `functions/.env.local` and signs as `dev1`, which `@domain/crucible/keys`
+ * registers as a key no deployed server holds. The ribbon reads that id — `sealHeadline` and
+ * `sealNotice` in `@features/crucible/seal-copy` both branch on it — so the reader is told
+ * which kind of signature they are looking at. This comment used to name a `sealSignerNote`
+ * that has never existed, which mattered: it asserted the distinction was surfaced at a time
+ * when nothing read the id at all.
+ *
+ * Routing it through the record rather than through the caller is deliberate. This function's
+ * knowledge of which transport it used is gone by the time a stranger opens the export; the
+ * key id is still on the seal.
  *
  * The id is encoded even though `ID_PATTERN` admits no character that needs it. A path built
  * by concatenation is a path traversal waiting for the pattern to be relaxed by someone who
@@ -192,8 +281,15 @@ function outcomeFrom(data: SealReceipt & { created?: unknown }): SealOutcome {
  * nothing on the other end was listening — a refusal that never happened, attributed to a
  * server that never spoke. This feature's whole claim is that it does not assert things it
  * cannot establish, and that has to hold for its error paths too.
+ *
+ * ## Why this is exported
+ *
+ * `requestSeal` cannot reach it while `FIREBASE_SEAL_CALLABLE_DEPLOYED` is false, so the only
+ * way `tests/crucible-request-seal.test.ts` can still hold this mapping to its word is to
+ * call it. The alternative was to let it ship untested until the day someone deploys the
+ * callable, which is the worst possible day to find out it is wrong.
  */
-function interpret(error: unknown): SealOutcome {
+export function interpretCallableError(error: unknown): SealOutcome {
   const code = typeof error === 'object' && error !== null ? String((error as { code?: unknown }).code ?? '') : '';
   const message = typeof error === 'object' && error !== null ? String((error as { message?: unknown }).message ?? '') : '';
 
@@ -219,12 +315,12 @@ function interpret(error: unknown): SealOutcome {
 /**
  * The same job for the platform API, whose codes are the callable's without the prefix.
  *
- * Written out rather than folded into `interpret` by stripping `functions/`, because the two
- * transports do not carry the server's words equally well and pretending otherwise would lose
- * the difference. `api-client` substitutes its own generic sentence for every status except
- * 400, 409 and 413 — so a 409, which is what every considered refusal from `sealCase` arrives
- * as, reaches the user in the server's own wording, and a 404 does not. A 404 here therefore
- * says only what is certain: no seal was made, and nothing was changed.
+ * Written out rather than folded into `interpretCallableError` by stripping `functions/`,
+ * because the two transports do not carry the server's words equally well and pretending
+ * otherwise would lose the difference. `api-client` substitutes its own generic sentence for
+ * every status except 400, 409 and 413 — so a 409, which is what every considered refusal from
+ * `sealCase` arrives as, reaches the user in the server's own wording, and a 404 does not. A
+ * 404 here therefore says only what is certain: no seal was made, and nothing was changed.
  */
 function interpretApi(error: unknown): SealOutcome {
   const code = typeof error === 'object' && error !== null ? String((error as { code?: unknown }).code ?? '') : '';

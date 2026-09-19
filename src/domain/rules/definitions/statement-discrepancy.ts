@@ -59,8 +59,11 @@ export const statementDiscrepancyRule: Rule = {
             title: `Contradictory transaction outcomes between ${labelA} and ${labelB}`,
             explanation:
               `"${labelA}" records the payment as ${transactionStatusLabel(extA.transactionStatus).toLowerCase()}, ` +
-              `while "${labelB}" records it as ${transactionStatusLabel(extB.transactionStatus).toLowerCase()}. ` +
-              `Both cannot describe the same transaction. Open each document and check which one you trust.`,
+              `while "${labelB}" records it as ${transactionStatusLabel(extB.transactionStatus).toLowerCase()}.`,
+            caveat:
+              'Both cannot describe the same transaction — but they may not be describing the ' +
+              'same one at all, and a retry after a failure produces exactly this pair. Open ' +
+              'each document and check which payment it is about.',
             severity: 'HIGH',
             confidence: 'STRONG_MATCH',
             inputs: {
@@ -87,10 +90,12 @@ export const statementDiscrepancyRule: Rule = {
             key: [itemA.id, itemB.id, 'chat-cross-perspective'],
             title: `Heated language involving ${commonSenders.join(', ')}, who appears in both records`,
             explanation:
-              `${commonSenders.join(', ')} sends messages in both "${labelA}" and ` +
-              `"${labelB}", and at least one of those records contains wording flagged as ` +
-              `hostile. Whether the two accounts conflict has not been determined — read both sides of ` +
-              `the exchange before drawing a conclusion.`,
+              `${commonSenders.join(', ')} sends messages in both "${labelA}" and "${labelB}", ` +
+              `and at least one of those records contains wording flagged as hostile.`,
+            caveat:
+              'Whether the two accounts conflict has not been determined. This matched on a ' +
+              'sender name and on wording, nothing more; read both sides of the exchange before ' +
+              'drawing a conclusion.',
             severity: 'MEDIUM',
             confidence: 'SUGGESTED_MATCH',
             inputs: {
@@ -118,8 +123,10 @@ export const statementDiscrepancyRule: Rule = {
             title: `Both records raise a disputed point worth comparing`,
             explanation:
               `"${labelA}" states: "${extA.disputedPoints[0]}". ` +
-              `"${labelB}" states: "${extB.disputedPoints[0]}". ` +
-              `Both lines were picked up for dispute wording; whether they disagree is for you to judge.`,
+              `"${labelB}" states: "${extB.disputedPoints[0]}".`,
+            caveat:
+              'Both lines were picked up because they carry dispute wording, not because ' +
+              'anything compared them. Whether they disagree is for you to judge.',
             severity: 'LOW',
             confidence: 'SUGGESTED_MATCH',
             inputs: {

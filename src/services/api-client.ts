@@ -9,8 +9,20 @@ export function apiBaseUrl(): string | null {
   if (url.username || url.password || url.search || url.hash || (url.protocol !== 'https:' && !(url.protocol === 'http:' && local))) {
     throw new Error('The platform API address must use HTTPS, or a local development network.');
   }
-  // On physical mobile devices, localhost or 127.0.0.1 resolves to the phone itself where no server runs.
-  if (Platform.OS !== 'web' && process.env.NODE_ENV !== 'test' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) {
+  // On a physical device, localhost is the handset itself — normally a dead address, so it is
+  // discarded rather than left to time out on every request.
+  //
+  // It is not dead when the build is tethered: `adb reverse tcp:8787 tcp:8787` maps the phone's
+  // loopback onto the development machine's, which is the configuration DEVELOPMENT.md documents
+  // for the Android release and that plugins/with-android-security.js whitelists for cleartext.
+  // Discarding the address there was silent: the tethered build fell back to the device-local
+  // adapter and never said so, so a release built to use the PC backend quietly did not.
+  //
+  // The tether is therefore an explicit opt-in rather than something inferred from the hostname.
+  // A build that does not set it keeps the old behaviour exactly.
+  const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  const tethered = process.env.EXPO_PUBLIC_API_ALLOW_LOOPBACK === '1';
+  if (Platform.OS !== 'web' && process.env.NODE_ENV !== 'test' && loopback && !tethered) {
     return null;
   }
   return url.toString().replace(/\/$/, '');

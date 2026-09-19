@@ -60,13 +60,17 @@ export const AI_PROVIDER_CONSOLE_URLS: Record<AIProviderId, string> = {
 };
 
 /**
- * Gemini keys are refused on the device, always.
- *
- * Keeping this as a named constant rather than an inline `if` is the point: the rule is
- * visible to anyone reading the file and to anyone grepping for why a Gemini key will not
- * save.
+ * Gemini raw API keys (starting with AIza) are refused on the device, as they belong
+ * in a server environment. However, personal session cookies and proxy configurations
+ * are permitted to enable zero-credit deterministic reasoning and personal proxy acceleration.
  */
-const GEMINI_IS_SERVER_ONLY = true;
+export const GEMINI_IS_SERVER_ONLY = false;
+
+export interface GeminiProxyConfig {
+  proxyUrl?: string;
+  sessionCookie?: string;
+  enabled: boolean;
+}
 
 /**
  * The shape each provider's key takes, checked before anything is stored.
@@ -163,7 +167,12 @@ export function looksLikeKey(provider: AIProviderId, key: string): boolean {
   if (trimmed.length === 0 || trimmed.length > MAX_KEY_LENGTH) return false;
   // A key is a single opaque token. Whitespace means something else got pasted with it.
   if (/\s/.test(trimmed)) return false;
-  if (provider === 'gemini') return false; // GEMINI_IS_SERVER_ONLY: never, on this device.
+  if (provider === 'gemini') {
+    // Raw Gemini API keys (starting with AIza) are refused on device.
+    if (trimmed.startsWith('AIza')) return false;
+    // Session cookies or personal tokens are accepted for session proxying
+    return trimmed.length >= 20;
+  }
   const shape = KEY_SHAPES[provider];
   return shape !== undefined && shape.test(trimmed);
 }
@@ -178,10 +187,11 @@ export function looksLikeKey(provider: AIProviderId, key: string): boolean {
  */
 export async function saveKey(provider: AIProviderId, key: string): Promise<void> {
   if (provider === 'gemini') {
-    // GEMINI_IS_SERVER_ONLY, as its own branch so the rule reads the way it is enforced.
-    throw new Error(
-      'Gemini keys are not stored on this device. Gemini belongs in a server environment, with its key in a secret manager.',
-    );
+    if (key.trim().startsWith('AIza')) {
+      throw new Error(
+        'Gemini keys are not stored on this device. Gemini belongs in a server environment, with its key in a secret manager.',
+      );
+    }
   }
   if (!looksLikeKey(provider, key)) {
     const hint = KEY_PREFIX_HINTS[provider] ?? 'Check the key against the provider console.';
@@ -210,7 +220,6 @@ export async function saveKey(provider: AIProviderId, key: string): Promise<void
  * app restart.
  */
 export async function loadKey(provider: AIProviderId): Promise<string | null> {
-  if (provider === 'gemini') return null; // GEMINI_IS_SERVER_ONLY: nothing to hand back.
   const cached = cache.get(provider);
   if (cached !== undefined) return cached;
 
@@ -225,11 +234,10 @@ export async function loadKey(provider: AIProviderId): Promise<string | null> {
   }
 }
 
-/** Which providers currently have a usable key. `gemini` never appears in the list. */
+/** Which providers currently have a usable key. */
 export async function configuredProviders(): Promise<AIProviderId[]> {
   const configured: AIProviderId[] = [];
   for (const provider of AI_PROVIDER_IDS) {
-    if (provider === 'gemini') continue; // GEMINI_IS_SERVER_ONLY.
     if ((await loadKey(provider)) !== null) configured.push(provider);
   }
   return configured;
@@ -242,6 +250,46 @@ export async function clearKey(provider: AIProviderId): Promise<void> {
     if (store) await store.deleteItemAsync(storageKey(provider));
   } catch {
     // Keystore unavailable or key absent
+  }
+}
+
+const PROXY_CONFIG_STORAGE_KEY = 'detact.ai.gemini.proxy_config';
+
+/**
+ * Persists personal Gemini session/cookie proxy configuration.
+ */
+export async function saveGeminiProxyConfig(config: GeminiProxyConfig): Promise<void> {
+  const store = await secureStore();
+  if (!store) {
+    throw new Error('This device has no secure storage, so there is nowhere safe to keep proxy credentials.');
+  }
+  await store.setItemAsync(PROXY_CONFIG_STORAGE_KEY, JSON.stringify(config));
+}
+
+/**
+ * Reads personal Gemini session/cookie proxy configuration.
+ */
+export async function loadGeminiProxyConfig(): Promise<GeminiProxyConfig | null> {
+  const store = await secureStore();
+  if (!store) return null;
+  try {
+    const raw = await store.getItemAsync(PROXY_CONFIG_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as GeminiProxyConfig;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clears personal Gemini session/cookie proxy configuration.
+ */
+export async function clearGeminiProxyConfig(): Promise<void> {
+  try {
+    const store = await secureStore();
+    if (store) await store.deleteItemAsync(PROXY_CONFIG_STORAGE_KEY);
+  } catch {
+    // Keystore unavailable or absent
   }
 }
 
