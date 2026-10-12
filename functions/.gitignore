@@ -1,7 +1,0 @@
-node_modules/
-*.local
-.data/
-.data-*/
-*.log
-lib/
-.cache/

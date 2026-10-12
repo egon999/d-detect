@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true
+  },
+  // `test-helpers` is included so the shared test doubles are typechecked too. Left out, a helper
+  // every test file leans on is the one piece of the suite nothing verifies, and a signature that
+  // drifted would only show up as a confusing runtime failure in whichever test used it next.
+  "include": ["src/**/*.ts", "test-helpers/**/*.ts"]
+}

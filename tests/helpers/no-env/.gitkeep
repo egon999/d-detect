@@ -1,0 +1,6 @@
+# Kept deliberately empty.
+#
+# `envDir` in vitest.config.mts points here so Vite loads no `.env` file for the test run.
+# Git cannot track an empty directory, so this file exists only to create it. Do not put a
+# `.env` here: anything in this directory becomes a test-visible environment variable, which
+# is the exact thing the `envDir` setting is there to prevent.

@@ -1,14 +1,3 @@
-/**
- * Measures the UI's copy volume and control density, per screen.
- *
- * Written because "the interface is overloaded with fields and excessive text" is a claim that
- * can be counted, and a rebuild that argues from taste rather than from numbers has no way to
- * tell afterwards whether it actually removed anything. Docblocks and line comments are
- * stripped before counting: this file measures what a user reads, not what a maintainer does.
- *
- * Run: node scripts/ui-audit.mjs [dir=app]
- */
-
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -23,7 +12,6 @@ function walk(dir, out = []) {
   return out;
 }
 
-/** Quoted literals of any kind, 20+ characters. Narrowed to prose by the filter below. */
 const LITERAL = /'([^'\n]{20,}?)'|"([^"\n]{20,}?)"|`([^`]{20,}?)`/g;
 
 /** Things that are 20+ characters but are not sentences a user reads. */

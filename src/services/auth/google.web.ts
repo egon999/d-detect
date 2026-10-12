@@ -16,5 +16,4 @@ export async function signInGoogleWeb() {
   }
 }
 
-// Firebase owns the browser session; the native account chooser needs no cleanup here.
 export async function signOutOfGoogle(): Promise<void> {}

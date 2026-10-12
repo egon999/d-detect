@@ -1,41 +1,15 @@
-/**
- * Copy audit — where the app's words actually live.
- *
- * `scripts/ui-audit.mjs` counts prose per *screen*, which is the right unit for judging how
- * loud a screen is but the wrong one for deciding what to cut. Most of this app's sentences
- * are not written in the screen that shows them: they come out of a label table in
- * `src/domain/enums.ts`, a helper in `src/ui/readable.ts`, or a copy block in a feature
- * component, and the screen only picks one. Cutting a screen string removes one sentence;
- * cutting a table entry removes it from every screen that reads the table.
- *
- * So this walks the whole of `src/` and `app/`, finds every string literal long enough to be
- * a sentence rather than a key, and reports by file — sorted by total words, which is the
- * number the brief is actually about ("overloaded with ... lengthy descriptions, and
- * excessive text").
- *
- * Deliberately crude in the same way the ui audit is: a regex over source, no parser. It
- * will count a long `import` path or a regex literal as prose now and then. That is fine —
- * it is a ranking tool, and the ranking is stable enough to decide what to open first.
- *
- *   node scripts/copy-audit.mjs            # top files
- *   node scripts/copy-audit.mjs --strings  # the actual sentences, longest first
- */
-
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
 const ROOTS = ['src', 'app'];
 
-/** Below this a literal is a key, an id, a class name or a route — not a sentence. */
 const MIN_LENGTH = 24;
 
-/** A literal with no space in it is an identifier however long it is. */
 const PROSE = /[A-Za-z]{2,}\s+[A-Za-z]/;
 
-/** Paths that hold words on purpose and must not be "reduced" by this audit. */
 const EXEMPT = [
-  // Every one of these is a sentence the product is legally or ethically careful about.
+
   'src/ui/claims.ts',
 ];
 
@@ -52,16 +26,9 @@ function walk(dir, out = []) {
   return out;
 }
 
-/**
- * Pulls string literals out of source, skipping comments.
- *
- * The comment skip matters more here than it would in most codebases: this one comments at
- * unusual length and those comments quote the strings they explain, so counting them would
- * double every sentence and rank the best-documented files as the noisiest.
- */
 function literalsOf(source) {
   const withoutComments = source
-    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\*[\s\S]*?\*\
     .replace(/^\s*\/\/.*$/gm, '');
 
   const found = [];
@@ -69,7 +36,7 @@ function literalsOf(source) {
     const value = match[2];
     if (value.length < MIN_LENGTH) continue;
     if (!PROSE.test(value)) continue;
-    if (value.includes('://') || value.startsWith('@') || value.includes('  ')) continue;
+    if (value.includes(':
     found.push(value.replace(/\\n/g, ' ').trim());
   }
   return found;

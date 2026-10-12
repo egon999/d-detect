@@ -1,44 +1,24 @@
-/**
- * Screen chrome.
- *
- * The frame every screen sits in, and the place the app's navigation personality lives.
- *
- * ## The header
- *
- * Two titles, not one. A compact bar is pinned at the top holding the back affordance and
- * the screen's actions; the *real* title sits below it in the scrolling content, set large.
- * As the content scrolls, the large title fades out and the compact one rises into the bar
- * to take its place, and a hairline appears under the bar to separate it from what is now
- * moving beneath it.
- *
- * This is the iOS large-title pattern, built by hand rather than taken from the native
- * stack header. Three reasons that is the right trade here:
- *
- *   - It behaves identically on Android, where the native equivalent does not exist.
- *   - The title can be set in the app's own type scale, which a native header will not do.
- *   - The bar can hold things a native header cannot — a monospace case reference, a live
- *     processing indicator — which this product needs.
- *
- * The scroll position drives the animation through `useNativeDriver`, so the fade runs on
- * the UI thread and holds 60fps while the list underneath is still rendering rows.
- *
- * ## Why the title is in the content
- *
- * A screen's title is information, not decoration: "Payment dispute — Meridian Supplies"
- * is the longest string on the screen and needs two lines to be read. A fixed header would
- * have to truncate it. Putting it in the content means it gets the room it needs, and the
- * compact version — which *is* truncated, because by then the user has read it — is what
- * survives scrolling.
- */
-
+import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import React, { useMemo, useRef } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   Animated,
+  Keyboard,
+  LayoutChangeEvent,
+  Platform,
   RefreshControl,
   StyleSheet,
   View,
   type FlatListProps,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   type StyleProp,
   type ViewStyle,
 } from 'react-native';
@@ -46,69 +26,180 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon, type IconName } from '../icon';
 import { useTheme } from '../theme';
-import { SPACING } from '../tokens';
+import { HIT_TARGET, LAYOUT, SPACING } from '../tokens';
 import { IconButton } from './Button';
 import { Row } from './Layout';
+import { useReducedMotion } from './Motion';
 import { Text } from './Text';
 
-/**
- * How far the content scrolls before the handover between titles completes.
- *
- * Short enough that a flick finishes it, long enough that a one-line correction scroll does
- * not flicker the header. The fade starts a third of the way in so the two titles are never
- * both at full opacity.
- */
-const HANDOVER_START = 18;
-const HANDOVER_END = 62;
+export const HANDOVER_START = 18;
+export const HANDOVER_END = 62;
 
-/**
- * `Animated.FlatList` under an unresolved generic.
- *
- * React Native types `Animated.FlatList`'s props as `AnimatedProps<FlatListProps<T>>`,
- * which maps every value to `WithAnimatedValue<…>`. When `T` is still an unresolved type
- * parameter — as it is inside the generic `ScreenList` below — TypeScript cannot prove
- * `T[]` is assignable to `WithAnimatedValue<T>[]`, so the call fails to typecheck even
- * though no animated value is ever passed as data.
- *
- * Re-declaring the component with the plain `FlatListProps<T>` it actually receives, plus
- * the scroll handler, is the narrow fix: the only prop that carries an animated value here
- * is `onScroll`, and it is typed as what `Animated.event` returns. Casting at each prop
- * instead would spread the same workaround across five call sites and hide which one is
- * load-bearing.
- */
+export type HandoverFrame = 'compact' | 'compactOffset' | 'rule' | 'masthead';
+
+const HANDOVER_RAMPS: Record<
+  HandoverFrame,
+  { readonly inputRange: readonly [number, number]; readonly outputRange: readonly [number, number] }
+> = {
+
+  compact: { inputRange: [HANDOVER_START, HANDOVER_END], outputRange: [0, 1] },
+
+  compactOffset: { inputRange: [HANDOVER_START, HANDOVER_END], outputRange: [7, 0] },
+
+  rule: { inputRange: [4, HANDOVER_START], outputRange: [0, 1] },
+
+  masthead: { inputRange: [0, HANDOVER_END * 0.78], outputRange: [1, 0] },
+};
+
+function ramp(y: number, from: number, to: number, start: number, end: number): number {
+  const t = Math.min(1, Math.max(0, (y - from) / (to - from)));
+  return start + (end - start) * t;
+}
+
+export function resolveHandover(scrollY: number): Record<HandoverFrame, number> {
+  const at = (frame: HandoverFrame) => {
+    const { inputRange, outputRange } = HANDOVER_RAMPS[frame];
+    return ramp(scrollY, inputRange[0], inputRange[1], outputRange[0], outputRange[1]);
+  };
+
+  return {
+    compact: at('compact'),
+    compactOffset: at('compactOffset'),
+    rule: at('rule'),
+
+    masthead: Math.min(1, at('masthead')),
+  };
+}
+
+export interface ScreenHandover {
+
+  scrollY: Animated.Value;
+
+  onScroll: ReturnType<typeof Animated.event>;
+
+  compactOpacity: Animated.AnimatedInterpolation<number>;
+
+  compactOffset: Animated.AnimatedInterpolation<number>;
+
+  ruleOpacity: Animated.AnimatedInterpolation<number>;
+
+  mastheadOpacity: Animated.AnimatedInterpolation<number>;
+}
+
+export function useScreenHandover(): ScreenHandover {
+  const scrollY = useRef(new Animated.Value(0)).current;
+
+  return useMemo(() => {
+    const interpolate = (frame: HandoverFrame) =>
+      scrollY.interpolate({
+        inputRange: [...HANDOVER_RAMPS[frame].inputRange],
+        outputRange: [...HANDOVER_RAMPS[frame].outputRange],
+        extrapolate: 'clamp',
+      });
+
+    return {
+      scrollY,
+      onScroll: Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], {
+        useNativeDriver: true,
+      }),
+      compactOpacity: interpolate('compact'),
+      compactOffset: interpolate('compactOffset'),
+      ruleOpacity: interpolate('rule'),
+      mastheadOpacity: interpolate('masthead'),
+    };
+  }, [scrollY]);
+}
+
+export const READING_MAX_WIDTH = LAYOUT.maxContentWidth + LAYOUT.screenPadding * 2;
+
+const HEADER_BLOCK = LAYOUT.headerHeight;
+
+const FOOTER_ESTIMATE =
+  SPACING.lg * 2 + HIT_TARGET + SPACING.giant;
+
+const SPOTLIGHT_HOLD_MS = 900;
+
+const SPOTLIGHT_FADE_MS = 600;
+
+const SCROLL_RETRY_DELAY_MS = 150;
+
+const SCROLL_MAX_ATTEMPTS = 2;
+
+export interface ScreenListScroller {
+  scrollToIndex: (params: { index: number; animated?: boolean; viewOffset?: number; viewPosition?: number }) => void;
+  scrollToOffset: (params: { offset: number; animated?: boolean }) => void;
+}
+
+type AnimatedFlatListProps<T> = FlatListProps<T> & {
+  onScroll?: ReturnType<typeof Animated.event>;
+  ref?: React.Ref<ScreenListScroller>;
+};
+
 const AnimatedFlatList = Animated.FlatList as unknown as <T>(
-  props: FlatListProps<T> & {
-    onScroll?: ReturnType<typeof Animated.event>;
-    ref?: React.Ref<unknown>;
-  },
+  props: AnimatedFlatListProps<T>,
 ) => React.ReactElement;
+
+export function indexOfKey<T>(
+  data: readonly T[],
+  keyExtractor: (item: T, index: number) => string,
+  key: string,
+): number {
+  if (!key) return -1;
+  for (let index = 0; index < data.length; index += 1) {
+    if (keyExtractor(data[index] as T, index) === key) return index;
+  }
+  return -1;
+}
+
+export function listRowCount(hasHeader: boolean, hasFooter: boolean, dataLength: number): number {
+
+  if (dataLength === 0) return 1;
+  return dataLength + (hasHeader ? 1 : 0) + (hasFooter ? 1 : 0);
+}
+
+export type ScrollRequest = { animated?: boolean; viewPosition?: number };
+
+export function scrollViewOffset(
+  options: ScrollRequest | undefined,
+  topInset: number,
+): number | undefined {
+  if (options?.viewPosition !== undefined) return undefined;
+  return topInset + HEADER_BLOCK + SPACING.md;
+}
+
+export type ScrollRetry =
+  | { action: 'scroll'; offset: number }
+  | { action: 'wait' }
+  | { action: 'give-up' };
+
+export function planScrollRetry(
+  info: { index: number; averageItemLength: number },
+  attempt: number,
+): ScrollRetry {
+  if (attempt >= SCROLL_MAX_ATTEMPTS) return { action: 'give-up' };
+  if (!(info.averageItemLength > 0)) return { action: 'wait' };
+  return { action: 'scroll', offset: Math.max(0, info.index * info.averageItemLength) };
+}
 
 export interface ScreenAction {
   icon: IconName;
-  /**
-   * Required. An icon on its own is not a label — this is what a screen reader announces,
-   * and the component will not let you omit it.
-   */
+
   label: string;
   onPress: () => void;
   disabled?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// The pinned bar
-// ---------------------------------------------------------------------------
-
 interface HeaderBarProps {
   title: string;
-  /** Opacity and offset for the compact title, driven by scroll. */
+
   titleOpacity?: Animated.AnimatedInterpolation<number>;
   titleOffset?: Animated.AnimatedInterpolation<number>;
-  /** Opacity for the hairline under the bar. */
+
   ruleOpacity?: Animated.AnimatedInterpolation<number>;
   back?: boolean;
   onBack?: () => void;
   actions?: ScreenAction[];
-  /** Rendered under the title row, inside the bar. Used for the case reference line. */
+
   accessory?: React.ReactNode;
 }
 
@@ -131,10 +222,9 @@ export function ScreenHeaderBar({
       onBack();
       return;
     }
-    // `canGoBack` guards the case where the screen was deep-linked into and there is no
-    // history to pop — dismissing to the case list is better than doing nothing.
+
     if (router.canGoBack()) router.back();
-    else router.replace('/cases');
+    else router.replace('/(tabs)/cases');
   };
 
   return (
@@ -143,27 +233,15 @@ export function ScreenHeaderBar({
         styles.bar,
         {
           paddingTop: insets.top,
-          backgroundColor: theme.colors.canvas,
+
+          paddingLeft: insets.left,
+          paddingRight: insets.right,
+          backgroundColor: theme.colors.backdrop.barFill,
         },
       ]}
     >
-      {/*
-        `height`, not `minHeight`, and deliberately the exception to the rule the rest of this
-        design system follows.
-
-        `LAYOUT.headerHeight` is a contract, not a measurement: the bar is absolutely
-        positioned, and three places pad their scroll content by `insets.top + headerHeight` so
-        content starts below it — two of them outside this file. A bar that grew with the font
-        scale would slide under none of that padding and sit on top of the first row of
-        content, which is a worse failure than the one growing would fix.
-
-        It stays safe by arithmetic instead: the compact title is a `subheading`, whose ceiling
-        in `TYPE_SCALE_CAP` puts its line box at 40.8pt inside this 52pt bar. `type-scaling.test.ts`
-        asserts that from the real tokens, so raising the cap or lowering the bar fails the test.
-        The title is also `accessibilityElementsHidden` below and repeated in the masthead at
-        `display` rank, which scales freely — nobody reads this bar to read the screen's name.
-      */}
-      <Row style={[styles.barRow, { height: theme.layout.headerHeight }]} gap="xs">
+      {}
+      <Row style={[styles.barRow, styles.readingWidth, { height: theme.layout.headerHeight }]} gap="xs">
         {back ? (
           <IconButton icon="chevron-left" accessibilityLabel="Go back" onPress={goBack} size={22} />
         ) : null}
@@ -174,13 +252,11 @@ export function ScreenHeaderBar({
             {
               opacity: titleOpacity ?? 1,
               transform: titleOffset ? [{ translateY: titleOffset }] : undefined,
-              // Without a back button the title starts at the content margin, so it lines
-              // up with the large title below rather than floating.
+
               paddingLeft: back ? 0 : theme.spacing.xs,
             },
           ]}
-          // The large title below carries the same string, so announcing this one too
-          // would read the screen name twice.
+
           accessibilityElementsHidden
           importantForAccessibility="no-hide-descendants"
         >
@@ -219,22 +295,18 @@ export function ScreenHeaderBar({
   );
 }
 
-// ---------------------------------------------------------------------------
-// The large title block
-// ---------------------------------------------------------------------------
-
 export interface MastheadProps {
   title: string;
-  /** Small uppercase line above the title. The record's type, usually. */
+
   overline?: string;
-  /** One line under the title. Keep it factual — this is not a tagline. */
+
   subtitle?: string;
-  /** Chips, counts or metadata. Sits under the subtitle. */
+
   meta?: React.ReactNode;
   opacity?: Animated.AnimatedInterpolation<number>;
 }
 
-function Masthead({ title, overline, subtitle, meta, opacity }: MastheadProps) {
+export function Masthead({ title, overline, subtitle, meta, opacity }: MastheadProps) {
   const theme = useTheme();
 
   return (
@@ -260,57 +332,193 @@ function Masthead({ title, overline, subtitle, meta, opacity }: MastheadProps) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Shared scroll wiring
-// ---------------------------------------------------------------------------
+function ScrolledToRow({
+  tint,
+  ring,
+  onDone,
+  children,
+}: {
+  tint: string;
+  ring: string;
+  onDone: () => void;
+  children: React.ReactNode;
+}) {
+  const reduced = useReducedMotion();
+  const highlight = useRef(new Animated.Value(1)).current;
+  const theme = useTheme();
 
-/**
- * Builds the interpolations both scrolling containers need.
- *
- * Extracted so `ScreenScroll` and `ScreenList` animate identically — if the fade distance
- * differed between a scroll view and a list, moving between two screens would feel like
- * moving between two apps.
- */
-function useHandover() {
-  const scrollY = useRef(new Animated.Value(0)).current;
+  const finish = useCallback(() => onDone(), [onDone]);
 
-  return useMemo(() => {
-    const compactIn = scrollY.interpolate({
-      inputRange: [HANDOVER_START, HANDOVER_END],
-      outputRange: [0, 1],
-      extrapolate: 'clamp',
+  useEffect(() => {
+
+    if (reduced === null) return;
+
+    if (reduced) {
+      const timer = setTimeout(finish, SPOTLIGHT_HOLD_MS);
+      return () => clearTimeout(timer);
+    }
+
+    const fade = Animated.timing(highlight, {
+      toValue: 0,
+      duration: SPOTLIGHT_FADE_MS,
+      delay: SPOTLIGHT_HOLD_MS,
+      useNativeDriver: true,
+    });
+    fade.start(({ finished }) => {
+
+      if (finished) finish();
     });
 
-    return {
-      scrollY,
-      onScroll: Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], {
-        useNativeDriver: true,
-      }),
-      /** The compact title's opacity: absent until the large title is on its way out. */
-      compactOpacity: compactIn,
-      /** The compact title rises the last few pixels into place rather than just appearing. */
-      compactOffset: scrollY.interpolate({
-        inputRange: [HANDOVER_START, HANDOVER_END],
-        outputRange: [7, 0],
-        extrapolate: 'clamp',
-      }),
-      /** The hairline arrives slightly before the title, so the bar reads as attached first. */
-      ruleOpacity: scrollY.interpolate({
-        inputRange: [4, HANDOVER_START],
-        outputRange: [0, 1],
-        extrapolate: 'clamp',
-      }),
-      /** The large title is gone by the time the compact one is fully in. */
-      mastheadOpacity: scrollY.interpolate({
-        inputRange: [0, HANDOVER_END * 0.78],
-        outputRange: [1, 0],
-        extrapolate: 'clamp',
-      }),
-    };
-  }, [scrollY]);
+    return () => fade.stop();
+  }, [reduced, highlight, finish]);
+
+  return (
+    <View style={styles.spotlightHost}>
+      {children}
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          {
+            borderRadius: theme.radius.md,
+            backgroundColor: tint,
+            borderColor: ring,
+            borderWidth: StyleSheet.hairlineWidth,
+            opacity: highlight,
+          },
+        ]}
+      />
+    </View>
+  );
 }
 
-function useRefreshControl(onRefresh?: () => void, refreshing = false) {
+const SPARKLE_CYCLE_MS = 7200;
+
+const SPARKLE_CURVE: readonly (readonly [number, number])[] = [
+  [0, 0.18],
+  [0.25, 1],
+  [0.5, 0.18],
+  [0.75, 0.5],
+];
+
+function curveAt(position: number): number {
+  const at = ((position % 1) + 1) % 1;
+  for (let index = 0; index < SPARKLE_CURVE.length; index += 1) {
+    const [from, value] = SPARKLE_CURVE[index] as readonly [number, number];
+    const next = SPARKLE_CURVE[(index + 1) % SPARKLE_CURVE.length] as readonly [number, number];
+    const to = index + 1 === SPARKLE_CURVE.length ? 1 : next[0];
+    if (at >= from && at <= to) {
+      const travelled = to === from ? 0 : (at - from) / (to - from);
+      return value + (next[1] - value) * travelled;
+    }
+  }
+  return (SPARKLE_CURVE[0] as readonly [number, number])[1];
+}
+
+export function sparkleRamp(phase: number): { inputRange: number[]; outputRange: number[] } {
+  const shift = ((phase % 1) + 1) % 1;
+  const boundary = curveAt(shift);
+
+  const keyframes = SPARKLE_CURVE.map(([at, value]) => {
+    const moved = (((at - shift) % 1) + 1) % 1;
+    return [moved, value] as const;
+  })
+
+    .filter(([at]) => at > 0 && at < 1)
+    .sort((left, right) => left[0] - right[0]);
+
+  return {
+    inputRange: [0, ...keyframes.map(([at]) => at), 1],
+    outputRange: [boundary, ...keyframes.map(([, value]) => value), boundary],
+  };
+}
+
+export const SPARKLE_STILL_OPACITY = 0.5;
+
+const SPARKLES: readonly { x: `${number}%`; y: `${number}%`; size: number; phase: number }[] = [
+  { x: '12%', y: '8%', size: 2.5, phase: 0 },
+  { x: '78%', y: '5%', size: 2, phase: 0.42 },
+  { x: '44%', y: '15%', size: 1.5, phase: 0.71 },
+  { x: '88%', y: '22%', size: 2.5, phase: 0.18 },
+  { x: '6%', y: '31%', size: 2, phase: 0.56 },
+  { x: '62%', y: '38%', size: 1.5, phase: 0.9 },
+  { x: '28%', y: '49%', size: 2, phase: 0.33 },
+  { x: '83%', y: '58%', size: 1.5, phase: 0.64 },
+  { x: '18%', y: '71%', size: 2, phase: 0.08 },
+];
+
+export const SPARKLE_FIELD = SPARKLES;
+
+function Sparkles() {
+  const theme = useTheme();
+  const reduced = useReducedMotion();
+  const cycle = useRef(new Animated.Value(0)).current;
+  const moving = reduced === false;
+
+  useEffect(() => {
+
+    if (!moving) return;
+
+    const loop = Animated.loop(
+      Animated.timing(cycle, {
+        toValue: 1,
+        duration: SPARKLE_CYCLE_MS,
+        useNativeDriver: true,
+      }),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [moving, cycle]);
+
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {SPARKLES.map((mote) => (
+        <Animated.View
+          key={`${mote.x}-${mote.y}`}
+          style={{
+            position: 'absolute',
+            left: mote.x,
+            top: mote.y,
+            width: mote.size,
+            height: mote.size,
+            borderRadius: mote.size / 2,
+            backgroundColor: theme.colors.backdrop.sparkle,
+            opacity: moving
+              ? cycle.interpolate({ ...sparkleRamp(mote.phase), extrapolate: 'clamp' })
+              : SPARKLE_STILL_OPACITY,
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+export function AmbientBackdrop() {
+  const theme = useTheme();
+
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <LinearGradient
+        colors={theme.colors.backdrop.wash}
+        start={{ x: 0.5, y: 0 }}
+        end={{ x: 0.5, y: 1 }}
+
+        style={[StyleSheet.absoluteFill, styles.backdropWash]}
+      />
+      <LinearGradient
+        colors={theme.colors.backdrop.pool}
+
+        start={{ x: 0.88, y: 0 }}
+        end={{ x: 0.1, y: 0.72 }}
+        style={[StyleSheet.absoluteFill, styles.backdropPool]}
+      />
+      {}
+      <Sparkles />
+    </View>
+  );
+}
+
+function useRefreshControl(onRefresh: (() => void) | undefined, refreshing: boolean, topOffset: number) {
   const theme = useTheme();
   if (!onRefresh) return undefined;
 
@@ -321,29 +529,21 @@ function useRefreshControl(onRefresh?: () => void, refreshing = false) {
       tintColor={theme.colors.accent}
       colors={[theme.colors.accent]}
       progressBackgroundColor={theme.colors.surface}
+      progressViewOffset={topOffset}
     />
   );
 }
 
-// ---------------------------------------------------------------------------
-// Screen: plain container
-// ---------------------------------------------------------------------------
-
 export interface ScreenProps {
   children: React.ReactNode;
-  /** Drops the horizontal padding, for full-bleed content like the graph canvas. */
+
   bleed?: boolean;
   style?: StyleProp<ViewStyle>;
 }
 
-/**
- * A screen that manages its own scrolling — or does not scroll at all.
- *
- * The graph canvas uses this: it pans and zooms, so it must own the gesture surface
- * completely rather than compete with a scroll view for it.
- */
 export function Screen({ children, bleed = false, style }: ScreenProps) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
 
   return (
     <View
@@ -351,30 +551,29 @@ export function Screen({ children, bleed = false, style }: ScreenProps) {
         styles.fill,
         {
           backgroundColor: theme.colors.canvas,
-          paddingHorizontal: bleed ? 0 : theme.layout.screenPadding,
+
+          paddingLeft: bleed ? 0 : Math.max(theme.layout.screenPadding, insets.left),
+          paddingRight: bleed ? 0 : Math.max(theme.layout.screenPadding, insets.right),
         },
         style,
       ]}
     >
+      <AmbientBackdrop />
       {children}
     </View>
   );
 }
-
-// ---------------------------------------------------------------------------
-// ScreenScroll: the default
-// ---------------------------------------------------------------------------
 
 export interface ScreenScrollProps extends MastheadProps {
   children: React.ReactNode;
   back?: boolean;
   onBack?: () => void;
   actions?: ScreenAction[];
-  /** Rendered inside the pinned bar, under the title row. */
+
   headerAccessory?: React.ReactNode;
   onRefresh?: () => void;
   refreshing?: boolean;
-  /** Pinned to the bottom, above the safe area. For a primary action on a long screen. */
+
   footer?: React.ReactNode;
   bleed?: boolean;
   contentStyle?: StyleProp<ViewStyle>;
@@ -398,29 +597,39 @@ export function ScreenScroll({
 }: ScreenScrollProps) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const handover = useHandover();
-  const refreshControl = useRefreshControl(onRefresh, refreshing);
+  const handover = useScreenHandover();
+  const refreshControl = useRefreshControl(onRefresh, Boolean(refreshing), insets.top);
+  const [footerHeight, setFooterHeight] = useState<number | null>(null);
 
   const padding = bleed ? 0 : theme.layout.screenPadding;
+  const bottomPadding = footer
+    ? (footerHeight ?? insets.bottom + FOOTER_ESTIMATE)
+    : insets.bottom + theme.spacing.giant;
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.colors.canvas }]}>
+      <AmbientBackdrop />
       <Animated.ScrollView
         onScroll={handover.onScroll}
         scrollEventThrottle={16}
         refreshControl={refreshControl}
         contentContainerStyle={[
+          styles.readingWidth,
           {
             paddingHorizontal: padding,
-            // Room for the pinned bar at the top, and for the footer plus home indicator
-            // at the bottom.
-            paddingTop: insets.top + theme.layout.headerHeight,
-            paddingBottom: insets.bottom + theme.spacing.giant + (footer ? 72 : 0),
+
+            paddingTop: insets.top + HEADER_BLOCK,
+            paddingBottom: bottomPadding,
           },
           contentStyle,
         ]}
         keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
+
+        automaticallyAdjustKeyboardInsets
+
+        style={{ paddingLeft: insets.left, paddingRight: insets.right }}
+
+        showsVerticalScrollIndicator={Platform.OS === 'web'}
       >
         <Masthead
           title={title}
@@ -443,22 +652,25 @@ export function ScreenScroll({
         accessory={headerAccessory}
       />
 
-      {footer ? <ScreenFooter>{footer}</ScreenFooter> : null}
+      {footer ? <ScreenFooter onHeight={setFooterHeight}>{footer}</ScreenFooter> : null}
     </View>
   );
 }
 
-// ---------------------------------------------------------------------------
-// ScreenList: the same chrome, over a FlatList
-// ---------------------------------------------------------------------------
+export type ScreenListHandle = {
+
+  scrollToKey: (key: string, options?: ScrollRequest) => boolean;
+
+  scrollToTop: (animated?: boolean) => void;
+};
 
 export interface ScreenListProps<T> extends MastheadProps {
   data: readonly T[];
   renderItem: (item: T, index: number) => React.ReactElement | null;
   keyExtractor: (item: T, index: number) => string;
-  /** Shown in place of the list when `data` is empty. */
+
   empty?: React.ReactNode;
-  /** Between the masthead and the first row. Filters and search live here. */
+
   listHeader?: React.ReactNode;
   listFooter?: React.ReactNode;
   separator?: boolean;
@@ -468,15 +680,12 @@ export interface ScreenListProps<T> extends MastheadProps {
   onRefresh?: () => void;
   refreshing?: boolean;
   footer?: React.ReactNode;
+
+  initialScrollIndex?: number;
+
+  ref?: React.Ref<ScreenListHandle>;
 }
 
-/**
- * The list screen.
- *
- * A real `FlatList` rather than a mapped array inside a scroll view, because the evidence
- * list on a well-used case runs to hundreds of rows and windowing is the difference between
- * a screen that opens instantly and one that hitches.
- */
 export function ScreenList<T>({
   data,
   renderItem,
@@ -495,11 +704,148 @@ export function ScreenList<T>({
   onRefresh,
   refreshing,
   footer,
+  initialScrollIndex,
+  ref,
 }: ScreenListProps<T>) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const handover = useHandover();
-  const refreshControl = useRefreshControl(onRefresh, refreshing);
+  const handover = useScreenHandover();
+  const [footerHeight, setFooterHeight] = useState<number | null>(null);
+
+  const listRef = useRef<ScreenListScroller | null>(null);
+
+  const laidOut = useRef(false);
+
+  const pending = useRef<{ key: string; options?: ScrollRequest } | null>(null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const attempt = useRef(0);
+  const [highlightKey, setHighlightKey] = useState<string | null>(null);
+
+  const refreshControl = useRefreshControl(onRefresh, Boolean(refreshing), insets.top);
+  const bottomPadding = footer
+    ? (footerHeight ?? insets.bottom + FOOTER_ESTIMATE)
+    : insets.bottom + theme.spacing.giant;
+
+  const renderSeparator = useMemo(
+    () =>
+      separator
+        ? () => (
+            <View
+              style={{
+                height: StyleSheet.hairlineWidth,
+                backgroundColor: theme.colors.border,
+              }}
+            />
+          )
+        : undefined,
+    [separator, theme.colors.border],
+  );
+
+  const cancelRetry = useCallback(() => {
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+    retryTimer.current = null;
+  }, []);
+
+  const scrollToKeyImpl = useRef<(key: string, options?: ScrollRequest) => boolean>(() => false);
+
+  scrollToKeyImpl.current = (key, options) => {
+    const index = indexOfKey(data, keyExtractor, key);
+    if (index < 0) {
+
+      pending.current = null;
+      return false;
+    }
+
+    if (!laidOut.current || !listRef.current) {
+
+      pending.current = { key, options };
+      return true;
+    }
+
+    const scroller = listRef.current;
+    if (typeof scroller.scrollToIndex !== 'function') return false;
+
+    attempt.current = 0;
+    const viewOffset = scrollViewOffset(options, insets.top);
+    scroller.scrollToIndex({
+      index,
+      animated: options?.animated ?? false,
+      viewPosition: options?.viewPosition ?? 0,
+      ...(viewOffset === undefined ? {} : { viewOffset }),
+    });
+
+    setHighlightKey(key);
+    return true;
+  };
+
+  const handleScrollToIndexFailed = useCallback(
+    (info: { index: number; averageItemLength: number; highestMeasuredFrameIndex: number }) => {
+      const retry = planScrollRetry(info, attempt.current);
+      if (retry.action === 'give-up') {
+        pending.current = null;
+        return;
+      }
+
+      attempt.current += 1;
+
+      if (retry.action === 'wait') {
+        laidOut.current = false;
+        return;
+      }
+
+      const scroller = listRef.current;
+      if (!scroller || typeof scroller.scrollToOffset !== 'function') return;
+
+      scroller.scrollToOffset({ offset: retry.offset, animated: false });
+      cancelRetry();
+      retryTimer.current = setTimeout(() => {
+        retryTimer.current = null;
+        const request = pending.current;
+        if (request) scrollToKeyImpl.current(request.key, request.options);
+      }, SCROLL_RETRY_DELAY_MS);
+    },
+    [cancelRetry],
+  );
+
+  const flushPending = useCallback(() => {
+    const request = pending.current;
+    if (!request) return;
+    pending.current = null;
+    scrollToKeyImpl.current(request.key, request.options);
+  }, []);
+
+  const handleListLayout = useCallback(
+    (_event: LayoutChangeEvent) => {
+      laidOut.current = true;
+      flushPending();
+    },
+    [flushPending],
+  );
+
+  const handleContentSizeChange = useCallback(() => {
+    if (pending.current && listRef.current) {
+      laidOut.current = true;
+      flushPending();
+    }
+  }, [flushPending]);
+
+  useEffect(() => cancelRetry, [cancelRetry]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      scrollToKey: (key, options) => scrollToKeyImpl.current(key, options),
+      scrollToTop: (animated = true) => {
+        pending.current = null;
+        cancelRetry();
+        const scroller = listRef.current;
+        if (scroller && typeof scroller.scrollToOffset === 'function') {
+          scroller.scrollToOffset({ offset: 0, animated });
+        }
+      },
+    }),
+    [cancelRetry],
+  );
 
   const header = (
     <>
@@ -514,52 +860,71 @@ export function ScreenList<T>({
     </>
   );
 
+  const safeInitialIndex =
+    typeof initialScrollIndex === 'number' &&
+    Number.isInteger(initialScrollIndex) &&
+    initialScrollIndex > 0 &&
+    initialScrollIndex < listRowCount(true, Boolean(listFooter), data.length)
+      ? initialScrollIndex
+      : undefined;
+
   return (
     <View style={[styles.fill, { backgroundColor: theme.colors.canvas }]}>
+      <AmbientBackdrop />
       <AnimatedFlatList<T>
+        ref={listRef}
         data={data as T[]}
-        renderItem={({ item, index }) => renderItem(item, index)}
+        renderItem={({ item, index }) => {
+          const row = renderItem(item, index);
+          const key = keyExtractor(item, index);
+          if (row === null) return null;
+          if (key !== highlightKey) return row;
+
+          return (
+
+            <ScrolledToRow
+              key={`spotlight-${key}`}
+              tint={theme.colors.tones.accent.bg}
+              ring={theme.colors.tones.accent.border}
+              onDone={() => setHighlightKey((current) => (current === key ? null : current))}
+            >
+              {row}
+            </ScrolledToRow>
+          );
+        }}
         keyExtractor={(item, index) => keyExtractor(item, index)}
+        extraData={highlightKey}
         ListHeaderComponent={header}
-        // The empty slot is a `View` where the header and footer are fragments, and the
-        // asymmetry is load-bearing. `VirtualizedList` wraps the header and footer in a `View`
-        // of its own to hang `onLayout` on, so a fragment in either is never written to. The
-        // empty slot gets no such wrapper: it `cloneElement`s whatever it is handed with
-        // `onLayout` and `style`, and a fragment accepts neither. That is where "Invalid prop
-        // `onLayout` supplied to `React.Fragment`" came from — on *every* list screen, because
-        // every one of them is empty while it loads, so the warning fired constantly and buried
-        // real ones. React Native 0.83 guards that path against fragments; react-native-web,
-        // which is what Expo web runs, does not, so this stops depending on either.
-        //
-        // Plain and unstyled on purpose. It sits directly in the scroll view's content
-        // container, which is already a stretch-aligned column, and `EmptyState`, `ErrorState`
-        // and `SkeletonList` all size themselves — so it adds a level of nesting and no
-        // geometry. The masthead is deliberately left inside its fragment: the header is the
-        // one slot whose height the handover fade is measured against, and it does not need
-        // changing.
+
         ListEmptyComponent={empty ? <View>{empty}</View> : null}
         ListFooterComponent={listFooter ? <>{listFooter}</> : null}
-        ItemSeparatorComponent={
-          separator
-            ? () => <View style={{ height: StyleSheet.hairlineWidth, backgroundColor: theme.colors.border }} />
-            : undefined
-        }
+        ItemSeparatorComponent={renderSeparator}
         onScroll={handover.onScroll}
         scrollEventThrottle={16}
         refreshControl={refreshControl}
+        onLayout={handleListLayout}
+        onContentSizeChange={handleContentSizeChange}
+
+        onScrollToIndexFailed={handleScrollToIndexFailed}
+        initialScrollIndex={safeInitialIndex}
         contentContainerStyle={{
+          ...styles.readingWidth,
           paddingHorizontal: theme.layout.screenPadding,
-          paddingTop: insets.top + theme.layout.headerHeight,
-          paddingBottom: insets.bottom + theme.spacing.giant + (footer ? 72 : 0),
+          paddingTop: insets.top + HEADER_BLOCK,
+          paddingBottom: bottomPadding,
         }}
+
+        style={{ paddingLeft: insets.left, paddingRight: insets.right }}
         keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-        // Tuned for rows of roughly `rowHeight`. Windowing too aggressively shows blank
-        // space on a fast flick; too loosely and the first paint does unnecessary work.
+
+        automaticallyAdjustKeyboardInsets
+        showsVerticalScrollIndicator={Platform.OS === 'web'}
+
         initialNumToRender={12}
         maxToRenderPerBatch={10}
         windowSize={11}
-        removeClippedSubviews
+
+        removeClippedSubviews={Platform.OS === 'android'}
       />
 
       <ScreenHeaderBar
@@ -572,80 +937,76 @@ export function ScreenList<T>({
         accessory={headerAccessory}
       />
 
-      {footer ? <ScreenFooter>{footer}</ScreenFooter> : null}
+      {footer ? <ScreenFooter onHeight={setFooterHeight}>{footer}</ScreenFooter> : null}
     </View>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Footer
-// ---------------------------------------------------------------------------
+export interface ScreenFooterProps {
+  children: React.ReactNode;
 
-/**
- * The pinned action bar.
- *
- * Opaque rather than translucent. A blurred bar over a list of monospace figures makes the
- * digits behind it ambiguous, and in this product an ambiguous digit is a real problem.
- */
-export function ScreenFooter({ children }: { children: React.ReactNode }) {
+  onHeight?: (height: number) => void;
+}
+
+export function ScreenFooter({ children, onHeight }: ScreenFooterProps) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const onShow = (event: any) => {
+      const height = event?.endCoordinates?.height ?? 0;
+      setKeyboardOffset(height);
+    };
+    const onHide = () => {
+      setKeyboardOffset(0);
+    };
+
+    const subShow = Keyboard.addListener(showEvent, onShow);
+    const subHide = Keyboard.addListener(hideEvent, onHide);
+
+    return () => {
+      subShow.remove();
+      subHide.remove();
+    };
+  }, []);
+
+  const bottomInset = keyboardOffset > 0 ? keyboardOffset : 0;
 
   return (
     <View
+      onLayout={(event) => onHeight?.(event.nativeEvent.layout.height)}
       style={[
         styles.footer,
         {
           backgroundColor: theme.colors.canvas,
           borderTopColor: theme.colors.border,
-          paddingBottom: insets.bottom + theme.spacing.lg,
-          paddingHorizontal: theme.layout.screenPadding,
-          paddingTop: theme.spacing.lg,
+          bottom: bottomInset,
+          paddingBottom: keyboardOffset > 0 ? theme.spacing.sm : insets.bottom + theme.spacing.lg,
+          paddingTop: theme.spacing.sm,
+          paddingLeft: Math.max(theme.layout.screenPadding, insets.left),
+          paddingRight: Math.max(theme.layout.screenPadding, insets.right),
         },
       ]}
     >
-      {children}
+      {}
+      <View style={styles.readingWidth}>{children}</View>
     </View>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Section
-// ---------------------------------------------------------------------------
-
 export interface SectionHeaderProps {
   title: string;
-  /** A count, shown in mono next to the title. Machine-counted, so set in mono. */
+
   count?: number;
-  /** One line explaining what the section contains, when the title is not enough. */
+
   hint?: string;
   action?: { label: string; onPress: () => void; icon?: IconName };
 }
 
-/**
- * The header above a section of a screen.
- *
- * ## Why the title is a `heading` and not an `overline`
- *
- * It used to be `overline`: 10.5pt, tracked out, uppercased, in *tertiary* text. That is a
- * label style, and using it for a section title inverted the hierarchy of every screen that
- * has sections — the title of a section was the smallest and faintest text in it, set
- * smaller than the body copy it introduced. A reader scanning for structure found nothing
- * to catch on, which is most of what "nothing has hierarchy" means in practice.
- *
- * A section title is now a real rank: `heading`, 22pt Bold, in primary text. That gives an
- * ordinary screen a three-step structure without the screen asking for one —
- * `display` 36 (the screen) → `heading` 22 (the section) → `body` 15.5 (the content) — which
- * is the whole point of fixing this here rather than screen by screen.
- *
- * The contrast improves as a side effect of the colour going with it: on the light canvas
- * the title moves from 4.91:1 to 16.91:1, and on the dark canvas from 6.34:1 to 17.39:1.
- * Both passed AA before; the title is now simply the thing your eye lands on.
- *
- * The `hint` moved from `caption` (12) to `bodySmall` (14) in secondary text for the same
- * reason. These hints are full sentences carrying the product's own hedging — "A grade is a
- * reading of the evidence, not a verdict" — so they are prose to be read, not a caption.
- */
 export function SectionHeader({ title, count, hint, action }: SectionHeaderProps) {
   const theme = useTheme();
 
@@ -691,7 +1052,7 @@ export function SectionHeader({ title, count, hint, action }: SectionHeaderProps
 
 export interface SectionProps extends SectionHeaderProps {
   children: React.ReactNode;
-  /** Extra space above. Sections after the first want it; the first does not. */
+
   first?: boolean;
 }
 
@@ -706,23 +1067,21 @@ export function Section({ children, first = false, ...header }: SectionProps) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Row of a list
-// ---------------------------------------------------------------------------
-
 export interface DisclosureProps {
   children: React.ReactNode;
 }
 
-/** The chevron on a tappable row. Separate so every row uses the same one. */
 export function Disclosure() {
   const theme = useTheme();
   return <Icon name="chevron-right" size={18} color={theme.colors.textTertiary} />;
 }
 
 const styles = StyleSheet.create({
+  readingWidth: { width: '100%', maxWidth: READING_MAX_WIDTH, alignSelf: 'center' },
   fill: { flex: 1 },
   flex: { flex: 1 },
+  backdropWash: { bottom: '34%' },
+  backdropPool: { bottom: '28%' },
   bar: {
     position: 'absolute',
     top: 0,
@@ -743,18 +1102,17 @@ const styles = StyleSheet.create({
     right: 0,
     height: StyleSheet.hairlineWidth,
   },
-  /*
-    The large title needs room around it to read as a masthead rather than as the first row
-    of content. The bottom gap is the larger of the two on purpose: it separates the title
-    block from the first section, which is the one boundary on the screen that most wants
-    to be unambiguous.
-  */
+
   masthead: {
     paddingTop: SPACING.xl,
     paddingBottom: SPACING.xxxl,
   },
   overline: {
     marginBottom: SPACING.sm,
+  },
+
+  spotlightHost: {
+    position: 'relative',
   },
   footer: {
     position: 'absolute',

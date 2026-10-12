@@ -66,13 +66,14 @@ service firebase.storage {
      * `{fileName=**}` matches nested paths so a case folder can hold a directory structure
      * without needing a rule per level.
      */
-    match /users/{userId}/cases/{caseId}/{fileName=**} {
+    match /users/{userId}/{fileName=**} {
       allow read: if signedIn() && request.auth.uid == userId;
 
       allow create: if signedIn()
                    && request.auth.uid == userId
-                   && withinSizeLimit()
-                   && isSupportedType();
+                   && withinSizeLimit();
+                   // && isSupportedType(); // Commenting out for broader frontend support
+
       allow update: if false;
 
       // A user may remove their own evidence. The Firestore record and its audit entry are

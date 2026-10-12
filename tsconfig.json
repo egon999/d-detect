@@ -14,8 +14,12 @@
       "@ui/*": ["./src/ui/*"],
       "@features/*": ["./src/features/*"],
       "@services/*": ["./src/services/*"],
+      "@api/*": ["./src/api/*"],
       "@ui": ["./src/ui/index.ts"],
-      "@services": ["./src/services/index.ts"]
+      "@services": ["./src/services/index.ts"],
+      "@api": ["./src/api/index.ts"],
+      "@i18n": ["./src/i18n/index.ts"],
+      "@i18n/*": ["./src/i18n/*"]
     }
   },
   "include": [
@@ -24,5 +28,5 @@
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
   ],
-  "exclude": ["node_modules", "functions", "dist"]
+  "exclude": ["node_modules", "functions", "server", "dist"]
 }

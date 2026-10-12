@@ -261,6 +261,10 @@ service cloud.firestore {
       allow delete: if signedIn() && uid() == userId;
     }
 
+    match /users/{userId}/chronicles/{docId} {
+      allow read, write: if signedIn() && uid() == userId;
+    }
+
     // -----------------------------------------------------------------------
     // Cases
     // -----------------------------------------------------------------------

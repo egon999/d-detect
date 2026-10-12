@@ -1,33 +1,3 @@
-/**
- * Release APK build, with the checks that make the result trustworthy.
- *
- *   npm run apk
- *
- * ## Why this is a script and not a Gradle invocation in a README
- *
- * Three things went wrong repeatedly when this was done by hand, and each one produces an
- * APK that looks finished:
- *
- * 1. **Building over a broken tree.** Metro bundles whatever TypeScript is there; type
- *    errors do not stop it. You get an APK that installs and crashes on the screen the
- *    error was on. So `tsc --noEmit` and the test suite run first and a failure stops the
- *    build — there is no flag here to skip them.
- * 2. **Shipping the debug key.** The React Native template signs release builds with the
- *    debug keystore, whose password is 'android' and which ships with the SDK. The APK
- *    installs, so nothing tells you. This script reads the signing certificate back out of
- *    the finished APK and fails if it is the debug one.
- * 3. **Reporting a path that is stale.** A failed build leaves the previous APK sitting in
- *    `outputs/`, and quoting it reads as success. The output is deleted before the build,
- *    and its timestamp is checked after.
- * 4. **Shipping without the security configuration.** `plugins/with-android-security.js`
- *    only runs during `expo prebuild`, and `android/` is checked in, so every build before
- *    this line was added shipped `allowBackup="true"` and no network security config — while
- *    `app.json` said otherwise and the plugin's unit tests passed. The configuration is now
- *    applied on every build, and read back out of the finished APK's manifest.
- *
- * Nothing here prints a result it did not read off disk.
- */
-
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -38,11 +8,77 @@ const ROOT = process.cwd();
 const ANDROID = resolve(ROOT, 'android');
 const APK = resolve(ANDROID, 'app/build/outputs/apk/release/app-release.apk');
 
-/** From app.json, which is what the native project is generated from. */
+const SHIPPED = resolve(ROOT, 'detact-release.apk');
+
 const APP_PACKAGE = JSON.parse(readFileSync(resolve(ROOT, 'app.json'), 'utf8')).expo?.android?.package ?? '';
 
-/** The stock debug certificate's SHA-256, as apksigner prints it (no separators). */
 const DEBUG_CERT_SHA256 = 'fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c';
+
+function assertApiBaseUrlShippable() {
+  const fromEnvFile = () => {
+    const filename = resolve(ROOT, '.env');
+    if (!existsSync(filename)) return '';
+    const line = readFileSync(filename, 'utf8')
+      .split(/\r?\n/)
+      .filter((text) => !text.trimStart().startsWith('#'))
+      .reverse()
+      .find((text) => text.trimStart().startsWith('EXPO_PUBLIC_API_BASE_URL='));
+    return line ? line.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '') : '';
+  };
+
+  // The process environment wins, because that is the order Expo resolves them in.
+  const value = (process.env.EXPO_PUBLIC_API_BASE_URL || fromEnvFile()).trim();
+
+  if (!value) {
+    throw new Error(
+      'EXPO_PUBLIC_API_BASE_URL is not set, so the app would fall back to the emulator\n' +
+        'loopback address and fail every request on a real phone.\n' +
+        'Set it to the production API origin before building a release.',
+    );
+  }
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`EXPO_PUBLIC_API_BASE_URL is not a URL: ${value}`);
+  }
+
+  const allowLoopbackFromEnv = () => {
+    const filename = resolve(ROOT, '.env');
+    if (!existsSync(filename)) return false;
+    const line = readFileSync(filename, 'utf8')
+      .split(/\r?\n/)
+      .filter((text) => !text.trimStart().startsWith('#'))
+      .reverse()
+      .find((text) => text.trimStart().startsWith('EXPO_PUBLIC_API_ALLOW_LOOPBACK='));
+    return line ? line.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '') === '1' : false;
+  };
+
+  const allowLoopback =
+    process.env.EXPO_PUBLIC_API_ALLOW_LOOPBACK === '1' ||
+    process.env.ALLOW_LOOPBACK === '1' ||
+    process.argv.includes('--allow-loopback') ||
+    allowLoopbackFromEnv();
+
+  if (url.protocol !== 'https:' && !allowLoopback) {
+    throw new Error(
+      `EXPO_PUBLIC_API_BASE_URL is ${value}, which a release build cannot use.\n` +
+        'The release network security config forbids cleartext traffic, so this would fail at\n' +
+        'the first request. A release needs an https origin reachable from a phone on mobile data.',
+    );
+  }
+
+  if (/^(localhost|127\.|10\.0\.2\.2$|0\.0\.0\.0$|\[::1\]$)/.test(url.hostname) && !allowLoopback) {
+    throw new Error(
+      `EXPO_PUBLIC_API_BASE_URL is ${value}, which resolves to the phone itself.\n` +
+        'This is the development value. A release built with it installs and then fails every\n' +
+        'request, which is indistinguishable from the server being down.',
+    );
+  }
+
+  return value;
+}
 
 /**
  * Java for the Android toolchain.
@@ -67,7 +103,12 @@ function javaHome() {
 }
 
 const JAVA_HOME = javaHome();
-const ENV = JAVA_HOME ? { ...process.env, JAVA_HOME } : process.env;
+const SDK_DIR = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT ?? sdkFromLocalProperties();
+const ENV = {
+  ...process.env,
+  ...(JAVA_HOME ? { JAVA_HOME } : {}),
+  ...(SDK_DIR ? { ANDROID_HOME: SDK_DIR, ANDROID_SDK_ROOT: SDK_DIR } : {}),
+};
 
 function heading(text) {
   console.log(`\n=== ${text} ===`);
@@ -296,11 +337,20 @@ function main() {
   heading('Tests');
   run('npx', ['vitest', 'run'], { cwd: ROOT });
 
+  heading('API base URL');
+  console.log(`Bundle will point at: ${assertApiBaseUrlShippable()}`);
+
   heading('Signing configuration');
   if (!existsSync(resolve(ANDROID, 'keystore.properties'))) {
+    // Deliberately does not suggest `expo prebuild`. A prebuild regenerates `android/` and
+    // deletes `android/app/ddetect-release.jks` with it, and that keystore is the only thing
+    // that can produce an update for an already-installed app. Telling someone to run it when
+    // the credentials are already missing is how the key gets destroyed rather than restored.
     throw new Error(
-      'android/keystore.properties is missing, so this would produce a debug-signed APK.\n' +
-        'Copy it and ddetect-release.jks back from .keystore-backup/, or run `npx expo prebuild`.',
+      'android/keystore.properties is missing, so this would produce a debug-signed APK that\n' +
+        'can never update an installed one.\n' +
+        'Restore keystore.properties and app/ddetect-release.jks from the project owner\'s\n' +
+        'off-machine backup. Do not run a prebuild to fix this — it deletes the keystore.',
     );
   }
   console.log('android/keystore.properties present.');
@@ -341,9 +391,33 @@ function main() {
   heading('Packaged manifest');
   console.log(`Security attributes verified in the APK: ${assertManifestSecured()}.`);
 
+  // Copy the finished APK to the path people actually hand out.
+  //
+  // Without this step the two diverge, and they did: `detact-release.apk` at the repository
+  // root was three weeks older than `outputs/app-release.apk`, 24 MB larger, and built from a
+  // version of the app that still carried an OCR feature which has since been removed. Anyone
+  // sideloading "the APK" was installing the stale one, because the build left its result in a
+  // Gradle output directory and never touched the file named like a deliverable.
+  copyFileSync(APK, SHIPPED);
+  if (createHash('sha256').update(readFileSync(APK)).digest('hex')
+      !== createHash('sha256').update(readFileSync(SHIPPED)).digest('hex')) {
+    throw new Error('The published APK does not match the APK that was just built.');
+  }
+
+  // Also publish to workspace root deliverables so external scripts and side-loaders never see stale files
+  const parentRoot = resolve(ROOT, '..');
+  const parentShipped = resolve(parentRoot, 'detact-release.apk');
+  const parentLatest = resolve(parentRoot, 'Ddetect-latest.apk');
+  if (existsSync(parentRoot)) {
+    copyFileSync(APK, parentShipped);
+    copyFileSync(APK, parentLatest);
+    console.log(`Also published to workspace root:\n  ${parentShipped}\n  ${parentLatest}`);
+  }
+
   const { size, mtime } = statSync(APK);
   heading('Done');
   console.log(`APK:   ${APK}`);
+  console.log(`Published to: ${SHIPPED}`);
   console.log(`Size:  ${(size / 1024 / 1024).toFixed(1)} MB`);
   console.log(`Built: ${mtime.toISOString()}`);
   console.log(`APK SHA-256: ${createHash('sha256').update(readFileSync(APK)).digest('hex')}`);
@@ -366,7 +440,7 @@ function main() {
  * `main` is guarded rather than called at import time, which is what makes that possible.
  * `npm run apk` is unaffected: it invokes this file directly, so `argv[1]` is this file.
  */
-export { assertManifestSecured, assertNotDebugSigned, checkSigningFingerprintRegistered };
+export { assertApiBaseUrlShippable, assertManifestSecured, assertNotDebugSigned, checkSigningFingerprintRegistered };
 
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   try {

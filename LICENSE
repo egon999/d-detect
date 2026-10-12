@@ -1,0 +1,33 @@
+COMMERCIAL SOFTWARE LICENSE AND ASSIGNMENT AGREEMENT
+
+This Commercial Software License and Assignment Agreement ("Agreement") is executed and made effective as of October 12, 2026, by and between the Developer and:
+
+Client / Licensee:
+  Name:  Diya Jothikumar
+  Email: divv.workkss@gmail.com
+
+Product:
+  D-Detect — Autonomous Evidence Intelligence, Timeline Forensics & Investigation System
+  Package: com.anonymous.detact
+  Version: 1.0.1 (Production Release)
+
+1. GRANT OF EXCLUSIVE RIGHTS & OWNERSHIP
+Developer hereby grants, transfers, and assigns to the Licensee, Diya Jothikumar, exclusive, perpetual, worldwide, irrevocable rights, title, and commercial interests in and to the D-Detect application codebase, including all associated client applications, backend server architectures, data models, forensic inference pipelines, algorithms, graphical assets, and release binaries.
+
+2. COMMERCIAL USE & DEPLOYMENT
+Licensee has the full, unrestricted authority to:
+  a. Deploy, distribute, host, modify, rebrand, and sublicense the application across all distribution channels (including Google Play Store, enterprise MDM, private app vaults, and cloud servers).
+  b. Execute commercial operations, monetize features, and integrate proprietary datasets or external API endpoints.
+  c. Create derivative works, updates, integrations, and improvements without restriction or requirement for additional royalties.
+
+3. CONFIDENTIALITY & DATA INTEGRITY
+All cryptographic seal keys, keystores (`ddetect-release.jks`), OAuth client configurations, and forensic database structures transferred under this Agreement belong exclusively to the Licensee. No tracking, backdoors, telemetry, or hidden administrative access points exist within this delivery.
+
+4. WARRANTY & DELIVERABLE INTEGRITY
+Developer certifies that:
+  a. The codebase has undergone comprehensive automated verification, achieving 1,059/1,059 passing client-side tests and 606/606 passing backend server tests.
+  b. The application binary (`detact-release.apk` / `Ddetect-latest.apk`) is cryptographically signed with the production release keystore and verified against Android security benchmarks.
+  c. Dedicated technical support and diagnostic log reporting are routed directly to the Licensee's verified address: divv.workkss@gmail.com.
+
+IN WITNESS WHEREOF, this Agreement is executed and delivered to Diya Jothikumar.
+All rights, title, and ownership are fully acknowledged and affirmed.

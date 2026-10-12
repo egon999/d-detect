@@ -1,77 +1,89 @@
 import React, { useEffect, useRef } from 'react';
 import {
   Animated,
-  Dimensions,
+  Easing,
   Image,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 
+import {
+  SPLASH_OVERLAY_CEILING_MS,
+  SPLASH_OVERLAY_EXIT_MS,
+  SPLASH_OVERLAY_SETTLE_MS,
+} from '@services/auth/launch';
 import { FONT_FAMILY } from '../tokens';
-
-const { width } = Dimensions.get('window');
+import { useReducedMotion } from './Motion';
+import { DetectiveMascot } from './DetectiveMascot';
 
 interface AnimatedSplashScreenProps {
   isReady: boolean;
   onFinish: () => void;
 }
 
-/**
- * The launch screen.
- *
- * ## Why this is dark regardless of the app's theme
- *
- * The native splash configured in `app.json` is `#030712` for both light and dark. This
- * overlay hands off directly from it, so if it respected the light theme the user would see
- * a dark-to-white flash at the seam. It stays dark and matches the native background; the
- * app's real (possibly light) canvas appears only once this lifts.
- *
- * ## What this screen deliberately does not do
- *
- * An earlier version headlined "Find the Truth." — the exact framing the product is built to
- * avoid, since evidence is reported in graded states (supported, conflicting, insufficient),
- * never as a verdict. It also carried glowing halos, a "liquid glass" logo, and a row of
- * "AI Powered · Deterministic Rules · Evidence Graph" pills: decoration and feature-boasting
- * on the one screen a user cannot act on. All of it is gone. What is left is the mark, the
- * name, one honest line about what the app does, and a progress cue — with a single muted
- * gold accent, which is the brand's whole visual vocabulary.
- *
- * The colours are fixed hex rather than theme tokens on purpose: the theme resolves to white
- * surfaces in light mode, and this screen must not.
- */
-
-// The muted brand gold — `gold500` / `gold300` from `src/ui/tokens.ts`, inlined because this
-// screen must render dark before (and independently of) the theme provider's palette.
 const GOLD = '#BEA860';
 const GOLD_TEXT = '#D4C491';
 
 export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreenProps) {
-  const logoScale = useRef(new Animated.Value(0.82)).current;
-  const logoOpacity = useRef(new Animated.Value(0)).current;
-  const contentOpacity = useRef(new Animated.Value(0)).current;
-  const contentTranslateY = useRef(new Animated.Value(18)).current;
-  const progressScale = useRef(new Animated.Value(0.01)).current;
+
+  const { width } = useWindowDimensions();
+
+  const reducedMotion = useReducedMotion();
+
+  const logoScale = useRef(new Animated.Value(1)).current;
+  const logoOpacity = useRef(new Animated.Value(1)).current;
+  const contentOpacity = useRef(new Animated.Value(1)).current;
+  const contentTranslateY = useRef(new Animated.Value(0)).current;
+  const progressScale = useRef(new Animated.Value(1)).current;
   const screenOpacity = useRef(new Animated.Value(1)).current;
+  const pulseAnim = useRef(new Animated.Value(0)).current;
 
   const hasFinishedRef = useRef(false);
+  const reducedMotionRef = useRef(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
 
   const safeFinish = () => {
     if (hasFinishedRef.current) return;
     hasFinishedRef.current = true;
-    Animated.timing(screenOpacity, {
-      toValue: 0,
-      duration: 260,
-      useNativeDriver: true,
-    }).start(() => {
+    Animated.parallel([
+      Animated.timing(screenOpacity, {
+        toValue: 0,
+        duration: SPLASH_OVERLAY_EXIT_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(logoScale, {
+        toValue: 1.12,
+        duration: SPLASH_OVERLAY_EXIT_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(contentOpacity, {
+        toValue: 0,
+        duration: SPLASH_OVERLAY_EXIT_MS * 0.8,
+        useNativeDriver: true,
+      }),
+    ]).start(() => {
       onFinish();
     });
   };
 
+  const safeFinishRef = useRef(safeFinish);
+  safeFinishRef.current = safeFinish;
+
   useEffect(() => {
-    // 1. Entrance animation - ALL using useNativeDriver: true to prevent any React Native crash!
+    if (reducedMotionRef.current !== false) return;
+
+    logoOpacity.setValue(0);
+    logoScale.setValue(0.82);
+    contentOpacity.setValue(0);
+    contentTranslateY.setValue(18);
+    progressScale.setValue(0.01);
+
     Animated.sequence([
       Animated.parallel([
         Animated.timing(logoOpacity, {
@@ -95,39 +107,58 @@ export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreen
         Animated.timing(contentTranslateY, {
           toValue: 0,
           duration: 300,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }),
         Animated.timing(progressScale, {
           toValue: 1,
-          duration: 700,
+          duration: 1900,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }),
       ]),
     ]).start();
 
-    // 2. Guaranteed Fail-Safe Dismissal
-    const failsafeTimer = setTimeout(() => {
-      safeFinish();
-    }, 1100);
+    const pulseLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 1600,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 0,
+          duration: 1600,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    pulseLoop.start();
 
-    return () => {
-      clearTimeout(failsafeTimer);
-    };
+    return () => pulseLoop.stop();
+  }, [contentOpacity, contentTranslateY, logoOpacity, logoScale, progressScale, pulseAnim]);
+
+  useEffect(() => {
+    const ceilingTimer = setTimeout(() => {
+      safeFinishRef.current();
+    }, SPLASH_OVERLAY_CEILING_MS);
+    return () => clearTimeout(ceilingTimer);
   }, []);
 
   useEffect(() => {
-    if (isReady) {
-      const settleTimer = setTimeout(() => {
-        safeFinish();
-      }, 650);
-      return () => clearTimeout(settleTimer);
-    }
-  }, [isReady]);
+    if (!isReady) return;
+    const settle = reducedMotion === true ? 0 : SPLASH_OVERLAY_SETTLE_MS;
+    const settleTimer = setTimeout(() => {
+      safeFinishRef.current();
+    }, settle);
+    return () => clearTimeout(settleTimer);
+  }, [isReady, reducedMotion]);
 
   return (
     <Animated.View style={[styles.container, { opacity: screenOpacity }]}>
-      {/* Dark royal blue foundation. Two near-black stops, a barely-there deepening rather
-          than a decorative sweep — the same restraint the rest of the app applies to gradient. */}
+      {}
       <LinearGradient
         colors={['#050B1E', '#0A1538']}
         style={StyleSheet.absoluteFillObject}
@@ -135,49 +166,44 @@ export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreen
         end={{ x: 0.5, y: 1 }}
       />
 
-      {/* Center Stage */}
+      {}
       <View style={styles.centerStage}>
-        {/* Logo — a plain rounded container with a hairline gold edge. No glow, no glass fill. */}
-        <Animated.View
-          style={[
-            styles.logoContainer,
-            {
-              opacity: logoOpacity,
-              transform: [{ scale: logoScale }],
-            },
-          ]}
-        >
-          <Image
-            source={require('../../../assets/dd.png')}
-            style={styles.logoImage}
-            resizeMode="contain"
+        {}
+        <View style={styles.logoWrapper}>
+          <Animated.View
+            style={[
+              styles.pulseHalo,
+              {
+                opacity: pulseAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [0.15, 0.4],
+                }),
+                transform: [
+                  {
+                    scale: pulseAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [0.96, 1.14],
+                    }),
+                  },
+                ],
+              },
+            ]}
           />
-        </Animated.View>
+          <Animated.View
+            style={[
+              styles.logoContainer,
+              {
+                opacity: logoOpacity,
+                transform: [{ scale: logoScale }],
+              },
+            ]}
+          >
+            <DetectiveMascot size={136} animated={true} />
+          </Animated.View>
+        </View>
 
-        {/* Wordmark + one honest line about what the app does. */}
-        <Animated.View
-          style={[
-            styles.typographyBlock,
-            {
-              opacity: contentOpacity,
-              transform: [{ translateY: contentTranslateY }],
-            },
-          ]}
-        >
-          {/*
-            The wordmark is capped where the tagline under it is not, and the asymmetry is the
-            point. A wordmark is brand geometry — it is set against a 110pt logo container that
-            cannot grow, on the one screen in the app with no scroll view to absorb it. The
-            tagline is a sentence about what the app does, so it scales like the prose it is.
-          */}
-          <Text style={styles.brandTitle} maxFontSizeMultiplier={1.3}>
-            Ddetect
-          </Text>
-          <Text style={styles.brandTagline}>Where your evidence agrees — and where it doesn&apos;t</Text>
-        </Animated.View>
-
-        {/* Progress cue — a thin gold fill, the one accent this screen spends. */}
-        <View style={styles.progressBarWrapper}>
+        {}
+        <View style={[styles.progressBarWrapper, { width: width * 0.44 }]}>
           <Animated.View
             style={[
               styles.progressBarFill,
@@ -189,18 +215,15 @@ export function AnimatedSplashScreen({ isReady, onFinish }: AnimatedSplashScreen
         </View>
       </View>
 
-      {/* 1-Tap Skip Bypass Button */}
+      {}
       <TouchableOpacity
         activeOpacity={0.7}
         onPress={safeFinish}
         style={styles.skipButton}
-        // 12.5pt of text in 7pt of padding is a ~30pt target. `hitSlop` tops it up to the
-        // 44pt floor without moving the control, which is the same trade `Pressable` makes
-        // for the dismiss affordances elsewhere in this directory.
+
         hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
         accessibilityRole="button"
-        // Spelled out, because the label is "Skip ›" and a screen reader announces the
-        // chevron as a character rather than as the direction it draws.
+
         accessibilityLabel="Skip the opening animation"
       >
         <Text style={styles.skipButtonText}>Skip ›</Text>
@@ -223,39 +246,29 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 24,
   },
-  logoContainer: {
-    width: 110,
-    height: 110,
-    borderRadius: 28,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(190, 168, 96, 0.45)',
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+  logoWrapper: {
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 28,
-    overflow: 'hidden',
   },
-  logoImage: {
-    width: 84,
-    height: 84,
+  pulseHalo: {
+    position: 'absolute',
+    width: 126,
+    height: 126,
+    borderRadius: 36,
+    backgroundColor: 'rgba(190, 168, 96, 0.22)',
+  },
+  logoContainer: {
+    width: 124,
+    height: 124,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   typographyBlock: {
     alignItems: 'center',
     marginBottom: 28,
   },
-  /**
-   * The wordmark.
-   *
-   * Named family, no `fontWeight`. This ran as `fontWeight: '700'` on a bare RN `Text` with no
-   * family at all, which on Android is Roboto Bold — so the very first thing a user saw was the
-   * brand set in the system font, fading into an app set in Plus Jakarta Sans. Pairing a named
-   * family *with* a weight is the other half of the same trap: the platform then synthesizes a
-   * fake bold over an already-bold face, which is what `tokens.ts:661` documents.
-   *
-   * By the time this component mounts, `RootLayout` has already waited for the fonts to settle,
-   * so the face is loaded. On the font-failure path it falls back to the system font — exactly
-   * what it did before, and now only as a failure mode rather than always.
-   */
+
   brandTitle: {
     fontFamily: FONT_FAMILY.sansExtraBold,
     fontSize: 34,
@@ -272,7 +285,6 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   progressBarWrapper: {
-    width: width * 0.44,
     height: 3,
     borderRadius: 999,
     backgroundColor: 'rgba(255, 255, 255, 0.08)',

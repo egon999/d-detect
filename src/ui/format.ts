@@ -1,30 +1,3 @@
-/**
- * Display formatting.
- *
- * Pure functions, no React Native import, so they are unit tested directly.
- *
- * These sit *above* the domain's own `formatAmount` / `formatDate` rather than replacing
- * them. The domain formatters answer "what is this value"; these answer "how should this
- * value be shown to a person who is deciding whether to trust it". That distinction
- * matters for dates especially, where the honest answer is often two strings — what the
- * document said, and what the system read it as.
- */
-
-import { currencyExponent, formatAmount } from '@domain/normalize/money';
-import { formatDate } from '@domain/normalize/dates';
-import type { NormalizedDate } from '@domain/normalize/dates';
-import type { AmountField, DateField } from '@domain/models';
-import type { ExtractionMethod } from '@domain/enums';
-
-// ---------------------------------------------------------------------------
-// Money
-// ---------------------------------------------------------------------------
-
-/**
- * Symbols for the currencies the normalizer recognises. A currency with no entry here
- * falls back to its ISO code, which is the correct behaviour: `AED 4,000` is clearer
- * than a symbol the reader may not know.
- */
 const CURRENCY_SYMBOLS: Record<string, string> = {
   INR: '₹',
   USD: '$',
@@ -37,110 +10,75 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   CAD: 'C$',
 };
 
-/**
- * A compact amount for tables and dense lists — symbol plus grouped digits, no decimals
- * when the value is whole. `formatAmount` from the domain is authoritative and always
- * includes the currency code; this is the display variant for places where the currency
- * is already established by context (a column header, a case with one currency).
- */
+const CURRENCY_EXPONENT: Record<string, number> = {
+  INR: 2, USD: 2, EUR: 2, GBP: 2, AUD: 2, CAD: 2, SGD: 2, AED: 2, CHF: 2, CNY: 2, NZD: 2, ZAR: 2,
+  JPY: 0, KRW: 0,
+  BHD: 3, KWD: 3, OMR: 3,
+};
+
+function currencyExponent(currency: string): number {
+  return CURRENCY_EXPONENT[currency.toUpperCase()] ?? 2;
+}
+
+const LAKH_CURRENCIES = new Set(['INR', 'PKR', 'LKR', 'NPR', 'BDT']);
+
+function groupDigits(digits: string, lakh: boolean): string {
+  if (digits.length <= 3) return digits;
+  const head = digits.slice(0, -3);
+
+  return `${head.replace(lakh ? /\B(?=(\d{2})+$)/g : /\B(?=(\d{3})+$)/g, ',')},${digits.slice(-3)}`;
+}
+
 export function formatMoneyCompact(minorUnits: number, currency: string): string {
-  // The domain owns the currency table — deliberately not duplicated here, since a
-  // currency with a non-2 exponent (JPY, KWD, BHD) would otherwise be rendered 100x wrong.
-  const exponent = currencyExponent(currency);
+  if (!Number.isFinite(minorUnits)) return '';
+  const code = currency.trim().toUpperCase();
+  const exponent = currencyExponent(code);
   const negative = minorUnits < 0;
-  const absolute = Math.abs(minorUnits);
+  const absolute = Math.abs(Math.trunc(minorUnits));
   const whole = Math.floor(absolute / 10 ** exponent);
   const fraction = absolute % 10 ** exponent;
-  // `en-IN` grouping (12,34,567) suits the primary audience; the fallback for readers
-  // elsewhere is acceptable because the digits are identical, only separators differ.
-  const grouped = whole.toLocaleString('en-IN');
-  const symbol = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
+  const grouped = groupDigits(String(whole), LAKH_CURRENCIES.has(code));
+  const symbol = CURRENCY_SYMBOLS[code] ?? `${code} `;
   const body = exponent === 0 || fraction === 0
     ? grouped
     : `${grouped}.${String(fraction).padStart(exponent, '0')}`;
   return `${negative ? '-' : ''}${symbol}${body}`;
 }
 
-/**
- * The fully-qualified form, e.g. "INR 40,000.00". Used where no column context exists.
- *
- * `formatAmount` needs an `original` string for its signature, but never reads it — the
- * value it prints is derived entirely from `minorUnits` and `currency`. Passing the
- * rendered form keeps that contract honest rather than inventing a source string.
- */
-export function formatMoneyFull(amount: AmountField): string {
-  const rendered = formatMoneyCompact(amount.minorUnits, amount.currency);
-  return formatAmount({
-    original: rendered,
-    minorUnits: amount.minorUnits,
-    currency: amount.currency,
-  });
+export function currencySymbol(currency: string): string {
+  const code = currency.trim().toUpperCase();
+  return CURRENCY_SYMBOLS[code]?.trim() || code;
 }
 
-// ---------------------------------------------------------------------------
-// Dates
-// ---------------------------------------------------------------------------
+export function normalizeUserAmount(input: string | null | undefined): string | null {
+  if (!input) return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
 
-export interface DateDisplay {
-  /** What the document actually said, verbatim. */
-  original: string;
-  /** The parsed reading, e.g. "3 April 2024"; empty when nothing was parsed. */
-  normalized: string;
-  /** True when a `03/04/2024` reading could go either way. */
-  ambiguous: boolean;
-  /** Extra context to show beside the date, if any. */
-  hint: string | null;
+  let cleaned = trimmed.replace(/^(?:[₹$€£¥₩₽₪₦₱৳₨]|(?:rs\.?|inr|usd|eur|gbp)\s*)/i, '').trim();
+
+  cleaned = cleaned.replace(/(?:\s*(?:\/[-=]|rs\.?|inr|usd|eur|gbp))$/i, '').trim();
+
+  cleaned = cleaned.replace(/[\s,]/g, '');
+  if (!/^\d+(?:\.\d{1,3})?$/.test(cleaned)) return null;
+  const num = Number(cleaned);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return cleaned;
 }
-
-/**
- * Renders a date for display, preserving uncertainty.
- *
- * The ambiguity signal is the important part. A date the system had to guess at is shown
- * as a guess, with the original beside it, so a user reviewing a case never sees a
- * confident-looking date that the system inferred from an ambiguous source.
- */
-export function describeDate(field: DateField): DateDisplay {
-  const normalized = {
-    original: field.original,
-    iso: field.iso,
-    precision: field.precision,
-    ambiguous: field.ambiguous,
-  } satisfies NormalizedDate;
-
-  const rendered = field.iso ? formatDate(normalized) : '';
-
-  let hint: string | null = null;
-  if (field.ambiguous) {
-    hint = 'Ambiguous — day and month could be read either way';
-  } else if (field.precision === 'MONTH') {
-    hint = 'Month only — the exact day is not stated';
-  } else if (field.precision === 'YEAR') {
-    hint = 'Year only — the exact date is not stated';
-  } else if (!field.iso) {
-    hint = 'No date could be read from the source';
-  }
-
-  return { original: field.original, normalized: rendered, ambiguous: field.ambiguous, hint };
-}
-
-// ---------------------------------------------------------------------------
-// Relative time
-// ---------------------------------------------------------------------------
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
-/**
- * Relative time for recency indicators ("2 days ago", "just now").
- *
- * Only ever used for *system* timestamps — upload time, last analysis run, audit entries.
- * Never for evidence dates: "3 months ago" is the wrong register for a date on an
- * invoice, and this function deliberately does not accept a precision-less date.
- *
- * Beyond a month it switches to an absolute date, because "7 weeks ago" is harder to
- * place than "12 Aug".
- */
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const;
+
+function shortMonth(monthIndex: number): string {
+  return (MONTH_NAMES[monthIndex] ?? '').slice(0, 3);
+}
+
 export function formatRelativeTime(timestamp: number, now: number): string {
   const delta = now - timestamp;
   if (delta < 0) return 'Just now';
@@ -163,115 +101,379 @@ export function formatRelativeTime(timestamp: number, now: number): string {
   return formatAbsoluteDate(timestamp);
 }
 
-/** Short absolute date, e.g. "12 Aug" or "12 Aug 2025" if not the current year. */
 export function formatAbsoluteDate(timestamp: number, now: number = Date.now()): string {
   const date = new Date(timestamp);
-  const month = date.toLocaleString('en-GB', { month: 'short' });
+  const month = shortMonth(date.getMonth());
   const sameYear = new Date(now).getFullYear() === date.getFullYear();
   return sameYear
     ? `${date.getDate()} ${month}`
     : `${date.getDate()} ${month} ${date.getFullYear()}`;
 }
 
-/** Full timestamp for audit entries, to the minute. */
 export function formatTimestamp(timestamp: number): string {
   const date = new Date(timestamp);
   const day = date.getDate();
-  const month = date.toLocaleString('en-GB', { month: 'short' });
+  const month = shortMonth(date.getMonth());
   const time = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
   return `${day} ${month} ${date.getFullYear()}, ${time}`;
 }
 
-// ---------------------------------------------------------------------------
-// Files and counts
-// ---------------------------------------------------------------------------
+export function formatOccurredOn(timestamp: number, precision?: string | null): string {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = MONTH_NAMES[date.getMonth()] ?? '';
+  if (precision === 'year') return String(year);
+  if (precision === 'month') return `${month} ${year}`;
+  const day = `${date.getDate()} ${month} ${year}`;
+  return precision === 'minute' ? `${day}, ${formatClockTime(timestamp)}` : day;
+}
 
-/** Byte size, e.g. "1.4 MB". Uses decimal units, which is what file managers report. */
-export function formatBytes(bytes: number | null): string {
-  if (bytes === null || bytes < 0) return '—';
-  if (bytes < 1000) return `${bytes} B`;
-  const units = ['KB', 'MB', 'GB'];
-  let value = bytes / 1000;
-  let unitIndex = 0;
-  while (value >= 1000 && unitIndex < units.length - 1) {
-    value /= 1000;
-    unitIndex += 1;
+export function formatClockTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const hours = date.getHours();
+  const twelve = hours % 12 === 0 ? 12 : hours % 12;
+  return `${twelve}:${String(date.getMinutes()).padStart(2, '0')} ${hours < 12 ? 'am' : 'pm'}`;
+}
+
+export function isoDateOf(timestamp: number): string {
+  const date = new Date(timestamp);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function realDate(day: number, month: number, year: number): boolean {
+  if (year < 1900 || year > 2100 || month < 1 || month > 12 || day < 1) return false;
+  const shortFebruary = month === 2 && !(year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0));
+  return day <= (DAYS_IN_MONTH[month - 1] ?? 31) - (shortFebruary ? 1 : 0);
+}
+
+export function normalizeTypedDate(input: string | null | undefined): string | null {
+  if (!input) return null;
+  const match = /^(\d{1,2})\s*[/.\s-]\s*(\d{1,2})\s*[/.\s-]\s*(\d{2}|\d{4})$/.exec(input.trim());
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const written = match[3] ?? '';
+  const year = written.length === 2 ? Number(written) + (Number(written) >= 70 ? 1900 : 2000) : Number(written);
+  if (!realDate(day, month, year)) return null;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+const WRITTEN_CURRENCIES: Record<string, string> = {
+  '₹': 'INR', '₨': 'INR', rs: 'INR', inr: 'INR',
+  $: 'USD', usd: 'USD',
+  '€': 'EUR', eur: 'EUR',
+  '£': 'GBP', gbp: 'GBP',
+  '¥': 'JPY',
+  '₩': 'KRW',
+  '₽': 'RUB',
+  '₪': 'ILS',
+  '₦': 'NGN',
+  '₱': 'PHP',
+  '৳': 'BDT',
+};
+
+export function currencyInUserAmount(input: string | null | undefined): string | null {
+  if (!input) return null;
+
+  const token = input
+    .toLowerCase()
+    .replace(/[\d\s,]/g, '')
+    .replace(/\/[-=]$/, '')
+    .replace(/\.+$/, '');
+  return WRITTEN_CURRENCIES[token] ?? null;
+}
+
+const TEXT_MARKER = '[TEXT]';
+const SCENE_MARKER = '[SCENE]';
+
+function splitRead(sourceText: string): { words: string; scene: string } {
+  const upper = sourceText.toUpperCase();
+  const textAt = upper.indexOf(TEXT_MARKER);
+  const sceneAt = upper.indexOf(SCENE_MARKER);
+  if (sceneAt === -1) {
+    const words = textAt === -1 ? sourceText : sourceText.slice(textAt + TEXT_MARKER.length);
+    return { words: words.trim(), scene: '' };
   }
-  const rounded = value < 10 ? value.toFixed(1) : Math.round(value).toString();
-  return `${rounded} ${units[unitIndex]}`;
+  return {
+    words:
+      textAt === -1 || textAt > sceneAt
+        ? ''
+        : sourceText.slice(textAt + TEXT_MARKER.length, sceneAt).trim(),
+    scene: sourceText.slice(sceneAt + SCENE_MARKER.length).trim(),
+  };
 }
 
-/** `1 item` / `4 items`. Used everywhere a count appears, so no screen writes "1 items". */
-export function pluralize(count: number, singular: string, plural?: string): string {
-  if (count === 1) return `${count} ${singular}`;
-  return `${count} ${plural ?? `${singular}s`}`;
+export function documentWords(sourceText: string | null | undefined): string | null {
+  if (!sourceText) return null;
+  return splitRead(sourceText).words || null;
 }
 
-/** Count without the noun, for tight spaces like a tab badge. */
-export function formatCount(count: number): string {
-  if (count > 999) return `${Math.floor(count / 100) / 10}k`;
-  return String(count);
+export function pictureDescription(sourceText: string | null | undefined): string | null {
+  if (!sourceText) return null;
+  return splitRead(sourceText).scene || null;
 }
 
-// ---------------------------------------------------------------------------
-// Provenance
-// ---------------------------------------------------------------------------
+export type RecordRead = {
 
-/**
- * A short, human sentence for a provenance method — used in the value popover that
- * answers "where did this come from?".
- *
- * `sourceQuote` is truncated rather than shown in full: it appears on a card, and the
- * full surrounding text is available on the evidence detail screen.
- */
-export function describeProvenance(
-  method: ExtractionMethod,
-  sourceQuote?: string,
-  maxQuoteLength = 140,
-): string {
-  const source = sourceQuote?.trim();
-  const quoted =
-    source && source.length > 0
-      ? `"${source.length > maxQuoteLength ? `${source.slice(0, maxQuoteLength).trimEnd()}…` : source}"`
-      : null;
+  isDocument: boolean;
 
-  switch (method) {
-    case 'MANUAL':
-      return 'Entered by hand and confirmed by a person.';
-    case 'DETERMINISTIC':
-      return quoted ? `Read directly from the document text: ${quoted}` : 'Read directly from the document text.';
-    case 'OCR':
-      // Says "an image", never "the document": these characters were guessed at from
-      // pixels, and the reader is told so plainly rather than left to infer it from a
-      // colour. The nudge to check is the point — a misread digit here is the failure
-      // mode the whole provenance system exists to catch.
-      return quoted
-        ? `Read from an image on this device. Characters can be misread, so check it against the original: ${quoted}`
-        : 'Read from an image on this device. Characters can be misread, so check it against the original.';
-    case 'AI':
-      return quoted ? `Suggested by a language model: ${quoted}` : 'Suggested by a language model, not yet confirmed.';
+  note: string | null;
+
+  reference: string | null;
+
+  marked: string | null;
+
+  summary: string | null;
+
+  words: string | null;
+
+  scene: string | null;
+
+  unread: boolean;
+};
+
+export const NOTHING_READ: RecordRead = {
+  isDocument: false,
+  note: null,
+  reference: null,
+  marked: null,
+  summary: null,
+  words: null,
+  scene: null,
+  unread: false,
+};
+
+const DOCUMENT_READS = new Set(['pdf', 'docx', 'text']);
+
+function readString(source: Record<string, unknown>, key: string, limit: number): string | null {
+  const value = source[key];
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+
+  return text && text.length <= limit ? text : null;
+}
+
+const REFERENCE_LIMIT = 80;
+
+const MARKED_LIMIT = 40;
+
+const PROSE_LIMIT = 1_000;
+
+export function readRecordDetails(extraction: unknown): RecordRead {
+  if (!extraction || typeof extraction !== 'object' || Array.isArray(extraction)) return NOTHING_READ;
+  const source = extraction as Record<string, unknown>;
+  const sourceText = typeof source.sourceText === 'string' ? source.sourceText : null;
+  const readBy = readString(source, 'readBy', MARKED_LIMIT);
+  const marked = readString(source, 'status', MARKED_LIMIT);
+  return {
+    isDocument: readBy !== null && DOCUMENT_READS.has(readBy.toLowerCase()),
+    note: readString(source, 'readNote', PROSE_LIMIT),
+    reference: readString(source, 'reference', REFERENCE_LIMIT),
+
+    marked: marked ? marked.charAt(0).toUpperCase() + marked.slice(1) : null,
+    summary: readString(source, 'summary', PROSE_LIMIT),
+    words: documentWords(sourceText),
+    scene: pictureDescription(sourceText),
+    unread: source.unread === true,
+  };
+}
+
+export function readHasContent(read: RecordRead): boolean {
+  return Boolean(read.summary || read.reference || read.marked || read.words || read.scene);
+}
+
+export type RecordStatusWords = {
+
+  label: string;
+
+  meaning: string;
+};
+
+export function recordStatusWords(status: string | null | undefined): RecordStatusWords {
+  switch ((status ?? '').trim().toLowerCase()) {
+    case 'processing':
+      return {
+        label: 'Reading it now',
+        meaning: 'This is still being read. You can leave the page — it carries on without you.',
+      };
+    case 'needs_context':
+      return {
+        label: 'One thing to check',
+        meaning: 'It has been read. There is one thing only you can answer.',
+      };
+    case 'complete':
+      return {
+        label: 'All set',
+        meaning: 'This one is finished. Anything that looks wrong can be corrected below.',
+      };
+    case 'unreadable':
+      return {
+        label: 'Couldn’t read this',
+        meaning: 'Nothing could be read from the file. It is still saved, and you can fill in what matters.',
+      };
+    case 'failed':
+      return {
+        label: 'Stopped partway',
+        meaning: 'Reading this stopped before it finished. The file is safe — have another go, or type it in.',
+      };
+    default:
+      return {
+        label: 'Saved',
+        meaning: 'This is saved. Anything below can be changed.',
+      };
   }
 }
 
-/** Truncates a string to `max` characters on a word boundary where possible. */
-export function truncate(value: string, max: number): string {
-  if (value.length <= max) return value;
-  const clipped = value.slice(0, max);
-  const lastSpace = clipped.lastIndexOf(' ');
-  const body = lastSpace > max * 0.6 ? clipped.slice(0, lastSpace) : clipped;
-  return `${body.trimEnd()}…`;
+export type RecordKindFamily =
+  | 'payment' | 'purchase' | 'bill' | 'receipt' | 'ticket'
+  | 'travel' | 'document' | 'message' | 'note' | 'other';
+
+const RECORD_KINDS: Record<string, { label: string; family: RecordKindFamily }> = {
+
+  payment: { label: 'Payment', family: 'payment' },
+  purchase: { label: 'Purchase', family: 'purchase' },
+  bill: { label: 'Bill', family: 'bill' },
+  receipt: { label: 'Receipt', family: 'receipt' },
+  ticket: { label: 'Ticket', family: 'ticket' },
+  travel: { label: 'Travel', family: 'travel' },
+  document: { label: 'Document', family: 'document' },
+  message: { label: 'Message', family: 'message' },
+  note: { label: 'Note', family: 'note' },
+
+  other: { label: 'Something you saved', family: 'other' },
+
+  invoice: { label: 'Bill', family: 'bill' },
+  statement: { label: 'Statement', family: 'bill' },
+  bank_statement: { label: 'Bank statement', family: 'bill' },
+  tax: { label: 'Tax paper', family: 'bill' },
+  transfer: { label: 'Transfer', family: 'payment' },
+  refund: { label: 'Refund', family: 'payment' },
+  salary: { label: 'Salary', family: 'payment' },
+  payslip: { label: 'Payslip', family: 'payment' },
+  rent: { label: 'Rent', family: 'payment' },
+  cheque: { label: 'Cheque', family: 'payment' },
+  check: { label: 'Cheque', family: 'payment' },
+  order: { label: 'Order', family: 'purchase' },
+  subscription: { label: 'Subscription', family: 'purchase' },
+  slip: { label: 'Slip', family: 'receipt' },
+  voucher: { label: 'Voucher', family: 'receipt' },
+  coupon: { label: 'Voucher', family: 'receipt' },
+  boarding_pass: { label: 'Boarding pass', family: 'ticket' },
+  booking: { label: 'Booking', family: 'travel' },
+  reservation: { label: 'Booking', family: 'travel' },
+  insurance: { label: 'Insurance paper', family: 'document' },
+  policy: { label: 'Policy', family: 'document' },
+  warranty: { label: 'Warranty', family: 'document' },
+  prescription: { label: 'Prescription', family: 'document' },
+  contract: { label: 'Agreement', family: 'document' },
+  agreement: { label: 'Agreement', family: 'document' },
+  letter: { label: 'Letter', family: 'document' },
+  certificate: { label: 'Certificate', family: 'document' },
+  form: { label: 'Form', family: 'document' },
+  email: { label: 'Message', family: 'message' },
+  chat: { label: 'Message', family: 'message' },
+  sms: { label: 'Message', family: 'message' },
+  photo: { label: 'Picture', family: 'other' },
+  picture: { label: 'Picture', family: 'other' },
+  image: { label: 'Picture', family: 'other' },
+  screenshot: { label: 'Picture', family: 'other' },
+};
+
+const UNNAMED_KIND = 'Something you saved';
+
+function kindInWords(token: string): string | null {
+  const words = token.split(/[^a-z]+/).filter(Boolean);
+  if (words.length === 0 || words.length > 3) return null;
+  if (words.join('').length > 24) return null;
+  if (!words.every((word) => word.length >= 3 && /[aeiou]/.test(word))) return null;
+  const [first = '', ...rest] = words;
+  return [first.charAt(0).toUpperCase() + first.slice(1), ...rest].join(' ');
 }
 
-/** Sentence case for a SCREAMING_CASE enum value, as a fallback. Prefer the label maps. */
-export function humanizeEnum(value: string): string {
-  const lower = value.toLowerCase().replace(/_/g, ' ');
-  return lower.charAt(0).toUpperCase() + lower.slice(1);
+export function recordKindLabel(kind: string | null | undefined): string {
+  const token = (kind ?? '').trim().toLowerCase();
+  if (!token) return UNNAMED_KIND;
+  return RECORD_KINDS[token]?.label ?? kindInWords(token) ?? UNNAMED_KIND;
 }
 
-/** Initials for an avatar, max two characters. */
-export function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return '?';
-  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
-  return `${parts[0]![0]!}${parts[parts.length - 1]![0]!}`.toUpperCase();
+export function recordKindFamily(kind: string | null | undefined): RecordKindFamily {
+  const token = (kind ?? '').trim().toLowerCase();
+  return RECORD_KINDS[token]?.family ?? 'other';
+}
+
+export type ShareableRecord = {
+  kind: string;
+  title: string;
+  amountLabel: string | null;
+  direction: 'in' | 'out' | null;
+  counterparty: string | null;
+  occurredAt: number | null;
+  occurredPrecision: string | null;
+};
+
+export function recordShareText(record: ShareableRecord, reference: string | null): string {
+  const title = record.title?.trim() || recordKindLabel(record.kind);
+  const lines: string[] = [title];
+  if (record.amountLabel) {
+    const verb = record.direction === 'in' ? 'Received' : record.direction === 'out' ? 'Paid' : 'Amount';
+    lines.push(`${verb} ${record.amountLabel}`);
+  }
+  if (record.counterparty?.trim()) {
+    const with_ = record.direction === 'in' ? 'From' : record.direction === 'out' ? 'To' : 'With';
+    lines.push(`${with_} ${record.counterparty.trim()}`);
+  }
+  if (record.occurredAt !== null) {
+    lines.push(`On ${formatOccurredOn(record.occurredAt, record.occurredPrecision)}`);
+  }
+  if (reference?.trim()) lines.push(`Reference ${reference.trim()}`);
+  return lines.join('\n');
+}
+
+export function exportFileName(title: string | null | undefined, fallback = 'The original'): string {
+  const cleaned = (title ?? '').replace(/[^\p{L}\p{N}\p{M} ._-]/gu, '').trim();
+
+  const named = cleaned.replace(/^[.\s]+/, '').slice(0, 80).trim();
+  return named || fallback;
+}
+
+export type RelatedLink = { by: 'counterparty'; value: string } | { by: 'category'; value: string };
+
+export function relatedLink(record: {
+  counterparty?: string | null;
+  category?: string | null;
+}): RelatedLink | null {
+  const name = (record.counterparty ?? '').trim();
+  if (name) return { by: 'counterparty', value: name };
+  const category = (record.category ?? '').trim();
+  if (category) return { by: 'category', value: category };
+  return null;
+}
+
+export function relatedLinkTitle(link: RelatedLink): string {
+  return link.by === 'counterparty' ? `More with ${link.value}` : `More under ${link.value}`;
+}
+
+export function relatedLinkHint(link: RelatedLink): string {
+  return link.by === 'counterparty'
+    ? 'Other things you’ve saved with the same name on them.'
+    : 'Other things you’ve filed the same way.';
+}
+
+export function relatedRecords<
+  T extends { id: string; counterparty?: string | null; category?: string | null },
+>(self: string, link: RelatedLink, page: readonly T[], limit: number): T[] {
+  if (limit <= 0) return [];
+  const wanted = link.value.trim().toLowerCase();
+  const field = link.by;
+  return page
+    .filter((entry) => {
+      if (entry.id === self) return false;
+      const value = (field === 'counterparty' ? entry.counterparty : entry.category) ?? '';
+      return value.trim().toLowerCase() === wanted;
+    })
+    .slice(0, limit);
 }

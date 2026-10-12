@@ -1,43 +1,33 @@
-/**
- * Text.
- *
- * Every string in the app goes through this component. Nothing renders a bare `<Text>`
- * with an inline font, for one reason: the sans/mono split is a product guarantee (see
- * `tokens.ts`), and a single stray `<Text>` with a hard-coded family is enough to break
- * it. Routing all type through here means the guarantee holds by construction.
- *
- * `variant` names a role, not a size. `mono` overrides the family while keeping the size
- * and rhythm of the variant, which is what you want when a name that is normally prose
- * turns out to have been read from a document.
- *
- * ## Font scaling
- *
- * That same funnel is why the app's text-scaling policy lives here rather than at the call
- * sites. Scaling is left **on** — this product is read by people building a case out of their
- * own documents, and a meaningful share of them have already raised the system font size —
- * and each variant carries the ceiling its rank earns, from `TYPE_SCALE_CAP`. The reasoning
- * for the per-rank figures is in `tokens.ts`; the short version is that a flat multiplier
- * magnifies the ranks that need it least and collapses the hierarchy for the readers who are
- * working hardest.
- *
- * A caller may pass its own `maxFontSizeMultiplier` and it wins, which is how the compact
- * controls apply `CONTROL_SCALE_CAP` — a chip, a badge and a button label are bounded by the
- * box they sit in, not by their rank.
- */
+import React, { forwardRef, useCallback, useState } from 'react';
+import {
+  StyleSheet,
+  useWindowDimensions,
+  View,
+  Text as RNText,
+  type LayoutChangeEvent,
+  type TextProps as RNTextProps,
+  type TextStyle,
+  type ViewStyle,
+} from 'react-native';
 
-import React, { forwardRef } from 'react';
-import { StyleSheet, Text as RNText, type TextProps as RNTextProps } from 'react-native';
-
-import { FONT_FAMILY, TYPE_SCALE_CAP, type TypeToken } from '../tokens';
+import {
+  FONT_FAMILY,
+  measureFigure,
+  TABULAR,
+  TYPE,
+  TYPE_SCALE_CAP,
+  type TypeToken,
+} from '../tokens';
 import { useTheme } from '../theme';
 import type { Tone } from '../tokens';
 
-/** How a variant maps to a colour when no explicit `tone` or `color` is given. */
 const VARIANT_DEFAULT_TONE: Record<TypeToken, Tone | 'primary' | 'secondary'> = {
   display: 'primary',
   title: 'primary',
+  titleSmall: 'primary',
   heading: 'primary',
   subheading: 'primary',
+  bodyLarge: 'primary',
   body: 'primary',
   bodyMedium: 'primary',
   bodySmall: 'secondary',
@@ -51,20 +41,27 @@ const VARIANT_DEFAULT_TONE: Record<TypeToken, Tone | 'primary' | 'secondary'> = 
   monoOverline: 'secondary',
 };
 
+const VARIANT_TABULAR: Partial<Record<TypeToken, true>> = {
+  statValue: true,
+  monoValue: true,
+  mono: true,
+  monoSmall: true,
+  monoOverline: true,
+};
+
 export interface TextProps extends Omit<RNTextProps, 'style'> {
   variant?: TypeToken;
-  /** An explicit semantic colour. Overrides the variant's default. */
+
   tone?: Tone;
-  /** An explicit colour token name. Overrides both `tone` and the variant default. */
+
   colorToken?: keyof import('../tokens').ColorScheme;
-  /**
-   * Force the monospace family while keeping the variant's size. Use for values that
-   * came out of a document but appear inside a prose context.
-   */
+
   mono?: boolean;
-  /** Centre the text. Shortcut for the most common non-default alignment. */
+
+  tabular?: boolean;
+
   center?: boolean;
-  /** Uppercase transform, for `overline` headings that are written in sentence case in code. */
+
   uppercase?: boolean;
   style?: RNTextProps['style'];
   children?: React.ReactNode;
@@ -76,6 +73,7 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
     tone,
     colorToken,
     mono = false,
+    tabular,
     center = false,
     uppercase = false,
     maxFontSizeMultiplier,
@@ -102,10 +100,9 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
     color = theme.tone(defaultTone).fg;
   }
 
-  // Only the family is swapped, never the size — a monospace face at the same nominal
-  // size has a different x-height, and re-scaling here would break the vertical rhythm
-  // of every card that mixes the two.
   const fontFamily = mono ? monoFamilyFor(base.fontFamily) : base.fontFamily;
+
+  const wantsTabular = tabular ?? (mono || VARIANT_TABULAR[variant] === true);
 
   return (
     <RNText
@@ -113,16 +110,12 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
       style={[
         base,
         { fontFamily, color },
+        wantsTabular && TABULAR,
         center && styles.center,
         uppercase && styles.uppercase,
         style,
       ]}
-      // Resolved here rather than left to JSX spread order, so the fallback is visible at the
-      // point it happens. `??` and not `||`, and the difference matters: RN reads `null` as
-      // "inherit the global default", which is no ceiling at all, so a `null` arriving from a
-      // prop that was threaded through three components would silently switch the policy off
-      // for that string. A caller that needs a different ceiling names one — which is what the
-      // compact controls do with `CONTROL_SCALE_CAP`.
+
       maxFontSizeMultiplier={maxFontSizeMultiplier ?? TYPE_SCALE_CAP[variant]}
       {...rest}
     >
@@ -131,13 +124,11 @@ export const Text = forwardRef<RNText, TextProps>(function Text(
   );
 });
 
-/** Maps a sans face to its mono counterpart at the same weight, preserving emphasis. */
 function monoFamilyFor(sansFamily: string): string {
   switch (sansFamily) {
     case FONT_FAMILY.sansSemiBold:
     case FONT_FAMILY.sansBold:
-    // Plex Mono stops at SemiBold, so ExtraBold lands there too. The alternative is
-    // letting RN synthesise a heavier weight, which smears the stems at small sizes.
+
     case FONT_FAMILY.sansExtraBold:
       return FONT_FAMILY.monoSemiBold;
     case FONT_FAMILY.sansMedium:
@@ -147,12 +138,85 @@ function monoFamilyFor(sansFamily: string): string {
   }
 }
 
-/** Mono-family text at an explicit token. Thin wrapper for table-like layouts. */
-export function MonoText({ variant = 'mono', ...rest }: TextProps) {
-  return <Text variant={variant} mono {...rest} />;
-}
-
 const styles = StyleSheet.create({
   center: { textAlign: 'center' },
   uppercase: { textTransform: 'uppercase' },
+
+  figureFit: { maxWidth: '100%', overflow: 'hidden' },
 });
+
+const FIGURE_MIN_RATIO = 0.72;
+
+type FigureVariant = Extract<
+  TypeToken,
+  'statValue' | 'display' | 'title' | 'titleSmall' | 'monoValue' | 'mono' | 'monoSmall'
+>;
+
+export interface FigureProps extends Omit<TextProps, 'variant' | 'children' | 'numberOfLines'> {
+
+  children: string;
+
+  variant?: FigureVariant;
+
+  fit?: boolean;
+}
+
+export function Figure({
+  children,
+  variant = 'monoValue',
+  fit = false,
+  style,
+  ...rest
+}: FigureProps) {
+  const theme = useTheme();
+  const [available, setAvailable] = useState<number | null>(null);
+  const { fontScale } = useWindowDimensions();
+
+  const onLayout = useCallback((event: LayoutChangeEvent) => {
+    const next = Math.round(event.nativeEvent.layout.width);
+
+    setAvailable((previous) => (previous === next ? previous : next));
+  }, []);
+
+  const base = theme.type[variant];
+  const cap = TYPE_SCALE_CAP[variant];
+  const scale = Math.min(fontScale, cap);
+
+  const natural = measureFigure(children, base.fontFamily, base.fontSize * scale);
+
+  const ratio =
+    fit && available !== null && available > 0 && natural > available
+      ? Math.max(FIGURE_MIN_RATIO, available / natural)
+      : 1;
+
+  const fitted: TextStyle | null =
+    ratio === 1
+      ? null
+      : {
+          fontSize: base.fontSize * ratio,
+          lineHeight: base.lineHeight * ratio,
+
+          letterSpacing: base.letterSpacing * ratio,
+        };
+
+  const content = (
+    <Text
+      variant={variant}
+      numberOfLines={1}
+
+      maxFontSizeMultiplier={cap}
+      style={[fitted, style]}
+      {...rest}
+    >
+      {children}
+    </Text>
+  );
+
+  if (!fit) return content;
+
+  return (
+    <View onLayout={onLayout} style={styles.figureFit as ViewStyle}>
+      {content}
+    </View>
+  );
+}

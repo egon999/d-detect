@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Ddetect",
+    "name": "D-Detect",
     "slug": "ddetect",
     "scheme": "ddetect",
     "version": "1.0.0",
@@ -13,17 +13,32 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.ddetect.casegraph"
+      "bundleIdentifier": "com.ddetect.casegraph",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
     },
     "android": {
       "package": "com.ddetect.casegraph",
+      "versionCode": 2,
       "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
-        "backgroundColor": "#030712",
-        "foregroundImage": "./assets/dd.png"
+        "backgroundImage": "./assets/android-icon-background.png",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png",
+        "backgroundColor": "#030712"
       },
       "predictiveBackGestureEnabled": false,
-      "allowBackup": false
+      "allowBackup": false,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "READ_EXTERNAL_STORAGE",
+        "READ_MEDIA_IMAGES",
+        "POST_NOTIFICATIONS"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -51,8 +66,8 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Ddetect needs photo access so you can attach screenshots and scanned documents as case evidence.",
-          "cameraPermission": "Ddetect needs camera access so you can photograph a document and add it as evidence."
+          "photosPermission": "D-Detect needs your photos so you can save a payment screenshot, a bill or a document and have it read for you.",
+          "cameraPermission": "D-Detect needs your camera so you can photograph a bill or a document and have it read for you."
         }
       ],
       [
@@ -70,7 +85,21 @@
       "@react-native-google-signin/google-signin",
       "./plugins/with-release-signing.js",
       "./plugins/with-android-security.js",
-      "expo-audio"
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "D-Detect needs your microphone so you can record a meeting and get the summary and the action items afterwards.",
+          "enableBackgroundRecording": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/android-notification-icon.png",
+          "color": "#BEA860",
+          "defaultChannel": "due-reminders"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

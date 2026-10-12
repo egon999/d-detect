@@ -1,0 +1,30 @@
+{
+  "name": "detact-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Detact backend. Owns storage, extraction, AI orchestration and analysis. The app is a thin client over this.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --import ./test-helpers/seal-network.mjs --test src/**/*.test.ts test-helpers/*.test.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.15.0",
+    "better-sqlite3": "^12.2.0",
+    "hono": "^4.9.0",
+    "mammoth": "^1.12.3",
+    "pdf-parse": "^2.4.5",
+    "sharp": "^0.35.5",
+    "tesseract.js": "^7.0.0",
+    "zod": "^4.6.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.20.2",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.2"
+  }
+}

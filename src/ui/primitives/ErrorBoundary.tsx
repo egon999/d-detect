@@ -1,28 +1,9 @@
-/**
- * Root error boundary.
- *
- * The problem this solves is specific to release builds. In development a JavaScript error
- * raises a red box with a stack trace. In a release APK there is no red box: the error
- * propagates, React unmounts the tree, and the user is left looking at whatever was behind
- * it — which, during boot, is the native splash screen. The app appears to hang forever,
- * and the one piece of information that would explain it is thrown away.
- *
- * So this catches the error and *renders* it. Not a friendly "something went wrong" card —
- * the actual message and component stack, on screen, copyable. Being able to read the error
- * off the device is worth more than a polished failure state, because a failure state the
- * user cannot report is a bug that cannot be fixed.
- *
- * Deliberately no theme, no design tokens, no fonts: this must render even when the theme
- * provider is the thing that threw. Plain `View`, `Text`, hard-coded colours, system font.
- * A dependency here is a way for the error screen itself to fail.
- */
-
 import React from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 interface Props {
   children: React.ReactNode;
-  /** Shown above the error. Identifies which boundary caught it when there are several. */
+
   label?: string;
 }
 
@@ -40,7 +21,8 @@ export class ErrorBoundary extends React.Component<Props, State> {
 
   override componentDidCatch(error: Error, info: React.ErrorInfo) {
     this.setState({ componentStack: info.componentStack ?? null });
-    console.error('[boundary] caught:', error.message);
+
+    console.error('[boundary] caught:', this.props.label ?? 'unlabelled', error.message, info.componentStack ?? '');
   }
 
   private reset = () => {
@@ -56,13 +38,7 @@ export class ErrorBoundary extends React.Component<Props, State> {
         <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
           <View style={styles.card}>
             <View style={styles.iconCircle}>
-              {/*
-                A literal ceiling, not the token — this file imports nothing by design (see the
-                header), and a 52pt circle drawn around a 26pt glyph is the one box on this
-                screen that cannot grow with it. Everything else here is inside a `ScrollView`
-                and scales freely, which is what matters: the reader who needs this screen is
-                reading an error message, not a decorative exclamation mark.
-              */}
+              {}
               <Text style={styles.iconText} maxFontSizeMultiplier={1.4}>
                 !
               </Text>
@@ -70,39 +46,34 @@ export class ErrorBoundary extends React.Component<Props, State> {
 
             <Text style={styles.title}>This screen stopped working</Text>
             <Text style={styles.subtitle}>
-              Your cases and the evidence you have added are saved and unaffected. Try the screen again — if it stops
-              again, the details below say why.
+              Nothing you have saved is affected. Try it again — if it stops a second time, close the app and reopen it.
             </Text>
 
-            {this.props.label ? (
-              <Text style={styles.label}>Context: {this.props.label}</Text>
-            ) : null}
-
-            <View style={styles.errorBox}>
-              <Text style={styles.message} numberOfLines={4} selectable>
-                {error.message || 'No further detail was recorded.'}
-              </Text>
-            </View>
+            {this.props.label ? <Text style={styles.label}>{this.props.label}</Text> : null}
 
             <TouchableOpacity
               style={styles.primaryButton}
               onPress={this.reset}
               activeOpacity={0.8}
-              // `TouchableOpacity` marks itself accessible but names no role, so this
-              // announced as plain text on the one screen whose entire purpose is to offer
-              // the reader a way out.
+
               accessibilityRole="button"
               accessibilityLabel="Try this screen again"
             >
               <Text style={styles.primaryButtonText}>Try this screen again</Text>
             </TouchableOpacity>
 
-            {componentStack ? (
+            {}
+            {__DEV__ ? (
               <View style={styles.traceContainer}>
-                <Text style={styles.traceTitle}>Technical detail</Text>
-                <Text style={styles.mono} selectable numberOfLines={6}>
-                  {componentStack.trim()}
+                <Text style={styles.traceTitle}>Development detail</Text>
+                <Text style={styles.mono} selectable>
+                  {error.message || 'No message on the error.'}
                 </Text>
+                {componentStack ? (
+                  <Text style={[styles.mono, styles.traceStack]} selectable numberOfLines={12}>
+                    {componentStack.trim()}
+                  </Text>
+                ) : null}
               </View>
             ) : null}
           </View>
@@ -112,14 +83,6 @@ export class ErrorBoundary extends React.Component<Props, State> {
   }
 }
 
-/*
-  Every value below is a literal copy of the dark palette in `src/ui/tokens.ts` — royal990,
-  royal950, royal880, royal800, the amber `warn` tone, `cta`, `text`, `textSecondary`,
-  `textTertiary`. Copied rather than imported, and that is the point of this file: it must
-  render when the theme provider is what threw, so it cannot depend on anything. Keeping the
-  values identical means the one screen a user sees when the app breaks is at least the same
-  app as the one that broke.
-*/
 const styles = StyleSheet.create({
   root: {
     flex: 1,
@@ -174,22 +137,8 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 12,
     color: '#8394B8',
-    marginBottom: 12,
-  },
-  errorBox: {
-    width: '100%',
-    backgroundColor: '#040814',
-    borderRadius: 8,
-    padding: 12,
     marginBottom: 20,
-    borderWidth: 1,
-    borderColor: '#16224A',
-  },
-  message: {
-    fontSize: 13,
-    color: '#AFC0E0',
-    lineHeight: 18,
-    fontFamily: 'monospace',
+    textAlign: 'center',
   },
   primaryButton: {
     width: '100%',
@@ -223,5 +172,8 @@ const styles = StyleSheet.create({
     color: '#8394B8',
     lineHeight: 16,
     fontFamily: 'monospace',
+  },
+  traceStack: {
+    marginTop: 8,
   },
 });

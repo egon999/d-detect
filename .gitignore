@@ -69,7 +69,43 @@ probe-output.txt
 keystore.properties
 
 # Preserved and generated release APKs.
+#
+# The directory rule alone left a build copied to the repository root (detact-release.apk)
+# tracked, so the extension is ignored wherever it lands.
 /artifacts/android/
+*.apk
 # Diagnostics export bundles. Generated on demand from the developer screen and purged
 # afterwards; whatever lands here is machine-state dumps, never source.
 .diag-export/
+
+# Private server storage and Python runtime artifacts.
+#
+# `server/.data/` is the path DATA_DIR resolves to by default; the bare `.data/` rule below
+# matches at any depth, so pointing DATA_DIR somewhere else cannot publish the database and
+# the stored originals by accident.
+server/.data/
+.data/
+server/.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Developer scratch areas, which are untracked today only because nobody has run `git add -A`.
+#
+# `server/.scratch/`, `server/.smoke/` and `server/.captmp/` are where probes, debug scripts, smoke
+# runs and half-finished investigations accumulate while something is being worked out. Several were
+# written in the last hour by different people. None of it is source, and two of the three hold
+# things that must never be published: `.smoke/` keeps a real SQLite database with stored originals
+# beside it, and `.captmp/` holds uploaded files mid-capture. The repository has essentially one
+# commit, so the first `git add -A` anybody runs is the one that would publish them.
+#
+# Probe output is ignored by shape as well as by name. `probe-output.txt` was already listed here,
+# and `server/probe-many.tmp.pdf` then landed beside it with a different name — a rule that matches
+# one filename does not survive the next probe somebody writes.
+.scratch/
+.smoke/
+.captmp/
+*.tmp
+*.tmp.pdf
+*.tmp.txt
+*.tmp.json

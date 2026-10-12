@@ -63,6 +63,22 @@
         { "fieldPath": "caseId", "order": "ASCENDING" },
         { "fieldPath": "ownerId", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "caseAnalyses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "caseId", "order": "ASCENDING" },
+        { "fieldPath": "ownerId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "seals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "caseId", "order": "ASCENDING" },
+        { "fieldPath": "ownerId", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

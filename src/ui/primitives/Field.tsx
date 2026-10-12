@@ -1,26 +1,3 @@
-/**
- * Form fields.
- *
- * ## The typographic rule, in an input
- *
- * The sans/mono split (see `tokens.ts`) says: mono means a machine read this, sans means a
- * person wrote it. An input is where a person writes, so inputs are sans — with one
- * exception that proves the rule. When a field is *correcting* a machine-read value, it is
- * set in mono and labelled with what the machine read, because the user is not composing
- * prose there, they are overwriting a specific string that came off a document. The
- * `mono` prop is how a caller says which situation it is in.
- *
- * ## Focus
- *
- * The focus ring is a border colour change plus a background lift, animated over 150ms. No
- * outer glow: on a dark canvas a glow reads as a halo around the field and blurs its edge,
- * and the edge is what tells the user where the tappable area ends.
- *
- * Errors are shown under the field, never as a placeholder replacement and never as an
- * alert. A field that erases what you typed to tell you it was wrong is a field you have to
- * fight.
- */
-
 import React, { forwardRef, useCallback, useMemo, useRef, useState } from 'react';
 import {
   Animated,
@@ -38,37 +15,26 @@ import { FONT_FAMILY, SPACING, TYPE_SCALE_CAP } from '../tokens';
 import { Row } from './Layout';
 import { Text } from './Text';
 
-/**
- * React Native 0.83 types these as its own `FocusEvent` / `BlurEvent` rather than the
- * older `NativeSyntheticEvent<TextInputFocusEventData>`. Deriving the parameter from the
- * prop itself means this keeps compiling when the name changes again.
- */
 type FocusHandler = NonNullable<TextInputProps['onFocus']>;
 type BlurHandler = NonNullable<TextInputProps['onBlur']>;
 
 export interface TextFieldProps extends Omit<TextInputProps, 'style' | 'placeholderTextColor'> {
   label?: string;
-  /** Explanatory line under the field. Replaced by `error` when one is present. */
+
   hint?: string;
   error?: string;
-  /** Set the value in the monospace face. For corrections to machine-read values. */
+
   mono?: boolean;
-  /** Leading glyph inside the field. */
+
   icon?: IconName;
-  /** Rendered at the right edge inside the field — a unit, a currency, a clear button. */
+
   trailing?: React.ReactNode;
-  /** Grows with content up to `maxHeight`. For notes and claim statements. */
+
   multiline?: boolean;
-  /**
-   * Override the field's resting height. Only meaningful with `multiline`.
-   *
-   * The default 112 is right for a two-line note at the current body size (15.5/23.5).
-   * A box somebody is expected to write a paragraph into needs to *look* like it expects a
-   * paragraph, or they write one line.
-   */
+
   minHeight?: number;
   containerStyle?: StyleProp<ViewStyle>;
-  /** Shown next to the label. Use for "optional", not for "required". */
+
   labelHint?: string;
 }
 
@@ -99,9 +65,7 @@ export const TextField = forwardRef<TextInput, TextFieldProps>(function TextFiel
       Animated.timing(focus, {
         toValue: to,
         duration: theme.motion.duration.fast,
-        // Colour cannot be driven natively, so this runs on the JS thread. It is one
-        // interpolation on one view for the duration of a tap — not a scroll-linked
-        // animation, where the same choice would be wrong.
+
         useNativeDriver: false,
       }).start();
     },
@@ -195,9 +159,7 @@ export const TextField = forwardRef<TextInput, TextFieldProps>(function TextFiel
             {
               fontFamily,
               color: theme.colors.text,
-              // Android adds its own vertical padding that misaligns the text against a
-              // leading icon; zeroing it and relying on the container's minHeight keeps
-              // both platforms identical.
+
               paddingVertical: 0,
               textAlignVertical: multiline ? 'top' : 'center',
             },
@@ -207,13 +169,9 @@ export const TextField = forwardRef<TextInput, TextFieldProps>(function TextFiel
           onBlur={handleBlur}
           multiline={multiline}
           selectionColor={theme.colors.accent}
-          // The cursor is hard to see against a dark field at the default Android colour.
+
           cursorColor={theme.colors.accent}
-          // `TextInput` is the one text path in the app that does not go through
-          // `primitives/Text`, so the scaling policy has to be restated here or a raised font
-          // scale would grow every label on the screen and leave what the user is *typing* at
-          // its nominal size. Matched to the rank the input is set in, so the field and the
-          // prose around it move together. The box already grows: `minHeight`, not `height`.
+
           maxFontSizeMultiplier={mono ? TYPE_SCALE_CAP.mono : TYPE_SCALE_CAP.body}
           {...rest}
           accessibilityLabel={rest.accessibilityLabel ?? label}
@@ -239,15 +197,11 @@ export const TextField = forwardRef<TextInput, TextFieldProps>(function TextFiel
   );
 });
 
-// ---------------------------------------------------------------------------
-// Select
-// ---------------------------------------------------------------------------
-
 export interface SelectOption<T extends string> {
   value: T;
   label: string;
   icon?: IconName;
-  /** One line under the label. For options whose meaning is not obvious from the name. */
+
   description?: string;
 }
 
@@ -259,13 +213,6 @@ export interface SelectFieldProps<T extends string> {
   hint?: string;
 }
 
-/**
- * A vertical list of choices, shown in full rather than behind a dropdown.
- *
- * Every use of this in the app has four options or fewer — case status, date precision,
- * relationship type. At that size a dropdown costs a tap and hides the alternatives, and
- * the alternatives are exactly what the user is deciding between.
- */
 export function SelectField<T extends string>({
   label,
   value,
@@ -343,12 +290,7 @@ function SelectRow<T extends string>({
       ) : null}
 
       <View style={styles.flex}>
-        {/*
-          Two lines. The one caller of this field offers a case's claims as the options, and a
-          claim is allowed two thousand characters — so an unclamped label set a radio row as a
-          page of prose with a radio button somewhere off the bottom of it. The full string stays
-          on `accessibilityLabel` above, so clamping costs a screen reader nothing.
-        */}
+        {}
         <Text variant="bodySmall" colorToken={selected ? 'textAccent' : 'text'} numberOfLines={2}>
           {option.label}
         </Text>
